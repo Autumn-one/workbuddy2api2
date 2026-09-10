@@ -89,12 +89,12 @@ func TestPickExcluding(t *testing.T) {
 	p.SetCredits("u1", 100)
 	p.SetCredits("u2", 50)
 	tried := map[string]bool{"u1": true}
-	got := p.PickExcluding(tried)
+	got := p.PickExcluding(tried, "")
 	if got == nil || got.UID != "u2" {
 		t.Fatalf("pick=%+v want u2", got)
 	}
 	tried["u2"] = true
-	if got := p.PickExcluding(tried); got != nil {
+	if got := p.PickExcluding(tried, ""); got != nil {
 		t.Fatalf("want nil, got %+v", got)
 	}
 }
@@ -109,7 +109,7 @@ func TestPickExcludingStaysWithinHealthy(t *testing.T) {
 	p.SetCredits("u-hot", 1)
 	p.Cooldown("u-cold", CoolHard, time.Hour, "x")
 	for i := 0; i < 20; i++ {
-		got := p.PickExcluding(nil)
+		got := p.PickExcluding(nil, "")
 		if got == nil || got.UID != "u-hot" {
 			t.Fatalf("iter %d: picked %+v, want only healthy u-hot", i, got)
 		}

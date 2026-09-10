@@ -106,9 +106,13 @@ var modelContextMarkers = []string{
 	"another model", "other model", "switch model",
 }
 
-// ModelRateLimitEvidence 模型级频率限制的观测证据（仅记录，不参与调度）。
+// ModelRateLimitEvidence 模型级频率限制（code 6004）的观测证据。
+// Model 取自报文 msg 字段里上游点名的模型（如 "deepseek-v4.1-flash 的使用量已超出…"），
+// 仅用于日志展示与交叉核对；真正的冷却键仍以【本请求实际使用的模型】为准
+// （st.model），因为发往上游的就是它——报文里没提或提取失败时以请求模型兜底。
 type ModelRateLimitEvidence struct {
 	Status int    // HTTP 状态码
+	Model  string // 报文里点名的模型（可能为空：上游没点名就不猜）
 	Msg    string // 原始报文片段（截断）
 }
 
@@ -137,6 +141,18 @@ func isModelRateLimit(body string) bool {
 	return hasModelWord && hasResetWord
 }
 
+// uidPrefixForLog 日志用的账号标识：取 uid 前 8 位；空值显示 "-"。
+// 与 server 包请求表格日志的 uid= 口径一致，方便按账号对照两处日志。
+func uidPrefixForLog(uid string) string {
+	if uid == "" {
+		return "-"
+	}
+	if len(uid) > 8 {
+		return uid[:8]
+	}
+	return uid
+}
+
 // ParseModelRateLimitFromMsg 从报文文本提取模型级频率限制证据。
 // 返回 ok=false 表示不是该类限制。仅用于记录，不解析"重置时间"
 // （实测该时间不可信，故刻意不提取，避免下游误用）。
@@ -144,7 +160,35 @@ func ParseModelRateLimitFromMsg(status int, msg string) (ModelRateLimitEvidence,
 	if !isModelRateLimit(msg) {
 		return ModelRateLimitEvidence{}, false
 	}
-	return ModelRateLimitEvidence{Status: status, Msg: truncate(msg, 300)}, true
+	return ModelRateLimitEvidence{
+		Status: status,
+		Model:  parseModelRateLimitModel(msg),
+		Msg:    truncate(msg, 300),
+	}, true
+}
+
+// parseModelRateLimitModel 从 6004 报文里提取上游点名的模型名。
+// 实测文案形如："您对模型的使用量已超出频率限制" / "模型 [xxx] 的使用量已超出频率限制"。
+// 提取策略（保守）：优先取「模型 [X]」/「模型 X 的」中的 X；取不到返回空串，绝不猜测。
+func parseModelRateLimitModel(msg string) string {
+	// 形式一：模型 [X]
+	if i := strings.Index(msg, "模型 ["); i >= 0 {
+		rest := msg[i+len("模型 ["):]
+		if j := strings.Index(rest, "]"); j > 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+	}
+	// 形式二：模型 X 的使用量
+	if i := strings.Index(msg, "模型 "); i >= 0 {
+		rest := msg[i+len("模型 "):]
+		if j := strings.Index(rest, " 的使用量"); j > 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+		if j := strings.Index(rest, "的使用量"); j > 0 {
+			return strings.TrimSpace(rest[:j])
+		}
+	}
+	return ""
 }
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
@@ -256,15 +300,15 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte) []byte {
-	out, _ := c.prepareBodyWithParams(body)
+func (c *Client) prepareBody(body []byte, uid string) []byte {
+	out, _ := c.prepareBodyWithParams(body, uid)
 	return out
 }
 
 // prepareBodyWithParams 组装出站请求体，并同时返回【改写后】的关键参数快照。
 // 两者在同一次解析中产生，保证日志展示的参数与真正发出的报文完全一致。
-func (c *Client) prepareBodyWithParams(body []byte) ([]byte, EffectiveParams) {
-	return PrepareBodyOptWithEffortsAndParams(body, c.SanitizeFingerprints, c.effortsSnapshot())
+func (c *Client) prepareBodyWithParams(body []byte, uid string) ([]byte, EffectiveParams) {
+	return PrepareBodyOptWithEffortsAndParams(body, c.SanitizeFingerprints, c.effortsSnapshot(), uid)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -367,7 +411,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 // 不一致；对非 JSON 请求体返回零值（日志显示"-"），不影响转发本身。
 func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, params EffectiveParams, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	prepared, params := c.prepareBodyWithParams(body)
+	prepared, params := c.prepareBodyWithParams(body, a.UID)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, params, err

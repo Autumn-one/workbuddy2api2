@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,8 +62,8 @@ type Status struct {
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
-	InFlightPeak int       `json:"in_flight_peak"`   // 近 peakWindow 内的在途峰值（"忙过"痕迹）
-	PeakActive   bool      `json:"peak_active"`      // 峰值是否仍在可见窗口内
+	InFlightPeak int       `json:"in_flight_peak"` // 近 peakWindow 内的在途峰值（"忙过"痕迹）
+	PeakActive   bool      `json:"peak_active"`    // 峰值是否仍在可见窗口内
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
@@ -112,6 +113,12 @@ type entry struct {
 	// creditsKnown 标记 credits 是否已从上游拿到过可信值。
 	// 从未刷新过额度时 credits=0 只代表“未知”而非“真 0”，首次变动不参与涨跌归因。
 	creditsKnown bool
+
+	// modelCool 按模型冷却（运行态，不持久化）：6004 模型级限流用。
+	// 键是【模型 ID】而非账号——6004 是模型级限制，同账号其他模型照常可用；
+	// 账号级冷却会误伤其他模型（见 applyErrorPolicy 既有结论）。
+	// 生命周期短（60s~20min），与 inFlight 同类不落盘；重启后从零开始，可接受。
+	modelCool map[string]*modelCoolState
 
 	// inFlightPeak / peakAt 为「忙闲痕迹」运行态（不持久化）：记录近 peakWindow 内的
 	// 在途峰值与其最后一次统计时刻。短请求的 +1/−1 可能整体落在 GUI 采样间隔之间
@@ -195,7 +202,7 @@ func (e *entry) fallbackKind(now time.Time) string {
 
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
-	Credits      int64     `json:"credits"`
+	Credits int64 `json:"credits"`
 	// CreditsKnown 标记 credits 是否已从上游拿到过可信值。
 	// 缺字段（旧文件）为 false：旧 state 的 credits 无法区分"真 0"与"从未刷过"。
 	CreditsKnown bool      `json:"credits_known,omitempty"`
@@ -245,7 +252,6 @@ type Pool struct {
 	// onCreditsChanged 积分变动回调；nil = 静默（不记录）。
 	// 在持锁路径上调用，必须非阻塞。
 	onCreditsChanged CreditChangeFunc
-
 
 	// 熔断器调优（SetBreaker 注入；默认值见 defaultBreaker*）。
 	breakerThreshold   int
@@ -439,18 +445,28 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
+// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘；
+// 顺带按固定周期清扫已过期的模型级冷却条目（防止（账号×模型）map 无限增长）。
 func (p *Pool) startFlusher() {
 	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
-		for range t.C {
-			p.mu.Lock()
-			if p.dirty.Swap(false) {
-				p.saveLocked()
+		sweep := time.NewTicker(modelCoolSweepInterval)
+		defer sweep.Stop()
+		for {
+			select {
+			case <-t.C:
+				p.mu.Lock()
+				if p.dirty.Swap(false) {
+					p.saveLocked()
+				}
+				p.mu.Unlock()
+			case now := <-sweep.C:
+				p.mu.Lock()
+				p.sweepModelCooldownsLocked(now)
+				p.mu.Unlock()
 			}
-			p.mu.Unlock()
 		}
 	}()
 }
@@ -505,14 +521,14 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
 func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
+	return p.pick(nil, "")
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
-func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried)
+func (p *Pool) PickExcluding(tried map[string]bool, model string) *auth.Auth {
+	return p.pick(tried, model)
 }
 
 // pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
@@ -521,12 +537,14 @@ func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 // 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
 // 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
 // minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-func (p *Pool) pick(tried map[string]bool) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 
 	var cands []*entry
+	modelAware := strings.TrimSpace(model) != "" // model 为空 = 不过滤（旧调用方行为不变）
+
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
@@ -534,10 +552,19 @@ func (p *Pool) pick(tried map[string]bool) *auth.Auth {
 		if !e.healthy(now) {
 			continue
 		}
+		if modelAware && e.modelCooling(model, now) {
+			continue // 该账号对此模型正被 6004 冷却：跳过
+		}
 		if p.inFlightFull(e) {
 			continue // 在途占满：跳过（max=0 不限时不触发）
 		}
 		cands = append(cands, e)
+	}
+	if len(cands) == 0 && modelAware {
+		// 模型级冷却把候选压空：不得落回全冷却兜底——那是账号级语义，可能挑出一个
+		// "最早到期"但对该模型照样 6004 的账号。保持 nil 让 handler 直接 503：
+		// 比起再浪费一次注定失败的上游调用，快速失败更诚实也更便宜。
+		return nil
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
@@ -767,6 +794,151 @@ func (p *Pool) noteCreditsLocked(e *entry, uid string, newCredits int64, reason 
 	p.onCreditsChanged(ch)
 }
 
+// modelCoolState 单个（账号×模型）对的模型级限流冷却状态（运行态）。
+type modelCoolState struct {
+	until    time.Time // 本次冷却截止
+	lastHit  time.Time // 最近一次撞墙时刻
+	backoffN int       // 已连续撞墙次数（指数退避的指数；成功清零）
+}
+
+// 模型级限流冷却：起步 1 分钟，连续撞墙翻倍，封顶 20 分钟（用户指定）。
+const (
+	maxModelCooldown = 20 * time.Minute
+)
+
+// modelCooldownFor 返回第 n 次连续撞墙应冷却的时长：base × 2^(n-1)，封顶 maxModelCooldown。
+// base 为调用方传入的基础时长（生产用 60s；参数化便于测试与调优）。
+func modelCooldownFor(base time.Duration, n int) time.Duration {
+	if base <= 0 {
+		base = time.Minute
+	}
+	d := base
+	for i := 1; i < n; i++ {
+		d *= 2
+		if d >= maxModelCooldown {
+			return maxModelCooldown
+		}
+	}
+	return d
+}
+
+// modelCooling 报告该 entry 对指定模型是否处于模型级冷却（调用方需已持锁或明确单协程语义；
+// 本方法只读，不加锁，由 pick 的持锁路径与测试调用）。
+func (e *entry) modelCooling(model string, now time.Time) bool {
+	st, ok := e.modelCool[model]
+	if !ok || st == nil {
+		return false
+	}
+	return now.Before(st.until)
+}
+
+// NoteModelRateLimit 记录一次【账号×模型】撞上 6004，返回本次冷却时长。
+//
+// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（20 分钟）。
+// 同账号的其他模型、其他账号不受影响（模型级，不是账号级）。
+// 返回 0 表示未记录：账号不存在/已禁用/入参非法。
+//
+// 成功（NoteSuccess）清零连续计数：账号有正常成功请求即恢复信任，
+// 下次撞墙从第一档 60s 起步，避免一次偶发限流导致长期高冷却。
+//
+// 到期后【退避记忆保留】（条目在过期后才被清扫）：再撞墙从当前档起步。
+// 否则每 60s 撞一次永远停在第一档，退避失去意义。
+func (p *Pool) NoteModelRateLimit(uid, model string, base time.Duration) time.Duration {
+	if uid == "" || strings.TrimSpace(model) == "" {
+		return 0
+	}
+	if base <= 0 {
+		base = time.Minute
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok || e.disabled {
+		return 0
+	}
+	now := time.Now()
+	if e.modelCool == nil {
+		e.modelCool = map[string]*modelCoolState{}
+	}
+	st, ok := e.modelCool[model]
+	if !ok || st == nil {
+		st = &modelCoolState{}
+		e.modelCool[model] = st
+	}
+	// 连续计数：上次冷却尚未到期就又撞墙 → 连续；已过期后撞 → 视作新一轮，但仍从
+	// 上次档位+1 起步（记忆保留），除非中间出现过成功（NoteSuccess 已清零）。
+	if now.Before(st.until) {
+		st.backoffN++
+	} else {
+		st.backoffN++
+	}
+	d := modelCooldownFor(base, st.backoffN)
+	st.until = now.Add(d)
+	st.lastHit = now
+	p.dirty.Store(true)
+	return d
+}
+
+// IsModelCooling 报告该（账号×模型）是否处于模型级冷却中。
+func (p *Pool) IsModelCooling(uid, model string) bool {
+	return !p.ModelCooldownUntil(uid, model).IsZero() && time.Now().Before(p.ModelCooldownUntil(uid, model))
+}
+
+// ModelCooldownUntil 返回该（账号×模型）的冷却截止时间；未冷却返回零值。
+func (p *Pool) ModelCooldownUntil(uid, model string) time.Time {
+	if uid == "" || strings.TrimSpace(model) == "" {
+		return time.Time{}
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return time.Time{}
+	}
+	st, ok := e.modelCool[model]
+	if !ok {
+		return time.Time{}
+	}
+	return st.until
+}
+
+// ExcludedByModelCooldown 选号候选过滤语义：该（账号×模型）冷却中则应被排除。
+func (p *Pool) ExcludedByModelCooldown(uid, model string) bool {
+	return p.IsModelCooling(uid, model)
+}
+
+// AdvanceModelCooldowns 测试专用：把所有模型冷却立即视为已到期。
+// 一律置为「当前墙钟的过去」，保证 IsModelCooling/pick 的 now.Before(until) 为 false（已恢复）；
+// 不接受调用方指定未来时刻（那会把 until 设到未来，语义就错了）。
+// 只动 until、不动 backoffN——「退避记忆在到期后保留」正是被测语义。
+func (p *Pool) AdvanceModelCooldowns(_ time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	past := time.Now().Add(-time.Second)
+	for _, e := range p.byUID {
+		for _, st := range e.modelCool {
+			st.until = past
+		}
+	}
+}
+
+// modelCoolSweepInterval 模型级冷却条目的清扫周期。
+const modelCoolSweepInterval = 5 * time.Minute
+
+// sweepModelCooldownsLocked 清理早已过期的模型级冷却条目，防止 map 无限增长。
+// 保留期 30 分钟（> 封顶 20 分钟）：到期≠信任恢复，退避记忆要保留一段时间，
+// 让"到期→再撞墙→升档"的退避链在跨窗口后仍然成立。
+func (p *Pool) sweepModelCooldownsLocked(now time.Time) {
+	const keep = 30 * time.Minute
+	for _, e := range p.byUID {
+		for m, st := range e.modelCool {
+			if now.Sub(st.until) > keep {
+				delete(e.modelCool, m)
+			}
+		}
+	}
+}
+
 // SetCredits 更新账号余额。
 func (p *Pool) SetCredits(uid string, credits int64) {
 	p.SetCreditsReason(uid, credits, "自动刷新")
@@ -900,6 +1072,12 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		// 该账号的模型级退避计数清零：一次成功即证明账号对此模型可用，
+		// 退避记忆作废，下次撞 6004 从第一档 60s 起步。
+		// 注意只清计数不清 until——未到期的冷却窗口仍有效（时间恢复语义）。
+		for _, st := range e.modelCool {
+			st.backoffN = 0
+		}
 		p.dirty.Store(true)
 	}
 }
@@ -947,7 +1125,10 @@ func (p *Pool) AvailableUIDs() []string {
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
-func (p *Pool) PickByUID(uid string) *auth.Auth {
+// PickByUID 粘性会话按 uid 直取。
+// model 非空时，若该账号对【此模型】正处于 6004 冷却，则返回 nil（调用方解绑粘性
+// 并回落普通轮换）——粘住一个对该模型已限流的账号只会反复撞墙。
+func (p *Pool) PickByUID(uid, model string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -956,6 +1137,9 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	}
 	now := time.Now()
 	if !e.healthy(now) {
+		return nil
+	}
+	if model != "" && e.modelCooling(model, now) {
 		return nil
 	}
 	if p.inFlightFull(e) {

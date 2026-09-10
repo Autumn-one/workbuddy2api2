@@ -304,19 +304,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 本请求的模型：6004 按模型冷却的键，选号时按（账号×模型）过滤。
+	model := st.model
+
 	for i := 0; i < h.cfg.MaxRotate; i++ {
-		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
+		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满 + 模型冷却），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUID(stickyUID, model)
 			if acct == nil {
-				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
+				// 粘性号当前不可用（冷却/占满/该模型正被 6004 冷却）→ 解绑，本次回落普通轮换。
 				h.cfg.Session.Unbind(sessKey)
 				stickyUID = ""
 			}
 		}
 		if acct == nil {
-			acct = h.cfg.Pool.PickExcluding(tried)
+			acct = h.cfg.Pool.PickExcluding(tried, model)
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable
@@ -371,7 +374,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind, status, string(respBody))
+			h.applyErrorPolicy(acct.UID, st.model, kind, status, string(respBody))
 			fail(acct.UID)
 			continue
 		}
@@ -416,6 +419,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.status = http.StatusServiceUnavailable
 }
 
+// modelRateCooldownBase 6004 模型级限流的起步冷却时长（用户指定 1 分钟）；
+// 连续撞墙翻倍、封顶 maxModelCooldown（20 分钟），见 pool.NoteModelRateLimit。
+const modelRateCooldownBase = time.Minute
+
+// truncateMsg 截断报文用于日志（避免长报文刷屏）。
+func truncateMsg(s string) string {
+	if len(s) > 200 {
+		return s[:200] + "..."
+	}
+	return s
+}
+
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
@@ -428,12 +443,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
-//   - ErrModelRateLimit → 【仅记录，不处置】：保留原始报文供观测，不改任何状态。
+//   - ErrModelRateLimit → 按【账号×模型】短冷却（60s 起、翻倍、封顶 20m）：
+//     不做账号级处置、不喂熔断；不采信报文里的重置时刻。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, status int, respBody string) {
+func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, status int, respBody string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -450,13 +466,26 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, status int
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
 	case upstream.ErrModelRateLimit:
-		// 模型级频率限制：当前【只记录、不处置】（不改冷却/不禁用/不喂熔断）。
-		// 依据：实测该限制是模型级、账号可继续用其他模型，且报文中的"重置可用"时刻
-		// 不可信（预报 22:56 但 02:52 已恢复，且调用零积分消耗）。在观测到足够样本、
-		// 弄清限制来源之前，任何自动冷却都可能造成长时间误伤。
-		if ev, ok := upstream.ParseModelRateLimitFromMsg(status, respBody); ok {
-			log.Printf("model_rate_limit uid=%s status=%d msg=%s", uid, ev.Status, ev.Msg)
+		// 模型级频率限制（code 6004）：按【账号×模型】短冷却——起步 1 分钟、
+		// 连续撞墙翻倍、封顶 20 分钟。刻意【不采信报文里的重置时刻】（实测预报
+		// 22:56 实际 02:52 已恢复）。也不做账号级处置：该限制是模型级的，
+		// 同账号其他模型实测照常可用，账号级冷却会造成长时间误伤。
+		//
+		// 动机（生产日志实测）：不冷却时同一账号同模型间隔 1~2 分钟被反复选中
+		// 反复撞墙（02:41→03:20 撞 7 次），既浪费上游往返也加重限流。
+		if model == "" {
+			// 请求体缺 model：无从建立（账号×模型）键，仅记录不冷却。
+			log.Printf("model_rate_limit uid=%s status=%d msg=%s (请求无 model 字段，未冷却)", uid, status, truncateMsg(respBody))
+			break
 		}
+		d := h.cfg.Pool.NoteModelRateLimit(uid, model, modelRateCooldownBase)
+		if ev, ok := upstream.ParseModelRateLimitFromMsg(status, respBody); ok && ev.Model != "" && ev.Model != model {
+			// 报文点名的模型 ≠ 本请求模型：仍按【请求模型】冷却（发出去的就是它），
+			// 但把差异亮出来，便于发现"上游把别的模型的额度记到这个请求头上"类异常。
+			log.Printf("model_rate_limit uid=%s model=%s(请求) vs %s(报文) 冷却=%s", uid, model, ev.Model, d)
+			break
+		}
+		log.Printf("model_rate_limit uid=%s model=%s 冷却=%s status=%d", uid, model, d, status)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

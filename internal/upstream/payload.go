@@ -10,15 +10,17 @@ import (
 )
 
 // PrepareBodyOpt 单 pass 改写；sanitize=false 时行为完全还原（仅强制 stream + 归一化 tool_choice）。
+// uid 仅用于日志标注（哪个账号的请求被改写了）；测试/无账号场景传 ""。
 func PrepareBodyOpt(src []byte, sanitize bool) []byte {
-	return PrepareBodyOptWithEfforts(src, sanitize, nil)
+	return PrepareBodyOptWithEfforts(src, sanitize, nil, "")
 }
 
 // PrepareBodyOptWithEfforts 在 PrepareBodyOpt 基础上按模型 supportedEfforts 降级 reasoning_effort：
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
-func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
-	out, _ := PrepareBodyOptWithEffortsAndParams(src, sanitize, efforts)
+// uid 仅用于日志标注（哪个账号的请求被改写了）；测试/无账号场景传 ""。
+func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string, uid string) []byte {
+	out, _ := PrepareBodyOptWithEffortsAndParams(src, sanitize, efforts, uid)
 	return out
 }
 
@@ -27,7 +29,7 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 //
 // 解析失败（非 JSON/空体）时原样返回入参，参数为零值（日志显示"-"）——
 // 与既有 early-return 行为逐字一致，不新增错误路径。
-func PrepareBodyOptWithEffortsAndParams(src []byte, sanitize bool, efforts map[string][]string) ([]byte, EffectiveParams) {
+func PrepareBodyOptWithEffortsAndParams(src []byte, sanitize bool, efforts map[string][]string, uid string) ([]byte, EffectiveParams) {
 	if len(src) == 0 {
 		return src, EffectiveParams{}
 	}
@@ -40,8 +42,8 @@ func PrepareBodyOptWithEffortsAndParams(src []byte, sanitize bool, efforts map[s
 
 	obj["stream"] = true
 	normalizeToolChoice(obj)
-	normalizeRoles(obj)
-	normalizeReasoningEffort(obj, efforts)
+	normalizeRoles(obj, uid)
+	normalizeReasoningEffort(obj, efforts, uid)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
 			sanitizeMessages(msgs)
@@ -127,7 +129,7 @@ var effortRank = map[string]int{"off": 0, "minimal": 1, "low": 2, "medium": 3, "
 //   - 请求档位不支持 → 改为 ≤请求档位的最高支持档（降级）
 //   - 支持档全部高于请求档 → 取最低支持档（偏离最小）
 //   - 未知模型/未知档位/未携带字段/模型未缓存 → 一律透传
-func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
+func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string, uid string) {
 	if len(efforts) == 0 {
 		return
 	}
@@ -167,7 +169,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	if best != "" {
 		if !strings.EqualFold(best, reqStr) {
 			obj[key] = best
-			log.Printf("reasoning_effort downgraded model=%s %s -> %s", model, reqStr, best)
+			log.Printf("reasoning_effort downgraded uid=%s model=%s %s -> %s", uidPrefixForLog(uid), model, reqStr, best)
 		}
 		return
 	}
@@ -181,7 +183,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 	}
 	if lowest != "" {
 		obj[key] = lowest
-		log.Printf("reasoning_effort floored model=%s %s -> %s", model, reqStr, lowest)
+		log.Printf("reasoning_effort floored uid=%s model=%s %s -> %s", uidPrefixForLog(uid), model, reqStr, lowest)
 	}
 }
 
@@ -196,7 +198,7 @@ func normalizeReasoningEffort(obj map[string]any, efforts map[string][]string) {
 //
 // 只认 developer 这一个值：其余 role（system/user/assistant/tool/任意未知值）一律原样保留，
 // 不合并、不重排、不删除任何消息（上游对多 system 的行为尚未实测，合并会引入新变量）。
-func normalizeRoles(obj map[string]any) {
+func normalizeRoles(obj map[string]any, uid string) {
 	msgs, ok := obj["messages"].([]any)
 	if !ok {
 		return
@@ -212,7 +214,7 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("role normalized developer->system idx=%d", i)
+			log.Printf("role normalized developer->system uid=%s idx=%d", uidPrefixForLog(uid), i)
 		}
 	}
 }

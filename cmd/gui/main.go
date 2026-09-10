@@ -909,10 +909,33 @@ type app struct {
 // logFilePath 落盘日志路径（启动后填入）；无控制台窗口时靠它排查问题。
 var logFilePath string
 
-// setupLogging 让标准日志同时流向：内存日志面板、磁盘日志文件。
+// faultTolerantWriter 包一层：目标写失败时静默忽略，绝不阻断 MultiWriter 里
+// 排在它后面的 writer。
+//
+// 背景（实测缺陷）：io.MultiWriter 遇错即短路返回。-H windowsgui 构建直接双击启动时
+// 没有控制台，os.Stdout 是无效句柄、写必失败，而它原先排在 [内存, stdout, 文件] 的
+// 中间——导致排在它后面的 gui.log 一次都收不到数据，文件日志自 04:01 启动后停更
+// （文件停在 03:48），排障时完全没有落盘依据。
+type faultTolerantWriter struct{ w io.Writer }
+
+func (f faultTolerantWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err != nil {
+		// 吞掉错误但如实报告已写字节数为 0，让 MultiWriter 继续走后面的 writer。
+		return 0, nil
+	}
+	return n, nil
+}
+
+// setupLogging 让标准日志同时流向：内存日志面板、磁盘日志文件、控制台（若有）。
+// 顺序刻意为 [内存, 文件, stdout]：
+//   - 文件在 stdout 之前：stdout 失效（windowsgui 双击启动）不再殃及落盘；
+//   - stdout 用容错包装：无控制台时静默跳过，有控制台时照常输出。
+//
 // 落盘位置按 exe 同目录 → %AppData% → 临时目录 依次尝试（环境里可能缺 APPDATA）。
 func setupLogging(mem io.Writer) io.Writer {
-	writers := []io.Writer{mem, os.Stdout}
+	// 先不把 os.Stdout 放进列表，等确定文件成功后再按 [内存, 文件, stdout] 顺序组装。
+	var fileW io.Writer
 
 	var cands []string
 	if exe, err := os.Executable(); err == nil {
@@ -931,10 +954,16 @@ func setupLogging(mem io.Writer) io.Writer {
 		if err != nil {
 			continue
 		}
-		writers = append(writers, f)
+		fileW = f
 		logFilePath = p
 		break
 	}
+	// 顺序：内存面板 → 磁盘文件 → 控制台（容错）。
+	writers := []io.Writer{mem}
+	if fileW != nil {
+		writers = append(writers, fileW)
+	}
+	writers = append(writers, faultTolerantWriter{os.Stdout})
 	return io.MultiWriter(writers...)
 }
 

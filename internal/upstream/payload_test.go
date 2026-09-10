@@ -46,7 +46,7 @@ func TestNormalizeRoles(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			// 全程 sanitize=false：验证 role 归一与内容脱敏开关无关（D4）。
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil)
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, nil, "")
 			var obj map[string]any
 			if err := json.Unmarshal(out, &obj); err != nil {
 				t.Fatalf("unmarshal: %v (out=%s)", err, out)
@@ -79,7 +79,7 @@ func TestNormalizeRoles(t *testing.T) {
 
 	// messages 缺失时，其余字段必须原样保留（除强制 stream）。
 	t.Run("messages 缺失时其余字段不变", func(t *testing.T) {
-		out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","temperature":0.7}`), false, nil)
+		out := PrepareBodyOptWithEfforts([]byte(`{"model":"glm-5.2","temperature":0.7}`), false, nil, "")
 		var obj map[string]any
 		if err := json.Unmarshal(out, &obj); err != nil {
 			t.Fatalf("unmarshal: %v", err)
@@ -124,7 +124,7 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out := PrepareBodyOptWithEfforts([]byte(c.body), false, c.efforts)
+			out := PrepareBodyOptWithEfforts([]byte(c.body), false, c.efforts, "")
 			var m map[string]any
 			if err := json.Unmarshal(out, &m); err != nil {
 				t.Fatalf("unmarshal: %v (body=%s)", err, out)
@@ -195,7 +195,7 @@ func TestEffectiveParamsMirrorPreparedBody(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			out, params := PrepareBodyOptWithEffortsAndParams([]byte(c.body), false, efforts)
+			out, params := PrepareBodyOptWithEffortsAndParams([]byte(c.body), false, efforts, "")
 
 			// 1) 参数必须等于改写后报文里的真实字段值。
 			var sent map[string]any
@@ -241,8 +241,8 @@ func TestEffectiveParamsDoesNotChangeBody(t *testing.T) {
 		``,
 	}
 	for _, b := range bodies {
-		oldOut := PrepareBodyOptWithEfforts([]byte(b), true, efforts)
-		newOut, _ := PrepareBodyOptWithEffortsAndParams([]byte(b), true, efforts)
+		oldOut := PrepareBodyOptWithEfforts([]byte(b), true, efforts, "")
+		newOut, _ := PrepareBodyOptWithEffortsAndParams([]byte(b), true, efforts, "")
 		if string(oldOut) != string(newOut) {
 			t.Errorf("body changed for %q:\n old=%s\n new=%s", b, oldOut, newOut)
 		}
