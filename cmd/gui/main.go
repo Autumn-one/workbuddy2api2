@@ -146,8 +146,16 @@ func (m *accountModel) Value(row, col int) interface{} {
 	case 3:
 		return accountState(s)
 	case 4:
+		// 在途列展示"忙闲痕迹"：瞬时值优先（正在忙）；瞬时为 0 但峰值仍在可见窗口内时
+		// 显示 "0（峰值 N）"，让整体落在 GUI 采样间隔之间的短请求也能被看见。
 		if s.InFlight > 0 {
+			if s.InFlightPeak > s.InFlight {
+				return fmt.Sprintf("%d（峰 %d）", s.InFlight, s.InFlightPeak)
+			}
 			return fmt.Sprintf("%d", s.InFlight)
+		}
+		if s.PeakActive && s.InFlightPeak > 0 {
+			return fmt.Sprintf("峰 %d", s.InFlightPeak)
 		}
 		return "-"
 	case 5:
@@ -683,7 +691,7 @@ func (a *app) refreshAccounts() {
 func (a *app) tblSignature(items []pool.Status) string {
 	var b strings.Builder
 	for _, s := range items {
-		fmt.Fprintf(&b, "%s|%d|%v|%v|%d|%d;", s.UID, s.Credits, s.Cooling, s.Disabled, s.InFlight, s.BreakerFails)
+		fmt.Fprintf(&b, "%s|%d|%v|%v|%d|%v|%d|%d;", s.UID, s.Credits, s.Cooling, s.Disabled, s.InFlight, s.PeakActive, s.InFlightPeak, s.BreakerFails)
 	}
 	return b.String()
 }

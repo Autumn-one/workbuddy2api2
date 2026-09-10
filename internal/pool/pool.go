@@ -61,6 +61,8 @@ type Status struct {
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	InFlight     int       `json:"in_flight"`
+	InFlightPeak int       `json:"in_flight_peak"`   // 近 peakWindow 内的在途峰值（"忙过"痕迹）
+	PeakActive   bool      `json:"peak_active"`      // 峰值是否仍在可见窗口内
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
@@ -87,6 +89,44 @@ type entry struct {
 
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+
+	// inFlightPeak / peakAt 为「忙闲痕迹」运行态（不持久化）：记录近 peakWindow 内的
+	// 在途峰值与其最后一次统计时刻。短请求的 +1/−1 可能整体落在 GUI 采样间隔之间
+	// （tick=1.5s），瞬时值看不到；峰值保留一段时间供界面展示"刚忙过"。
+	// 纯读路径（statusOf）按 now-peakAt > peakWindow 判定过期，不回写。
+	inFlightPeak atomic.Int64
+	peakAt       atomic.Int64 // UnixNano；0 = 从未忙过
+}
+
+// peakWindow 在途峰值的可见窗口：最后一次占用在途后的这段时间内，
+// 界面仍展示该峰值，用于呈现"最近忙过"的痕迹。
+const peakWindow = 10 * time.Second
+
+// bumpPeak 抬升峰值至当前在途数，并刷新统计时刻。仅在 Acquire 成功后调用（写路径）。
+func (e *entry) bumpPeak(now time.Time) {
+	cur := e.inFlight.Load()
+	for {
+		old := e.inFlightPeak.Load()
+		if cur <= old {
+			break
+		}
+		if e.inFlightPeak.CompareAndSwap(old, cur) {
+			break
+		}
+	}
+	e.peakAt.Store(now.UnixNano())
+}
+
+// peakVisible 返回窗口内的在途峰值；超出 peakWindow 视为无痕迹（返回 0,false）。
+func (e *entry) peakVisible(now time.Time) (int, bool) {
+	nanos := e.peakAt.Load()
+	if nanos == 0 {
+		return 0, false
+	}
+	if now.Sub(time.Unix(0, nanos)) > peakWindow {
+		return 0, false
+	}
+	return int(e.inFlightPeak.Load()), true
 }
 
 // healthy 报告账号当前是否可选（未禁用、未处于任一冷却/熔断期）。
@@ -326,6 +366,7 @@ func (p *Pool) Acquire(uid string) bool {
 	if limit <= 0 {
 		// 不限：计数仍累加（供状态观测），但永不拒绝。
 		e.inFlight.Add(1)
+		e.bumpPeak(time.Now())
 		return true
 	}
 	for {
@@ -334,6 +375,7 @@ func (p *Pool) Acquire(uid string) bool {
 			return false
 		}
 		if e.inFlight.CompareAndSwap(cur, cur+1) {
+			e.bumpPeak(time.Now())
 			return true
 		}
 	}
@@ -914,6 +956,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:        int(e.inFlight.Load()),
 		BreakerFails:    e.fails,
 		BreakerUntil:    e.breakerUntil,
+	}
+	if pk, ok := e.peakVisible(now); ok {
+		st.InFlightPeak = pk
+		st.PeakActive = true
 	}
 	if st.Cooling {
 		// 冷却剩余秒数（向上取整，避免 0 显示为已到期）。

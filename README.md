@@ -266,6 +266,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|---|
 | 健康 | `disabled` / `until` / `breakerUntil` | `healthy = !disabled && !until && !breakerUntil` |
 | 并发 | `inFlight` | 在途租约（运行态，不持久化），上限 `max_in_flight` |
+| 痕迹 | `inFlightPeak` / `peakAt` | 近 10s 内的在途峰值（运行态，不持久化）：短请求整体落在 GUI 采样间隔内时，瞬时 `inFlight` 读不到，靠峰值呈现"刚忙过" |
 | 统计 | `successCount` / `errTotal` / `lastUsed` | 供成功率权重与闲置补偿 |
 
 ```text

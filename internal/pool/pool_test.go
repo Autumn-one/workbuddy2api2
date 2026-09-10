@@ -1318,3 +1318,120 @@ func TestStatusExposesRuntimeFields(t *testing.T) {
 	}
 	p.Release("u1")
 }
+
+// TestInFlightPeakLeavesTrace 忙闲痕迹：请求结束后瞬时 in_flight 归零，
+// 但近 peakWindow 内的峰值仍在 /status 透出（供界面显示"刚忙过"）。
+func TestInFlightPeakLeavesTrace(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(3)
+	if !p.Acquire("u1") || !p.Acquire("u1") {
+		t.Fatal("two acquires should succeed")
+	}
+	p.Release("u1")
+	p.Release("u1")
+	st, _ := p.Status("u1")
+	if st.InFlight != 0 {
+		t.Errorf("in_flight=%d want 0（请求已结束）", st.InFlight)
+	}
+	if !st.PeakActive || st.InFlightPeak != 2 {
+		t.Errorf("peak_active=%v peak=%d want true/2（痕迹应保留）", st.PeakActive, st.InFlightPeak)
+	}
+}
+
+// TestInFlightPeakSingleRequestVisible 单个瞬时请求也留下痕迹：
+// 即使 Acquire/Release 紧跟着完成，读到的峰值仍 >0。
+func TestInFlightPeakSingleRequestVisible(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(1)
+	p.Acquire("u1")
+	p.Release("u1")
+	st, _ := p.Status("u1")
+	if !st.PeakActive || st.InFlightPeak != 1 {
+		t.Errorf("peak_active=%v peak=%d want true/1", st.PeakActive, st.InFlightPeak)
+	}
+}
+
+// TestInFlightPeakExpires 窗口过期后痕迹消失：直接回拨 peakAt 模拟长时间空闲。
+func TestInFlightPeakExpires(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(1)
+	p.Acquire("u1")
+	p.Release("u1")
+	p.mu.Lock()
+	p.byUID["u1"].peakAt.Store(time.Now().Add(-peakWindow - time.Second).UnixNano())
+	p.mu.Unlock()
+	st, _ := p.Status("u1")
+	if st.PeakActive || st.InFlightPeak != 0 {
+		t.Errorf("peak_active=%v peak=%d want false/0（窗口已过）", st.PeakActive, st.InFlightPeak)
+	}
+}
+
+// TestInFlightPeakNeverBusyIsSilent 从未占用在途的账号不显示痕迹。
+func TestInFlightPeakNeverBusyIsSilent(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	st, _ := p.Status("u1")
+	if st.PeakActive || st.InFlightPeak != 0 {
+		t.Errorf("peak_active=%v peak=%d want false/0（从未忙过）", st.PeakActive, st.InFlightPeak)
+	}
+}
+
+// TestInFlightPeakUnlimitedMode 不限流（max=0）时峰值仍统计，仅不拒绝。
+func TestInFlightPeakUnlimitedMode(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	for i := 0; i < 5; i++ {
+		if !p.Acquire("u1") {
+			t.Fatal("unlimited mode must never reject")
+		}
+	}
+	st, _ := p.Status("u1")
+	if st.InFlight != 5 || st.InFlightPeak != 5 {
+		t.Errorf("in_flight=%d peak=%d want 5/5", st.InFlight, st.InFlightPeak)
+	}
+}
+
+// TestInFlightPeakConcurrentStress 并发抬高峰值：多 goroutine 同时 Acquire/Release，
+// 峰值必须等于观察到的最大并发，且不超上限（无竞态导致的错计）。
+func TestInFlightPeakConcurrentStress(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetMaxInFlight(8)
+	var wg sync.WaitGroup
+	var held, maxHeld int64
+	var mu sync.Mutex
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 200; j++ {
+				if p.Acquire("u1") {
+					mu.Lock()
+					held++
+					if held > maxHeld {
+						maxHeld = held
+					}
+					mu.Unlock()
+					mu.Lock()
+					held--
+					mu.Unlock()
+					p.Release("u1")
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	st, _ := p.Status("u1")
+	if st.InFlight != 0 {
+		t.Errorf("in_flight=%d want 0（全部释放）", st.InFlight)
+	}
+	if st.InFlightPeak > 8 {
+		t.Errorf("peak=%d want <=8（不得超过上限）", st.InFlightPeak)
+	}
+	if st.InFlightPeak == 0 {
+		t.Errorf("peak=0 want >0（应留有痕迹）")
+	}
+}
