@@ -320,7 +320,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, kind)
+			h.applyErrorPolicy(acct.UID, kind, status, string(respBody))
 			fail(acct.UID)
 			continue
 		}
@@ -365,17 +365,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // kind 是唯一权威分类（来自 upstream.Classify），此处不再按原始 status 二次判断。
 // 仅在 chatCompletions 轮转循环内调用：调用方已准备好 lastErr 并打算 continue 换号。
 //
-// 五条路径，各司其职：
+// status/respBody 仅供 ErrModelRateLimit 记录观测证据用，其余分支不使用。
+//
+// 六条路径，各司其职：
 //   - ErrHardCredit → CooldownUntilTomorrow4AM：即时硬冷却到次日 04:00（等签到恢复）。
 //   - ErrSoftRate / ErrNotFound → Cooldown(CoolSoft)：即时软冷却（429/404）。
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
+//   - ErrModelRateLimit → 【仅记录，不处置】：保留原始报文供观测，不改任何状态。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
+func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, status int, respBody string) {
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -391,6 +394,14 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind) {
 	case upstream.ErrServer:
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
+	case upstream.ErrModelRateLimit:
+		// 模型级频率限制：当前【只记录、不处置】（不改冷却/不禁用/不喂熔断）。
+		// 依据：实测该限制是模型级、账号可继续用其他模型，且报文中的"重置可用"时刻
+		// 不可信（预报 22:56 但 02:52 已恢复，且调用零积分消耗）。在观测到足够样本、
+		// 弄清限制来源之前，任何自动冷却都可能造成长时间误伤。
+		if ev, ok := upstream.ParseModelRateLimitFromMsg(status, respBody); ok {
+			log.Printf("model_rate_limit uid=%s status=%d msg=%s", uid, ev.Status, ev.Msg)
+		}
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

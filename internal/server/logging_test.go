@@ -46,8 +46,19 @@ func TestChatStatsReaderTokensFromUsage(t *testing.T) {
 	if !ok || toks != 1 {
 		t.Fatalf("tokens=%d ok=%v, want 1/true (from usage, not rune count)", toks, ok)
 	}
-	if r.TTFB() <= 0 {
-		t.Errorf("ttfb=%v want >0", r.TTFB())
+	// TTFB 用 time.Since 计时，精度到纳秒；但 sseOK 是内存 reader，
+	// 首帧解析可能与 start 落在同一时钟刻度内（Windows 粒度 ~0.5-15.6ms），
+	// 此时 time.Since(start)==0 是【物理正确】的——不是缺陷。
+	// 原断言写死 >0，在快速机器上必然偶发失败（flaky）。
+	//
+	// 这里改断言真正要保证的性质：
+	//  1) 见过 data 帧 → seen 置位（TTFB 记录逻辑被触发）
+	//  2) TTFB 非负（不会出现负值/时钟回拨污染）
+	if r.TTFB() < 0 {
+		t.Errorf("ttfb=%v must not be negative", r.TTFB())
+	}
+	if !r.seen {
+		t.Error("见到 data 帧后 seen 应置位（TTFB 记录逻辑未触发）")
 	}
 }
 

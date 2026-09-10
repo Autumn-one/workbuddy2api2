@@ -19,6 +19,25 @@ var chatSeq atomic.Int64
 // 测试包经 TestMain 置 false 关闭 stdout 噪音，需要断言行输出的测试用 withChatLog 临时开启（R5）。
 var chatLogEnabled = true
 
+// chatLogWriter 请求表格日志的自定义输出目标；nil 表示用 os.Stdout。
+// 刻意不在此处缓存 os.Stdout：nil 时在写日志的瞬间再读，这样测试对
+// os.Stdout 的临时替换（以及 GUI 接管）都仍然生效。
+var chatLogWriter io.Writer
+
+// SetChatLogWriter 更换请求日志输出目标；传 nil 恢复 stdout。
+// 非并发安全（只在启动装配阶段调用一次）。
+func SetChatLogWriter(w io.Writer) {
+	chatLogWriter = w
+}
+
+// chatOut 返回当前请求日志输出目标。
+func chatOut() io.Writer {
+	if chatLogWriter != nil {
+		return chatLogWriter
+	}
+	return os.Stdout
+}
+
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
 	start  time.Time
@@ -153,6 +172,31 @@ func uidPrefix(uid string) string {
 	return uid
 }
 
+// modelColWidth 模型列的显示宽度。
+//
+// 修复说明：原实现硬截断到 11 字符，导致多个不同模型塌缩成同一个名字——
+// "deepseek-v4.1-flash" / "deepseek-v4-flash" / "deepseek-v4-pro" 全部显示为
+// "deepseek-v4"，日志完全丧失区分能力（排障时无法判断实际调用的是哪个模型）。
+// 现放宽到 20 字符（覆盖实测全部模型 ID），并对超长者加省略号提示而非静默截断。
+const modelColWidth = 20
+
+// padModelName 规范化模型名用于定宽表格显示。
+// 超长时保留前缀 + "…"，使"被截断"这件事在视觉上可见，不再静默变名。
+func padModelName(model string) string {
+	if model == "" {
+		return "-"
+	}
+	if len(model) > modelColWidth {
+		// 按 rune 安全截断（模型 ID 目前均为 ASCII，但仍避免切裂多字节字符）。
+		rs := []rune(model)
+		if len(rs) > modelColWidth-1 {
+			rs = rs[:modelColWidth-1]
+		}
+		return string(rs) + "…"
+	}
+	return model
+}
+
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks<0 表示 usage 缺失，显示 "-"。
 func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
@@ -160,9 +204,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	model = padModelName(model)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
@@ -177,7 +219,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(os.Stdout, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,

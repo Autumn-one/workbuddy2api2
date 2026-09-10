@@ -328,8 +328,11 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4 (next-day 04:00)", st.Until.Hour())
 	}
-	if d := time.Until(st.Until); d <= 0 || d > 24*time.Hour {
-		t.Errorf("until %v not within (0,24h]: %v", st.Until, d)
+	// 上界 28h：语义是【次日】04:00（pool.nextDay4AM 用 Day()+1），
+	// 最坏情况 now=00:00:00 → 相距 28h。
+	// 原断言写死 24h，在 now ∈ [00:00, 04:00) 时必然失败——断言有误，非产品缺陷。
+	if d := time.Until(st.Until); d <= 0 || d > 28*time.Hour {
+		t.Errorf("until %v not within (0,28h]: %v", st.Until, d)
 	}
 	// 立即换号成功：good 被选中。
 	stGood, _ := p.Status("good")
