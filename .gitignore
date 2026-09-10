@@ -20,6 +20,8 @@ data/
 /gui-dbg.exe
 /wb2api-gui-test.exe
 /wb2api-test.exe
+# 项目规范要求：测试产物一律用新文件名与旧进程并存（见 AGENTS.md）
+/wb2api-gui-*.exe
 
 # 运行期日志与调试产物
 /gui.log
@@ -27,6 +29,11 @@ data/
 *.log
 # 桌面窗口枚举调试产物（非本项目源码生成）
 /.winlist.txt
+
+# 独立试运行目录（隔离端口与 state，便于与生产实例并存验证）
+/run-v2/
+# 积分功能演示实例（内含真实凭证，绝不能提交）
+/credit-demo/
 
 # Config with secrets (use config.example.json)
 config.json
@@ -46,7 +53,9 @@ PLAN.md
 SPEC.md
 docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
+# 设计/计划文档（但 README.md / 使用指南.md / AGENTS.md 必须进版本库）
+# AGENTS.md 是项目级 AI 预设（测试隔离与模型调用额度规范），必须随仓库分发。
 *.md
 !README.md
 !使用指南.md
+!AGENTS.md
