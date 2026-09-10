@@ -99,9 +99,61 @@ cp config.example.json config.json
 
 ### 3. 启动服务
 
+**方式 A：Docker（推荐）**
+
 ```bash
 docker compose up -d --build
 ```
+
+**方式 B：Windows 原生运行（不用 Docker）**
+
+**最省事：直接双击项目根目录的 `start.bat`。**
+
+命令行方式：
+
+```powershell
+.\run.ps1                                       # 使用 config.json
+.\run.ps1 -Config other.json                    # 指定其它配置
+```
+
+`start.bat` 只是 `run.ps1` 的一层壳：切到项目目录 → `wb2api.exe` 缺失时自动 `go build` →
+前台运行 → 进程退出后保持窗口显示退出码。`Ctrl+C` 停止。
+`run.ps1` 在启动失败时会自动诊断端口（是被占用、还是落在系统保留段里），并给出换端口建议。
+
+> `start.bat` 为纯 ASCII 内容 + CRLF 换行（cmd 按 OEM 代码页解析，中文会乱码，故提示语用英文；
+> 中文诊断信息由 `run.ps1` 输出，它是 UTF-8 with BOM，在 PowerShell 下显示正常）。
+
+想在后台常驻：
+
+```powershell
+Start-Process -FilePath .\wb2api.exe -WindowStyle Hidden   # 启动
+Get-Process wb2api | Stop-Process                          # 停止
+```
+
+原生运行与 Docker 的差异：
+
+| 项 | Docker | 原生运行 |
+|---|---|---|
+| 工作目录 | 容器内 `/app` | 必须**项目根目录**（`auths`/`data`/`config.json` 都是相对路径） |
+| 时区 | compose 的 `TZ=Asia/Shanghai` | 跟随 Windows 系统时区，无需额外设置 |
+| Redis | 同 | 同（未配置 upstash 则纯内存模式） |
+| 监听 | `0.0.0.0:7863` | `config.json` 的 `listen` |
+
+> ⚠️ **Windows 端口保留段**：Hyper-V / WSL2 / Docker Desktop 会预留一批 TCP 端口段，落在保留段内的端口**任何程序都绑不上**，报错：
+> `bind: An attempt was made to access a socket in a way forbidden by its access permissions`（`WSAEACCES`，`os error 10013`）。
+> 查保留段：
+>
+> ```powershell
+> netsh int ipv4 show excludedportrange protocol=tcp
+> ```
+>
+> 本机实测 `7769-7868` 被保留 → 项目默认的 `7863` 正好落在其中，因此本仓库的 `config.json`
+> 已改为 `"listen": "127.0.0.1:8787"`（`config.example.json` 仍保留上游默认 `:7863`）。
+> **下文所有 `localhost:7863` 的示例，在本机请换成 `8787`。**
+> 想局域网/手机访问就把 `listen` 改成 `:8787`（会额外弹一次防火墙授权）。
+
+> 另外：`wb2api.exe` 只在**启动时**读一次 `auths\`，新增账号后需要重启进程才生效
+> （`login.ps1` 会自动检测并提示；Docker 模式下它是靠 `docker restart` 解决的）。
 
 ### 4. 验证
 
@@ -171,6 +223,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
 | `cooldown.soft_rate` | `60s` | 429/404 软冷却时长 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询 |
+| `schedule.credit_refresh` | `30m` | 额度刷新间隔（duration）；`0` = 关闭定时刷新，仅留签到与手动刷新。上游 billing 接口对频率敏感，故串行 + 200ms 间隔 |
 | `schedule.keepalive_hours` | `[22]` | 每日本地时区整点刷新 token 保活 |
 | `upstream.timeout_seconds` | `120` | 短 RPC（刷新/签到/余额/模型）总时长上限 |
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
@@ -293,7 +346,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 |---|---|
 | `#001` | 进程级请求序号 |
 | `18:31:31` | 结束时刻 |
-| `deepseek-v4` | 模型名（超 11 字符截断） |
+| `deepseek-v4.1-flash` | 模型名（超 20 字符截断，带 `…` 提示；此前 11 字符截断会把 flash/pro 等不同模型显示成同一个名字） |
 | `stream` / `sync` | 请求模式 |
 | `200` | 状态码 |
 | `uid=0851ce35` | 账号 UID 前 8 位 |
@@ -363,6 +416,21 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `./login.sh` | OAuth 登录 → 落盘 auth → 重启容器 |
 | `./signin.sh [auths_dir]` | 批量签到（过期先刷新） |
 | `./credit.sh` / `./credit.sh -json` | 积分日报（美化 / 原始 JSON） |
+
+**Windows / PowerShell 等价脚本**（同名 `.ps1`，与 `.sh` 行为一致）：
+
+```powershell
+.\login.ps1                          # 对应 ./login.sh
+.\signin.ps1                         # 对应 ./signin.sh（位置参数亦可：.\signin.ps1 myauths）
+.\signin.ps1 -AuthsDir myauths
+.\credit.ps1                         # 对应 ./credit.sh
+.\credit.ps1 -Json                   # 对应 ./credit.sh -json
+```
+
+- 首次运行会自动 `go build -o <name>.exe ./cmd/...`；`*.exe` 已加入 `.gitignore`
+- 脚本以 **UTF-8 with BOM** 保存（Windows PowerShell 5.1 读取中文的必要条件），需 PowerShell 5.1+
+- 若脚本来自压缩包而被标记为"来自其他计算机"，需先 `Unblock-File`，或改用 `powershell -ExecutionPolicy Bypass -File .\login.ps1`
+- 依赖系统临时目录存放 OAuth state（`os.TempDir()`），不再硬编码 `/tmp`
 
 ## 🛠️ 开发
 

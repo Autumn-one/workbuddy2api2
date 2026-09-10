@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,21 @@ const (
 	ErrNotFound                   // 404 上游偶发 → 短冷却，不累计错误计数（防雪崩）
 	ErrServer                     // 5xx 上游故障
 	ErrClient                     // 其他 4xx / 业务错误
+	// ErrModelRateLimit 模型级频率限制（观测专用，当前【不触发任何冷却】）。
+	//
+	// 实测文案（WorkBuddy 客户端，2026-09-11）：
+	//   "当前您在Deepseek-V4.1-Flash模型的使用量已超出频率限制，
+	//    可在2026-09-11 22:56:11 重置可用。您可切换其他模型或消耗积分继续使用该模型"
+	//
+	// 已实证的结论：
+	//   1) 是【模型级】而非账号级——文案限定到具体模型，且提示"可切换其他模型"；
+	//   2) 文案里的"重置可用"时刻【不可信】——实测预报 22:56:11，但 02:52 已可正常调用，
+	//      且连续 5 次调用积分零消耗（排除"降级扣积分"假设），故该时刻仅为保守上界；
+	//   3) 不冻结账号——账号积分仍充足，其他模型照常可用。
+	//
+	// 因此当前仅做【识别 + 详细记录】，不做冷却处置：先观测真实频率与分布，
+	// 拿到足够样本后再决定退避策略。切勿据报文时间冷却（会误伤数十小时）。
+	ErrModelRateLimit
 )
 
 func (k ErrKind) String() string {
@@ -44,6 +60,8 @@ func (k ErrKind) String() string {
 		return "server"
 	case ErrClient:
 		return "client"
+	case ErrModelRateLimit:
+		return "model_rate_limit"
 	default:
 		return "none"
 	}
@@ -70,7 +88,76 @@ var hardMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// modelRateLimitMarkers 模型级频率限制关键词。
+//
+// 判定策略：必须【同时】命中"频率限制类"与"模型/切换"语境才算，避免把
+// 泛化的 429 限流（应走 ErrSoftRate）误吸进来。实测文案同时含：
+//   - 频率限制类："超出频率限制" / "frequency limit" / "rate limit"
+//   - 模型语境："模型的使用量" / "切换其他模型" / "模型" + "重置可用"
+var modelRateLimitMarkers = []string{
+	"超出频率限制", "频率限制", "模型的使用量",
+	"超出使用频率", "频率已达上限",
+	"frequency limit", "model usage limit", "rate limit exceeded",
+}
+
+// modelContextMarkers 模型语境关键词（与频率限制类关键词合取判定）。
+var modelContextMarkers = []string{
+	"切换其他模型", "其他模型", "模型的使用量", "该模型", "模型已",
+	"another model", "other model", "switch model",
+}
+
+// ModelRateLimitEvidence 模型级频率限制的观测证据（仅记录，不参与调度）。
+type ModelRateLimitEvidence struct {
+	Status int    // HTTP 状态码
+	Msg    string // 原始报文片段（截断）
+}
+
+// isModelRateLimit 判定报文是否描述"模型级频率限制"。
+// 合取条件：(命中频率限制类词) AND (命中模型语境词 OR 同时出现"模型/model"与"重置/reset")。
+func isModelRateLimit(body string) bool {
+	lb := strings.ToLower(body)
+	freq := false
+	for _, m := range modelRateLimitMarkers {
+		if strings.Contains(body, m) || strings.Contains(lb, strings.ToLower(m)) {
+			freq = true
+			break
+		}
+	}
+	if !freq {
+		return false
+	}
+	for _, m := range modelContextMarkers {
+		if strings.Contains(body, m) || strings.Contains(lb, strings.ToLower(m)) {
+			return true
+		}
+	}
+	// 兜底：含"模型"/"model"字样 且 含"重置"/"reset"（实测文案特征）也算。
+	hasModelWord := strings.Contains(body, "模型") || strings.Contains(lb, "model")
+	hasResetWord := strings.Contains(body, "重置") || strings.Contains(lb, "reset")
+	return hasModelWord && hasResetWord
+}
+
+// ParseModelRateLimitFromMsg 从报文文本提取模型级频率限制证据。
+// 返回 ok=false 表示不是该类限制。仅用于记录，不解析"重置时间"
+// （实测该时间不可信，故刻意不提取，避免下游误用）。
+func ParseModelRateLimitFromMsg(status int, msg string) (ModelRateLimitEvidence, bool) {
+	if !isModelRateLimit(msg) {
+		return ModelRateLimitEvidence{}, false
+	}
+	return ModelRateLimitEvidence{Status: status, Msg: truncate(msg, 300)}, true
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
+//
+// 判定顺序（重要）：
+//  1. 402 → ErrHardCredit（最确定的余额信号，优先）
+//  2. 硬余额关键词 → ErrHardCredit
+//  3. 模型级频率限制 → ErrModelRateLimit【必须早于硬余额关键词之外的一切】
+//  4. session dead / 429 / 404 / 5xx / 4xx
+//
+// 第 3 步位置说明：模型级频率限制文案不含余额关键词（已实测），因此不会被第 2 步截走；
+// 但它可能伴随 200/400/429 各种状态码。放在 429/4xx 之前，保证不被 ErrSoftRate/ErrClient
+// 抢先归类——否则该现象将永远无法被观测到。
 func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
@@ -80,6 +167,10 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(lower, strings.ToLower(m)) || strings.Contains(body, m) {
 			return ErrHardCredit
 		}
+	}
+	// 模型级频率限制：先于 429/404/4xx 判定，确保可观测。
+	if isModelRateLimit(body) {
+		return ErrModelRateLimit
 	}
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
@@ -294,6 +385,13 @@ type ModelInfo struct {
 	ContextWindow int64    // = maxInputTokens
 	MaxTokens     int64    // = maxOutputTokens
 	Efforts       []string // reasoning.supportedEfforts（空=未知/固定档）
+	// CreditsText 上游 data.models[].credits 的原文（形如 "x0.51 credits"）。
+	// 语义是【消耗倍率】而非额度：同一个账号积分池按倍率折算各模型可用量。
+	// 上游对部分模型（auto/hunyuan-chat 等）返回空串或非数值串，此时保持原文不解析。
+	CreditsText string
+	// CreditsRate 从 CreditsText 解析出的倍率（如 0.51）；无法解析时为 0。
+	// 仅作换算展示用，不参与任何调度/计费决策。
+	CreditsRate float64
 }
 
 // FetchModels 调上游动态模型接口。
@@ -328,6 +426,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				MaxInputTokens  int64  `json:"maxInputTokens"`
 				MaxOutputTokens int64  `json:"maxOutputTokens"`
 				Disabled        bool   `json:"disabled"`
+				Credits         string `json:"credits"`
 				Reasoning       struct {
 					Effort           string   `json:"effort"`
 					SupportedEfforts []string `json:"supportedEfforts"`
@@ -361,6 +460,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		MaxInputTokens  int64
 		MaxOutputTokens int64
 		Disabled        bool
+		Credits         string
 		Efforts         []string
 	}, len(env.Data.Models))
 	for _, m := range env.Data.Models {
@@ -370,8 +470,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			MaxInputTokens  int64
 			MaxOutputTokens int64
 			Disabled        bool
+			Credits         string
 			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Reasoning.SupportedEfforts}
+		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Credits, m.Reasoning.SupportedEfforts}
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
 	for _, id := range cliIDs {
@@ -379,12 +480,15 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if !ok || m.Disabled {
 			continue
 		}
+		rate, _ := ParseCreditsRate(m.Credits)
 		out = append(out, ModelInfo{
 			ID:            m.ID,
 			Name:          m.Name,
 			ContextWindow: m.MaxInputTokens,
 			MaxTokens:     m.MaxOutputTokens,
 			Efforts:       m.Efforts,
+			CreditsText:   m.Credits,
+			CreditsRate:   rate,
 		})
 	}
 	if len(out) == 0 {
@@ -403,8 +507,64 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
-// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
-func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+// ParseCreditsRate 从上游 credits 原文解析消耗倍率。
+// 实测上游取值形如 "x0.51 credits" / "x0.03" / "x2.20 credits"，也可能为空串
+// （auto / hunyuan-chat 等模型不返回倍率）。解析失败返回 0,false——调用方据此
+// 显示原文而不做换算，绝不猜测。
+func ParseCreditsRate(s string) (float64, bool) {
+	t := strings.TrimSpace(s)
+	if t == "" {
+		return 0, false
+	}
+	t = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(t, "x"), "X"))
+	// 取前导数字部分（小数点/正负号），遇到 " credits" 之类后缀即停。
+	end := 0
+	for end < len(t) {
+		c := t[end]
+		if (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' {
+			end++
+			continue
+		}
+		break
+	}
+	if end == 0 {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(t[:end], 64)
+	if err != nil {
+		return 0, false
+	}
+	return v, true
+}
+
+// PackageDetail 单个套餐包的额度明细（get-user-resource 的 Accounts[] 一行）。
+// 上游积分按【套餐包】发放，同一个账号可能有多行（体验版 + 赠送包等），
+// 但全部折算为同一单位 credits 且共享同一积分池——不存在模型维度的额度。
+type PackageDetail struct {
+	PackageName    string // 如 "CodeBuddy个人体验版"
+	ProductName    string // 如 "腾讯云代码助手"
+	SubProductName string // 如 "腾讯云代码助手 (IDE) - 赠送包"
+	PackageCode    string
+	Remain         int64  // 该包剩余积分
+	Size           int64  // 该包周期总量
+	Used           int64  // 该包已用
+	CycleEndTime   string // 周期结束（到期日）
+	Unit           string // 单位，实测 "credits"
+}
+
+// ResourceDetail 账号额度详情：聚合剩余 + 套餐包明细。
+type ResourceDetail struct {
+	Remain      int64           // 所有包聚合剩余（与 UserResource 同口径）
+	Size        int64           // 所有包聚合总量
+	Used        int64           // 所有包聚合已用
+	TotalDosage int64           // 上游总配额（作 size 下限）
+	Packages    []PackageDetail // 每个套餐包一行
+}
+
+// UserResourceDetail 查询账号额度详情（聚合值 + 套餐包明细）。
+// 与 UserResource 的聚合口径完全一致（Cycle 优先、负值钳 0），额外透出分包明细。
+// UserResource 保留为它的薄封装，既有调用方行为不变。
+func (c *Client) UserResourceDetail(a *auth.Auth) (*ResourceDetail, error) {
 	url := c.billingBase(a) + "/v2/billing/meter/get-user-resource"
 	now := time.Now()
 	body := map[string]any{
@@ -418,18 +578,24 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	BillingHeaders(req, a)
 	data, err := c.doJSON(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
-				Accounts []struct {
+				TotalDosage int64 `json:"TotalDosage"`
+				Accounts    []struct {
 					PackageName         string `json:"PackageName"`
+					ProductName         string `json:"ProductName"`
+					SubProductName      string `json:"SubProductName"`
+					PackageCode         string `json:"PackageCode"`
+					CapacityUnit        string `json:"CapacityUnit"`
+					CycleEndTime        string `json:"CycleEndTime"`
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
 					CapacityUsed        int64  `json:"CapacityUsed"`
@@ -441,24 +607,54 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return nil, fmt.Errorf("resource parse: %w", err)
 	}
+
+	rd := &ResourceDetail{TotalDosage: resp.Response.Data.TotalDosage}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
+		// 与 UserResource 逐字相同的选取口径：Cycle 优先，否则回落 Capacity；负值钳 0。
+		var r, size, used int64
 		switch {
 		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
+			r, size, used = acct.CycleCapacityRemain, acct.CycleCapacitySize, acct.CycleCapacityUsed
 		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
+			r, size, used = acct.CycleCapacityRemain, acct.CycleCapacitySize, acct.CycleCapacityUsed
 		default:
-			r = acct.CapacityRemain
+			r, size, used = acct.CapacityRemain, acct.CapacitySize, acct.CapacityUsed
 		}
 		if r < 0 {
 			r = 0
 		}
-		remain += r
+		rd.Remain += r
+		rd.Size += size
+		rd.Used += used
+		rd.Packages = append(rd.Packages, PackageDetail{
+			PackageName:    acct.PackageName,
+			ProductName:    acct.ProductName,
+			SubProductName: acct.SubProductName,
+			PackageCode:    acct.PackageCode,
+			Remain:         r,
+			Size:           size,
+			Used:           used,
+			CycleEndTime:   acct.CycleEndTime,
+			Unit:           acct.CapacityUnit,
+		})
 	}
-	return remain, nil
+	// TotalDosage 作为 size 下限（与 cmd/credit 口径一致）。
+	if rd.TotalDosage > rd.Size {
+		rd.Size = rd.TotalDosage
+	}
+	return rd, nil
+}
+
+// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
+// 保留原签名与聚合结果；明细见 UserResourceDetail。
+func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+	rd, err := c.UserResourceDetail(a)
+	if err != nil {
+		return 0, err
+	}
+	return rd.Remain, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
@@ -479,4 +675,14 @@ func truncate(s string, n int) string {
 		return s[:n]
 	}
 	return s
+}
+
+// IsAlreadyCheckedIn 判断签到返回的错误是否表示"今天已签到"（属于正常业务提示，不算故障）。
+// 已签到走业务 code 非 0 而非 HTTP 错误，措辞可能是中文或英文（实测 code=10001 "今天已签到"）。
+func IsAlreadyCheckedIn(msg string) bool {
+	s := strings.ToLower(msg)
+	return strings.Contains(s, "已签到") ||
+		strings.Contains(s, "already") ||
+		strings.Contains(s, "checkin") ||
+		strings.Contains(s, "code=400")
 }

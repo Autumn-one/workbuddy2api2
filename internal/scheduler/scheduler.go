@@ -12,12 +12,32 @@ import (
 	"workbuddy2api/internal/upstream"
 )
 
+// CheckinStatus 签到结果分类。
+type CheckinStatus string
+
+const (
+	CheckinOK      CheckinStatus = "ok"      // 签到成功
+	CheckinAlready CheckinStatus = "already" // 今天已签到（正常，非故障）
+	CheckinFailed  CheckinStatus = "failed"  // 其它失败
+)
+
 // Config 调度器依赖。
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	KeepaliveHours []int // 默认 [22]
+
+	// CreditRefreshInterval 额度刷新周期；<=0 关闭定时刷新。
+	// 串行 + 间隔，避免触发上游 billing 限流。
+	CreditRefreshInterval time.Duration
+
+	// OnCheckin 每个账号签到后回调，供 GUI 展示"签到记录"；nil 时静默。
+	OnCheckin func(uid string, status CheckinStatus, detail string)
+	// OnKeepalive 每个账号 token 刷新后回调；nil 时静默。
+	OnKeepalive func(uid string, ok bool, detail string)
+	// OnCreditRefresh 额度刷新后回调（uid, remain, err）；nil 时静默。
+	OnCreditRefresh func(uid string, remain int64, err error)
 }
 
 // Scheduler 调度器。
@@ -53,6 +73,10 @@ func nextFire(now time.Time, hours []int) time.Time {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 额度刷新独立 ticker（周期型，而非整点型）：与签到的整点调度解耦。
+	if s.cfg.CreditRefreshInterval > 0 {
+		go s.creditRefreshLoop(ctx)
+	}
 	all := append(append([]int{}, s.cfg.CheckinHours...), s.cfg.KeepaliveHours...)
 	for {
 		next := nextFire(time.Now(), all)
@@ -71,6 +95,55 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// creditRefreshLoop 周期性刷新所有账号额度显示值。
+//
+// 设计约束（防限流，与项目既有 credit 工具同口径）：
+//   - 串行执行，每账号之间 200ms 间隔，绝不并发打上游 billing；
+//   - 单个账号失败只跳过该账号，不影响其余；
+//   - 只更新显示用积分（SetCredits），不改变任何冷却/熔断状态。
+func (s *Scheduler) creditRefreshLoop(ctx context.Context) {
+	t := time.NewTicker(s.cfg.CreditRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.RunCreditRefreshNow()
+		}
+	}
+}
+
+// RunCreditRefreshNow 立即刷新所有账号额度（供定时循环与 GUI 手动按钮共用）。
+// 禁用账号跳过；返回成功刷新的账号数。
+func (s *Scheduler) RunCreditRefreshNow() int {
+	ok := 0
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.RefreshToken == "" {
+			continue
+		}
+		remain, err := s.cfg.Upstream.UserResource(a)
+		if err != nil {
+			if s.cfg.OnCreditRefresh != nil {
+				s.cfg.OnCreditRefresh(st.UID, 0, err)
+			}
+			time.Sleep(200 * time.Millisecond)
+			continue
+		}
+		s.cfg.Pool.SetCredits(st.UID, remain)
+		ok++
+		if s.cfg.OnCreditRefresh != nil {
+			s.cfg.OnCreditRefresh(st.UID, remain, nil)
+		}
+		time.Sleep(200 * time.Millisecond) // 防限流：串行 + 间隔
+	}
+	return ok
 }
 
 func contains(hours []int, h int) bool {
@@ -93,9 +166,26 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
+		// 签到：成功 / 今天已签到 / 失败 三态；后两者都不断后续余额查询
+		status, detail := CheckinOK, ""
 		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			log.Printf("checkin %s: %v", st.UID, err)
-			// 已签到等业务错误也继续走余额查询
+			detail = err.Error()
+			if upstream.IsAlreadyCheckedIn(detail) {
+				status = CheckinAlready
+			} else {
+				status = CheckinFailed
+			}
+		}
+		switch status {
+		case CheckinOK:
+			log.Printf("checkin %s: ok", st.UID)
+		case CheckinAlready:
+			log.Printf("checkin %s: 今天已签到", st.UID)
+		default:
+			log.Printf("checkin %s: %s", st.UID, detail)
+		}
+		if s.cfg.OnCheckin != nil {
+			s.cfg.OnCheckin(st.UID, status, detail)
 		}
 		remain, err := s.cfg.Upstream.UserResource(a)
 		if err != nil {
@@ -122,10 +212,16 @@ func (s *Scheduler) RunKeepaliveNow() {
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
 				s.cfg.Pool.Disable(st.UID, "12153 session dead")
 			}
+			if s.cfg.OnKeepalive != nil {
+				s.cfg.OnKeepalive(st.UID, false, err.Error())
+			}
 			continue
 		}
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", st.UID, err)
+		}
+		if s.cfg.OnKeepalive != nil {
+			s.cfg.OnKeepalive(st.UID, true, "")
 		}
 	}
 }
