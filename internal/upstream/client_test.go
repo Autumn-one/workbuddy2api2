@@ -197,6 +197,70 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	}
 }
 
+// TestFetchModelsVerifiedEffortsSupplementShownButNotDowngrade 验证本次修正：
+//
+//  1. 上游未声明 supportedEfforts 的模型（deepseek-v4.1-flash）在 ModelInfo.Efforts
+//     中补全实测档位 → GUI / /v1/models 不再误显示为"固定单档"；
+//  2. 【关键不回归】该补全不得进入请求体降级缓存：缓存为空时一切 effort 原样透传，
+//     "none"/"off"（关闭思考）绝不能被档位下限抬成 "low"。
+func TestFetchModelsVerifiedEffortsSupplementShownButNotDowngrade(t *testing.T) {
+	var outbound []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			// 只给 defaultEffort、不给 supportedEfforts（与上游对 deepseek-v4.1-flash 实测一致）。
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"reasoning":{"defaultEffort":"high"}}
+			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
+		default:
+			outbound, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	infos, err := c.FetchModels(a)
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if len(infos) != 1 {
+		t.Fatalf("infos=%+v", infos)
+	}
+
+	// 1) 展示层：补全为 low/high/max（顺序与声明无关，按集合比较）。
+	got := map[string]bool{}
+	for _, e := range infos[0].Efforts {
+		got[e] = true
+	}
+	for _, want := range []string{"low", "high", "max"} {
+		if !got[want] {
+			t.Errorf("ModelInfo.Efforts=%v 缺少 %q（展示层未补全）", infos[0].Efforts, want)
+		}
+	}
+	if len(infos[0].Efforts) != 3 {
+		t.Errorf("ModelInfo.Efforts=%v want 3 项", infos[0].Efforts)
+	}
+	// 默认档仍应来自上游 defaultEffort，不被补全影响。
+	if infos[0].DefaultEffort != "high" {
+		t.Errorf("DefaultEffort=%q want high", infos[0].DefaultEffort)
+	}
+
+	// 2) 降级缓存：上游未声明 → 缓存为空 → "none" 必须原样透传（不回归）。
+	if _, status, _, err := c.ChatStream(a, []byte(`{"model":"deepseek-v4.1-flash","reasoning_effort":"none","messages":[]}`)); err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(outbound, &m); err != nil {
+		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
+	}
+	if got := m["reasoning_effort"]; got != "none" {
+		t.Errorf("reasoning_effort=%v want none（补全档位泄漏进降级缓存，关闭思考被抬高）", got)
+	}
+}
+
 func TestChatStreamHardCreditError(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil

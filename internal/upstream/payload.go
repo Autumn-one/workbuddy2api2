@@ -18,13 +18,26 @@ func PrepareBodyOpt(src []byte, sanitize bool) []byte {
 // 仅当请求显式携带且模型不支持该档位时，改为 ≤请求档位的最高支持档；支持档全部高于请求档时取最低档；
 // 未知模型/未知档位/未携带该字段一律透传。efforts 为 nil 表示未知（不降级）。
 func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]string) []byte {
+	out, _ := PrepareBodyOptWithEffortsAndParams(src, sanitize, efforts)
+	return out
+}
+
+// PrepareBodyOptWithEffortsAndParams 与 PrepareBodyOptWithEfforts 行为完全一致，
+// 额外返回【改写后】的关键参数快照供请求日志展示。
+//
+// 解析失败（非 JSON/空体）时原样返回入参，参数为零值（日志显示"-"）——
+// 与既有 early-return 行为逐字一致，不新增错误路径。
+func PrepareBodyOptWithEffortsAndParams(src []byte, sanitize bool, efforts map[string][]string) ([]byte, EffectiveParams) {
 	if len(src) == 0 {
-		return src
+		return src, EffectiveParams{}
 	}
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src
+		return src, EffectiveParams{}
 	}
+	// 先取客户端原始档位（降级前），供日志区分"请求档"与"实际档"。
+	reqEffort := extractEffort(obj)
+
 	obj["stream"] = true
 	normalizeToolChoice(obj)
 	normalizeRoles(obj)
@@ -36,9 +49,74 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 	}
 	out, err := json.Marshal(obj)
 	if err != nil {
-		return src
+		return src, EffectiveParams{}
 	}
-	return out
+
+	params := extractEffectiveParams(obj)
+	params.EffortReq = reqEffort
+	return out, params
+}
+
+// EffectiveParams 一次出站 chat 请求的关键参数快照（仅供请求日志展示，不参与任何决策）。
+//
+// 取值时机是【改写之后】：展示的必须是真正发往上游的值，而不是客户端原始请求值——
+// 否则 reasoning_effort 被降级时日志会与实际上游行为不符。
+type EffectiveParams struct {
+	// Effort 实际发往上游的思考档位（reasoning_effort / reasoningEffort，已按 supportedEfforts 降级）。
+	// 空串 = 客户端未指定（模型走自身默认档）。
+	Effort string
+	// EffortReq 客户端原始请求档位。仅在发生降级/floored 改写时与 Effort 不同。
+	EffortReq string
+	// MaxTokens 客户端指定的输出上限（max_tokens / max_completion_tokens）；0 = 未指定。
+	MaxTokens int
+}
+
+// Downgraded 报告档位是否被改写（降级或 floor）。
+func (p EffectiveParams) Downgraded() bool {
+	return p.Effort != "" && p.EffortReq != "" && !strings.EqualFold(p.Effort, p.EffortReq)
+}
+
+// extractEffort 取 reasoning_effort / reasoningEffort（snake/camel 双字段兼容）；无则空串。
+func extractEffort(obj map[string]any) string {
+	for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
+		v, present := obj[k]
+		if !present {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			return strings.TrimSpace(s)
+		}
+		return ""
+	}
+	return ""
+}
+
+// extractEffectiveParams 从【已改写】的请求对象里取出关键参数。
+// 只读不写：绝不因日志需求改动出站请求体。
+func extractEffectiveParams(obj map[string]any) EffectiveParams {
+	var p EffectiveParams
+	p.Effort = extractEffort(obj)
+	// 输出上限：优先 max_completion_tokens（OpenAI 新字段），其次 max_tokens。
+	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
+		if v, ok := toInt(obj[k]); ok {
+			p.MaxTokens = v
+			break
+		}
+	}
+	return p
+}
+
+// toInt 把 JSON 解出的数值（float64）或整型转成 int；非数值/缺失返回 false。
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	}
+	return 0, false
 }
 
 // effortRank 档位从低到高。

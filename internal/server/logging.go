@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -48,6 +50,16 @@ type chatStat struct {
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
 
+	// params 实际发往上游的关键参数（思考档位 / 输出上限），由 ChatStreamWithParams 回填。
+	// 零值 = 未取到（如未走到上游调用就失败），日志显示 "-"。
+	params upstream.EffectiveParams
+
+	// inTok 输入（上下文）token 用量，来自末尾 usage 帧的 prompt_tokens；<0 = 缺失。
+	inTok int
+	// thinkTok 思考（推理）token 用量，来自 usage 的 reasoning_tokens / completion_thinking_tokens；
+	// <0 = 缺失。它是"思考深度档位是否真的生效"的直接证据（比 effort= 更接近事实）。
+	thinkTok int
+
 	logged bool
 }
 
@@ -57,7 +69,7 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, inTok: -1, thinkTok: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -66,7 +78,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.inTok, s.thinkTok, s.params)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -79,6 +91,16 @@ type chatStatsReader struct {
 	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
+	// hasPrompt/promptTok 输入（上下文）token 用量：usage.prompt_tokens。
+	// 单独用 bool 标记存在性：0 是合法值，不能拿 0 当"缺失"。
+	hasPrompt bool
+	promptTok int
+	// hasThink/thinkTok 思考（推理）token 用量。上游同时提供两个字段，两者同源：
+	//   - completion_tokens_details.reasoning_tokens（OpenAI 标准字段）
+	//   - completion_thinking_tokens（上游自有字段）
+	// 优先取标准字段，缺失时回落自有字段；只采信上游上报值，不做任何估算。
+	hasThink bool
+	thinkTok int
 	pend     []byte // 已读未返回的行缓存
 }
 
@@ -93,7 +115,24 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+// PromptTokens 返回输入（上下文）token 数，即 usage.prompt_tokens；缺失返回 -1。
+// 这是判断"上下文到底占多少"的唯一可信来源，不做任何本地估算。
+func (s *chatStatsReader) PromptTokens() int {
+	if !s.hasPrompt {
+		return -1
+	}
+	return s.promptTok
+}
+
+// ThinkingTokens 返回思考（推理）token 数；缺失返回 -1。
+func (s *chatStatsReader) ThinkingTokens() int {
+	if !s.hasThink {
+		return -1
+	}
+	return s.thinkTok
+}
+
+// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 token 数。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
@@ -110,6 +149,14 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	var chunk struct {
 		Usage *struct {
 			CompletionTokens int `json:"completion_tokens"`
+			// 用指针区分"缺该字段"（未知）与"真是 0"（合法的空上下文）。
+			PromptTokens *int `json:"prompt_tokens"`
+			// 思考 token：上游自有字段（同样的理由用指针）。
+			ThinkingTokens *int `json:"completion_thinking_tokens"`
+			// 思考 token：OpenAI 标准嵌套字段。
+			Details *struct {
+				ReasoningTokens *int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -117,6 +164,18 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	s.hasUsage = true
 	s.tokens = chunk.Usage.CompletionTokens
+	if chunk.Usage.PromptTokens != nil {
+		s.hasPrompt = true
+		s.promptTok = *chunk.Usage.PromptTokens
+	}
+	// 标准字段优先；两者都存在时取标准字段（与上游实测同值，不会互相矛盾）。
+	if d := chunk.Usage.Details; d != nil && d.ReasoningTokens != nil {
+		s.hasThink = true
+		s.thinkTok = *d.ReasoningTokens
+	} else if chunk.Usage.ThinkingTokens != nil {
+		s.hasThink = true
+		s.thinkTok = *chunk.Usage.ThinkingTokens
+	}
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
@@ -150,11 +209,40 @@ func parseModelFromBody(body []byte) string {
 
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
 func completionTokens(resp map[string]any) int {
+	return usageInt(resp, "completion_tokens")
+}
+
+// promptTokens 从 Aggregate 返回的响应中提取 usage.prompt_tokens（输入/上下文用量）；缺失返回 -1。
+func promptTokens(resp map[string]any) int {
+	return usageInt(resp, "prompt_tokens")
+}
+
+// thinkingTokens 从 Aggregate 返回的响应中提取思考（推理）token 数；缺失返回 -1。
+// 优先 OpenAI 标准字段 usage.completion_tokens_details.reasoning_tokens，
+// 缺失时回落上游自有字段 usage.completion_thinking_tokens。只采信上游上报值。
+func thinkingTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
 	if !ok {
 		return -1
 	}
-	v, ok := u["completion_tokens"].(float64)
+	if d, ok := u["completion_tokens_details"].(map[string]any); ok {
+		if v, ok := d["reasoning_tokens"].(float64); ok {
+			return int(v)
+		}
+	}
+	if v, ok := u["completion_thinking_tokens"].(float64); ok {
+		return int(v)
+	}
+	return -1
+}
+
+// usageInt 取 resp.usage.<key> 的整数值；缺失/类型不符返回 -1。
+func usageInt(resp map[string]any, key string) int {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return -1
+	}
+	v, ok := u[key].(float64)
 	if !ok {
 		return -1
 	}
@@ -198,8 +286,8 @@ func padModelName(model string) string {
 }
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// toks/inTok <0 表示 usage 缺失，显示 "-"；params 零值字段同样显示 "-"。
+func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks, inTok, thinkTok int, params upstream.EffectiveParams) {
 	if !chatLogEnabled {
 		return
 	}
@@ -219,16 +307,52 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | uid=%s | %s | ctx=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
 		uidPrefix(uid),
+		paramsText(params),
+		intOrDash(inTok),
 		ttfbMS,
 		tokField,
+		intOrDash(thinkTok),
 		tokpsField,
 		total.Seconds(),
 	)
+}
+
+// intOrDash 把 token 计数渲染为字段文案；负数（usage 缺失）显示 "-"。
+func intOrDash(n int) string {
+	if n < 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// paramsText 把关键请求参数压成定宽短文案，形如 "effort=high max=8192"。
+//
+// 只输出【真正会影响上游行为】且【排查时真正需要】的参数：
+//   - effort：思考深度档，直接决定思考 token 量与开销（不传显示 effort=-）；
+//     发生降级时显示为 effort=high←max（←后是客户端原始请求值）。
+//   - max=：客户端指定的输出上限（max_tokens / max_completion_tokens），
+//     为 0/未给时显示 max=-（此时由上游默认值决定，日志不猜测）。
+//
+// 上下文大小（prompt_tokens）不在此处，它由 usage 的 ctx= 字段展示：
+// 前者是"客户端要求的输出上限"，后者是"上游实际报的输入用量"，两者不可混同。
+func paramsText(p upstream.EffectiveParams) string {
+	effort := p.Effort
+	if effort == "" {
+		effort = "-"
+	} else if p.Downgraded() {
+		// 明确标出被改写：客户端请求 > 实际发出，避免误读为"日志与请求不符"。
+		effort = fmt.Sprintf("%s←%s", p.Effort, p.EffortReq)
+	}
+	maxTok := "-"
+	if p.MaxTokens > 0 {
+		maxTok = fmt.Sprintf("%d", p.MaxTokens)
+	}
+	return fmt.Sprintf("effort=%s max=%s", effort, maxTok)
 }

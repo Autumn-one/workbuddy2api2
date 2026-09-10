@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 // captureStdout 重定向 os.Stdout 并捕获 fn 期间的全部输出。
@@ -153,10 +154,10 @@ func TestUIDPrefix(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234)
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, 5000, 1800, upstream.EffectiveParams{Effort: "high", EffortReq: "high", MaxTokens: 8192})
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "effort=high", "max=8192", "ctx=5000", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -170,9 +171,9 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1)
+		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, upstream.EffectiveParams{})
 	})
-	for _, want := range []string{"TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"effort=-", "max=-", "ctx=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
@@ -182,8 +183,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1)
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, -1, -1, upstream.EffectiveParams{})
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -291,5 +292,206 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+// TestChatLogsParamsEndToEnd 端到端：请求日志行必须带出客户端指定的关键参数
+// （思考深度 + 输出上限），否则用户无法从日志判断"这次请求到底用了什么配置"。
+func TestChatLogsParamsEndToEnd(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"deepseek-v4.1-flash","stream":true,"reasoning_effort":"max","max_tokens":4096,"messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	for _, want := range []string{"effort=max", "max=4096", "ctx=1", "tok=1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("请求行缺少参数 %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestChatLogsMissingParamsShowDash 未指定参数时显示 "-"（区分"没传"与"传了 0"），
+// 且不影响该行其它字段。
+func TestChatLogsMissingParamsShowDash(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"deepseek-v4.1-flash","messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	for _, want := range []string{"effort=-", "max=-", "| 200 |"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("请求行缺少 %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestChatLogsDowngradedEffortShowsArrow 档位被降级时，日志须显示"实际←请求"，
+// 让人一眼看出网关改写过请求（而不是误以为日志与客户端请求不符）。
+//
+// 通过 FetchModels 走真实的请求体降级通道填缓存（它才是生产路径），
+// 不引入测试专用后门。
+func TestChatLogsDowngradedEffortShowsArrow(t *testing.T) {
+	withChatLog(t)
+	modelsJSON := `{"code":0,"data":{"agents":[{"name":"cli","models":["hy4-preview"]}],"models":[` +
+		`{"id":"hy4-preview","name":"HY4 Preview","maxInputTokens":100000,` +
+		`"reasoning":{"supportedEfforts":["high"]}}]}}`
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	// FetchModels 与 ChatStream 共用 HTTP transport；按 URL 路径分流来区分两者。
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/models") {
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(modelsJSON)),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(sseOK)),
+		}, nil
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+
+	// 先拉一次模型表，把 supportedEfforts 灌进缓存（与启动时 loadModelRates 同路径）。
+	if _, err := up.FetchModels(&auth.Auth{UID: "u1", AccessToken: "at1"}); err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"hy4-preview","reasoning_effort":"max","messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+		}
+	})
+	if !strings.Contains(out, "effort=high←max") {
+		t.Errorf("降级未被标注（期望 effort=high←max）:\n%s", out)
+	}
+}
+
+// TestChatStatsReaderThinkingTokens 思考 token 必须从 usage 里如实读出。
+//
+// 它是本次要新增的关键参数之一：effort= 只是"请求了什么档位"，
+// think= 才是"这个档位实际产生了多少思考"——后者才能验证档位是否真的生效。
+// 实测（deepseek-v4.1-flash）上游同时给两个同值字段，此处两个都要认。
+func TestChatStatsReaderThinkingTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		sse  string
+		want int
+	}{
+		{
+			name: "standard completion_tokens_details.reasoning_tokens",
+			sse: "data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":16," +
+				"\"completion_tokens_details\":{\"reasoning_tokens\":16}}}\n\ndata: [DONE]\n\n",
+			want: 16,
+		},
+		{
+			name: "upstream completion_thinking_tokens fallback",
+			sse:  "data: {\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":4,\"completion_thinking_tokens\":7}}\n\ndata: [DONE]\n\n",
+			want: 7,
+		},
+		{
+			name: "thinking 0 is a real value not missing",
+			sse:  "data: {\"usage\":{\"completion_tokens\":4,\"completion_tokens_details\":{\"reasoning_tokens\":0}}}\n\ndata: [DONE]\n\n",
+			want: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newChatStatsReaderSince(strings.NewReader(c.sse), time.Now())
+			_, _ = io.Copy(io.Discard, r)
+			if got := r.ThinkingTokens(); got != c.want {
+				t.Errorf("ThinkingTokens()=%d want %d", got, c.want)
+			}
+		})
+	}
+}
+
+// TestChatStatsReaderThinkingTokensMissing 无思考字段时报告 -1（缺失），
+// 与"思考为 0"区分开——否则日志无法区分"关闭思考"与"上游没报"。
+func TestChatStatsReaderThinkingTokensMissing(t *testing.T) {
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if got := r.ThinkingTokens(); got != -1 {
+		t.Errorf("ThinkingTokens()=%d want -1（缺失）", got)
+	}
+}
+
+// TestChatStatsReaderPromptTokens 上下文（输入）用量必须来自 usage.prompt_tokens。
+func TestChatStatsReaderPromptTokens(t *testing.T) {
+	sse := "data: {\"usage\":{\"prompt_tokens\":1234,\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if got := r.PromptTokens(); got != 1234 {
+		t.Errorf("PromptTokens()=%d want 1234", got)
+	}
+
+	// 缺失 → -1
+	r2 := newChatStatsReaderSince(strings.NewReader("data: {\"usage\":{\"completion_tokens\":5}}\n\ndata: [DONE]\n\n"), time.Now())
+	_, _ = io.Copy(io.Discard, r2)
+	if got := r2.PromptTokens(); got != -1 {
+		t.Errorf("缺失时 PromptTokens()=%d want -1", got)
+	}
+}
+
+// TestChatLogsSyncRowIncludesPromptAndThinkingTokens 非流式路径同样要带出
+// 上下文与思考用量（usage 走 Aggregate，字段口径必须与流式一致）。
+func TestChatLogsSyncRowIncludesPromptAndThinkingTokens(t *testing.T) {
+	withChatLog(t)
+	sse := "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]," +
+		"\"usage\":{\"prompt_tokens\":321,\"completion_tokens\":12," +
+		"\"completion_tokens_details\":{\"reasoning_tokens\":9}}}\n\ndata: [DONE]\n\n"
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, sse, true
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	out := captureStdout(t, func() {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions",
+			strings.NewReader(`{"model":"m","messages":[]}`))
+		h.ServeHTTP(rec, req)
+		if rec.Code != 200 {
+			t.Fatalf("code=%d", rec.Code)
+		}
+	})
+	for _, want := range []string{"| sync |", "ctx=321", "think=9", "tok=12"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("非流式行缺少 %q:\n%s", want, out)
+		}
 	}
 }

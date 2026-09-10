@@ -257,7 +257,14 @@ func (c *Client) chatBase(a *auth.Auth) string {
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
 func (c *Client) prepareBody(body []byte) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot())
+	out, _ := c.prepareBodyWithParams(body)
+	return out
+}
+
+// prepareBodyWithParams 组装出站请求体，并同时返回【改写后】的关键参数快照。
+// 两者在同一次解析中产生，保证日志展示的参数与真正发出的报文完全一致。
+func (c *Client) prepareBodyWithParams(body []byte) ([]byte, EffectiveParams) {
+	return PrepareBodyOptWithEffortsAndParams(body, c.SanitizeFingerprints, c.effortsSnapshot())
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -349,10 +356,21 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+	rc, status, respBody, _, err = c.ChatStreamWithParams(a, body)
+	return rc, status, respBody, err
+}
+
+// ChatStreamWithParams 与 ChatStream 行为完全一致，额外返回实际发往上游的关键参数
+// （思考档位 / 输出上限）供请求日志展示。
+//
+// 参数来自与出站报文同一次改写（prepareBodyWithParams），因此日志不会与实际上游请求
+// 不一致；对非 JSON 请求体返回零值（日志显示"-"），不影响转发本身。
+func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, params EffectiveParams, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
+	prepared, params := c.prepareBodyWithParams(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 	if err != nil {
-		return nil, 0, nil, err
+		return nil, 0, nil, params, err
 	}
 	ChatHeaders(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -361,7 +379,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err != nil {
 		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
-		return nil, 0, nil, err
+		return nil, 0, nil, params, err
 	}
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -370,15 +388,18 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
-		return nil, resp.StatusCode, raw, nil
+		return nil, resp.StatusCode, raw, params, nil
 	}
 	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
 	// IdleTimeout<=0 时 monitorBody 原样返回底流、无人调 cancel——可接受：
 	// ctx 无 deadline 无 goroutine，连接由 resp.Body.Close 正常清理。
-	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
+	return monitorBody(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, params, nil
 }
 
-// ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
+// ModelInfo 动态模型信息。
+//
+// 字段对应上游 /console/enterprises/personal/models 的 data.models[]。
+// 上游实测提供 23 个字段，此处透出对使用者有意义的部分（调度/展示/客户端感知）。
 type ModelInfo struct {
 	ID            string
 	Name          string
@@ -392,6 +413,98 @@ type ModelInfo struct {
 	// CreditsRate 从 CreditsText 解析出的倍率（如 0.51）；无法解析时为 0。
 	// 仅作换算展示用，不参与任何调度/计费决策。
 	CreditsRate float64
+
+	// ── 思考深度（reasoning）──
+	// DefaultEffort 上游 reasoning.defaultEffort：模型默认思考档（如 "high"）。
+	// 注意：与 Efforts 是【互斥】的两种表达——上游对固定单档模型只给 defaultEffort，
+	// 对可调档模型只给 supportedEfforts。二者都空表示上游未声明。
+	DefaultEffort string
+	// CanDisableThinking 上游 reasoning.canDisableThinking：是否允许关闭思考。
+	CanDisableThinking bool
+	// ReasoningSummary 上游 reasoning.summary（实测恒为 "auto"）。
+	ReasoningSummary string
+
+	// ── 能力标志 ──
+	SupportsImages    bool // 支持图片输入（多模态）
+	SupportsReasoning bool // 是推理模型
+	SupportsToolCall  bool // 支持工具调用
+	OnlyReasoning     bool // 只能推理（无法关闭思考链）
+
+	// ── 描述与元信息 ──
+	DescriptionZh string   // 中文简介
+	DescriptionEn string   // 英文简介
+	Vendor        string   // 厂商标识（e/f/j 等内部代号）
+	Tags          []string // 标签（如 "craft"）
+	IsDefault     bool     // 是否为默认模型
+
+	// ── 采样默认值 ──
+	// 上游直接给出各模型的推荐采样参数；指针语义用零值区分"未提供"。
+	Temperature *float64
+	TopP        *float64
+	TopK        *int64
+}
+
+// dynModel 上游 data.models[] 的原始结构（具名类型，便于扩展与避免匿名结构体位置字面量错位）。
+type dynModel struct {
+	ID                string   `json:"id"`
+	Name              string   `json:"name"`
+	MaxInputTokens    int64    `json:"maxInputTokens"`
+	MaxOutputTokens   int64    `json:"maxOutputTokens"`
+	MaxAllowedSize    int64    `json:"maxAllowedSize"`
+	Disabled          bool     `json:"disabled"`
+	Credits           string   `json:"credits"`
+	DescriptionZh     string   `json:"descriptionZh"`
+	DescriptionEn     string   `json:"descriptionEn"`
+	Vendor            string   `json:"vendor"`
+	SupportsImages    bool     `json:"supportsImages"`
+	SupportsReasoning bool     `json:"supportsReasoning"`
+	SupportsToolCall  bool     `json:"supportsToolCall"`
+	OnlyReasoning     bool     `json:"onlyReasoning"`
+	IsDefault         bool     `json:"isDefault"`
+	Tags              []string `json:"tags"`
+	Temperature       *float64 `json:"temperature"`
+	TopP              *float64 `json:"top_p"`
+	TopK              *int64   `json:"top_k"`
+	Reasoning         struct {
+		Effort             string   `json:"effort"`
+		DefaultEffort      string   `json:"defaultEffort"`
+		SupportedEfforts   []string `json:"supportedEfforts"`
+		CanDisableThinking bool     `json:"canDisableThinking"`
+		Summary            string   `json:"summary"`
+	} `json:"reasoning"`
+}
+
+// verifiedEffortsSupplement 实测确认、但上游未声明的可选思考档。
+//
+// 背景：上游对部分【实际可调档】的模型不返回 reasoning.supportedEfforts（只给
+// defaultEffort），而网关对未声明的模型不做降级（原样透传）——请求因此仍然生效，
+// 但 GUI 与 /v1/models 会把它显示成"固定单档"，与真实能力不符。
+//
+// 收录条件：必须是【本项目实测确认】过的模型，且必须在上游确实未声明时才有意义。
+// 新增条目必须附上实测证据，不得凭推测填入。
+var verifiedEffortsSupplement = map[string][]string{
+	// 证据：同一难题 4 轮独立实测，max 在全部 4 轮中均为最高（low/high 差距明显）；
+	// 与 OpenRouter 公开模型列表独立声明 supported_efforts=["max","high","low"] 一致。
+	// 反面证据（已并入文档）：简单题上三档会重叠甚至倒序（曾有 low 59 > high 46 > max 33），
+	// 那是信噪比不足，不代表档位失效——收录结论以难题实测为准。
+	"deepseek-v4.1-flash": {"low", "high", "max"},
+}
+
+// verifiedEfforts 上游未声明 supportedEfforts 时，用实测档位补全【展示用】能力。
+//
+// 边界：上游一旦声明就以上游为准（本表只填补空缺，不覆盖）。
+// 重要：本函数只影响展示（ModelInfo.Efforts → GUI / /v1/models），
+// 【不影响】请求体降级缓存——缓存只认上游原始声明，否则 "none"/"off" 这类
+// "关闭思考"的请求会被档位下限抬成 "low"，反而改变了既有行为。
+func verifiedEfforts(id string, declared []string) []string {
+	if len(declared) > 0 {
+		return declared
+	}
+	sup, ok := verifiedEffortsSupplement[id]
+	if !ok {
+		return declared
+	}
+	return append([]string(nil), sup...)
 }
 
 // FetchModels 调上游动态模型接口。
@@ -420,18 +533,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	var env struct {
 		Code int `json:"code"`
 		Data struct {
-			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Credits         string `json:"credits"`
-				Reasoning       struct {
-					Effort           string   `json:"effort"`
-					SupportedEfforts []string `json:"supportedEfforts"`
-				} `json:"reasoning"`
-			} `json:"models"`
+			Models []dynModel `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
 				Models []string `json:"models"`
@@ -454,55 +556,62 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	dynMap := make(map[string]struct {
-		ID              string
-		Name            string
-		MaxInputTokens  int64
-		MaxOutputTokens int64
-		Disabled        bool
-		Credits         string
-		Efforts         []string
-	}, len(env.Data.Models))
+	dynMap := make(map[string]dynModel, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = struct {
-			ID              string
-			Name            string
-			MaxInputTokens  int64
-			MaxOutputTokens int64
-			Disabled        bool
-			Credits         string
-			Efforts         []string
-		}{m.ID, m.Name, m.MaxInputTokens, m.MaxOutputTokens, m.Disabled, m.Credits, m.Reasoning.SupportedEfforts}
+		dynMap[m.ID] = m
 	}
 	out := make([]ModelInfo, 0, len(cliIDs))
+	// rawEfforts 只记录【上游原始声明】的可选档，供请求体降级使用（理由见函数尾注释）。
+	rawEfforts := make(map[string][]string, len(cliIDs))
 	for _, id := range cliIDs {
 		m, ok := dynMap[id]
 		if !ok || m.Disabled {
 			continue
 		}
+		if len(m.Reasoning.SupportedEfforts) > 0 {
+			rawEfforts[id] = m.Reasoning.SupportedEfforts
+		}
 		rate, _ := ParseCreditsRate(m.Credits)
+		// 上游对固定单档模型只给 reasoning.effort，对可调档模型只给
+		// reasoning.supportedEfforts（实测互斥）；默认档优先取 defaultEffort，
+		// 回落 effort，保证两类模型都有"默认档"可显示。
+		defEffort := m.Reasoning.DefaultEffort
+		if defEffort == "" {
+			defEffort = m.Reasoning.Effort
+		}
 		out = append(out, ModelInfo{
-			ID:            m.ID,
-			Name:          m.Name,
-			ContextWindow: m.MaxInputTokens,
-			MaxTokens:     m.MaxOutputTokens,
-			Efforts:       m.Efforts,
-			CreditsText:   m.Credits,
-			CreditsRate:   rate,
+			ID:                 m.ID,
+			Name:               m.Name,
+			ContextWindow:      m.MaxInputTokens,
+			MaxTokens:          m.MaxOutputTokens,
+			Efforts:            verifiedEfforts(id, m.Reasoning.SupportedEfforts),
+			CreditsText:        m.Credits,
+			CreditsRate:        rate,
+			DefaultEffort:      defEffort,
+			CanDisableThinking: m.Reasoning.CanDisableThinking,
+			ReasoningSummary:   m.Reasoning.Summary,
+			SupportsImages:     m.SupportsImages,
+			SupportsReasoning:  m.SupportsReasoning,
+			SupportsToolCall:   m.SupportsToolCall,
+			OnlyReasoning:      m.OnlyReasoning,
+			DescriptionZh:      m.DescriptionZh,
+			DescriptionEn:      m.DescriptionEn,
+			Vendor:             m.Vendor,
+			Tags:               m.Tags,
+			IsDefault:          m.IsDefault,
+			Temperature:        m.Temperature,
+			TopP:               m.TopP,
+			TopK:               m.TopK,
 		})
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
-	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
-	cache := make(map[string][]string, len(out))
-	for _, mi := range out {
-		if len(mi.Efforts) > 0 {
-			cache[mi.ID] = mi.Efforts
-		}
-	}
+	// 刷新 effort 能力缓存（供请求体降级）。
+	// 只收录【上游原始声明】的 supportedEfforts：展示层补全的实测档位不参与降级，
+	// 否则"关闭思考"类请求（none/off）会被下限抬成 low，改变既有行为。
 	c.effortsMu.Lock()
-	c.efforts = cache
+	c.efforts = rawEfforts
 	c.effortsMu.Unlock()
 	return out, nil
 }

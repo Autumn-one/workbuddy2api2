@@ -3,6 +3,8 @@ package server
 import (
 	"strings"
 	"testing"
+
+	"workbuddy2api/internal/upstream"
 )
 
 // TestPadModelNameKeepsModelsDistinguishable 回归测试：日志模型名必须能区分不同模型。
@@ -57,7 +59,7 @@ func TestPadModelNameEmpty(t *testing.T) {
 func TestLogChatRowShowsFullModel(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, 0, "deepseek-v4.1-flash", "stream", "uid-12345678", 200, -1)
+		logChatRow(0, 0, "deepseek-v4.1-flash", "stream", "uid-12345678", 200, -1, -1, -1, upstream.EffectiveParams{})
 	})
 	if !strings.Contains(out, "deepseek-v4.1-flash") {
 		t.Errorf("日志应含完整模型名 deepseek-v4.1-flash:\n%s", out)

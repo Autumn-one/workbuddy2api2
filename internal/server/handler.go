@@ -144,6 +144,10 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // modelList 动态获取模型列表并包装成 OpenAI 格式（含 context_length）。
+//
+// 除 OpenAI 标准字段外，额外透出上游提供的扩展信息（reasoning / 能力标志 /
+// 消耗倍率）。这些是【增量字段】，不影响标准客户端解析；需要思考深度档位的
+// 客户端可据此决定传哪个 reasoning_effort。
 func (h *Handler) modelList() []map[string]any {
 	if infos := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
@@ -158,6 +162,51 @@ func (h *Handler) modelList() []map[string]any {
 			}
 			if mi.ContextWindow == 0 {
 				entry["context_length"] = 131072 // 兜底
+			}
+			// 模型显示名与简介（上游 descriptionZh/En）。
+			if mi.Name != "" {
+				entry["name"] = mi.Name
+			}
+			if mi.DescriptionZh != "" {
+				entry["description"] = mi.DescriptionZh
+			} else if mi.DescriptionEn != "" {
+				entry["description"] = mi.DescriptionEn
+			}
+			// 思考深度：默认档 + 可选档 + 能否关闭。
+			// 上游对固定单档模型给 defaultEffort，对可调档模型给 supportedEfforts（互斥）。
+			reasoning := map[string]any{}
+			if mi.DefaultEffort != "" {
+				reasoning["default_effort"] = mi.DefaultEffort
+			}
+			if len(mi.Efforts) > 0 {
+				reasoning["supported_efforts"] = mi.Efforts
+			}
+			if mi.CanDisableThinking {
+				reasoning["can_disable_thinking"] = true
+			}
+			if mi.OnlyReasoning {
+				reasoning["only_reasoning"] = true
+			}
+			if len(reasoning) > 0 {
+				entry["reasoning"] = reasoning
+			}
+			// 能力标志。
+			caps := map[string]any{}
+			if mi.SupportsImages {
+				caps["images"] = true
+			}
+			if mi.SupportsToolCall {
+				caps["tool_calls"] = true
+			}
+			if mi.SupportsReasoning {
+				caps["reasoning"] = true
+			}
+			if len(caps) > 0 {
+				entry["capabilities"] = caps
+			}
+			// 消耗倍率（非额度）：积分池按此倍率折算各模型可用量。
+			if mi.CreditsRate > 0 {
+				entry["credits_multiplier"] = mi.CreditsRate
 			}
 			out = append(out, entry)
 		}
@@ -307,7 +356,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		rc, status, respBody, params, terr := h.cfg.Upstream.ChatStreamWithParams(acct, body)
+		// 实际发往上游的关键参数：无论成败都记下（失败行同样需要"请求了什么"才能排查）。
+		st.params = params
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -337,6 +388,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			st.inTok = stats.PromptTokens()
+			st.thinkTok = stats.ThinkingTokens()
 			rc.Close()
 			return
 		}
@@ -351,6 +404,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		st.inTok = promptTokens(resp)
+		st.thinkTok = thinkingTokens(resp)
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

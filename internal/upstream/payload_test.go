@@ -145,3 +145,106 @@ func TestPrepareBodyOptWithEfforts(t *testing.T) {
 		})
 	}
 }
+
+// TestEffectiveParamsMirrorPreparedBody 关键不变量：日志展示的参数必须与【真正发出的报文】一致。
+//
+// 这是本功能的核心正确性要求——如果日志读的是客户端原始值，那么 reasoning_effort
+// 被降级时日志就会与上游实际收到的请求不符，排障时反而误导。
+func TestEffectiveParamsMirrorPreparedBody(t *testing.T) {
+	efforts := map[string][]string{"glm-5.2-mini": {"low", "medium"}}
+	cases := []struct {
+		name     string
+		body     string
+		wantOut  string // 期望实际发出的 effort
+		wantReq  string // 期望记录的客户端请求 effort
+		wantMax  int
+		wantDown bool
+	}{
+		{
+			name: "passthrough supported effort",
+			body: `{"model":"glm-5.2-mini","reasoning_effort":"low","max_tokens":4096}`,
+			// low 受支持 → 原样；requested == effective → 未降级
+			wantOut: "low", wantReq: "low", wantMax: 4096, wantDown: false,
+		},
+		{
+			name: "downgraded effort is visible as such",
+			body: `{"model":"glm-5.2-mini","reasoning_effort":"high","max_tokens":1024}`,
+			// high 不支持 → 降为 medium；日志须同时保留请求值与实际值
+			wantOut: "medium", wantReq: "high", wantMax: 1024, wantDown: true,
+		},
+		{
+			name:    "unknown model passes through",
+			body:    `{"model":"mystery","reasoning_effort":"max"}`,
+			wantOut: "max", wantReq: "max", wantMax: 0, wantDown: false,
+		},
+		{
+			name:    "camelCase effort field is captured",
+			body:    `{"model":"glm-5.2-mini","reasoningEffort":"high"}`,
+			wantOut: "medium", wantReq: "high", wantMax: 0, wantDown: true,
+		},
+		{
+			name:    "max_completion_tokens takes precedence over max_tokens",
+			body:    `{"model":"glm-5.2","max_tokens":100,"max_completion_tokens":777}`,
+			wantOut: "", wantReq: "", wantMax: 777, wantDown: false,
+		},
+		{
+			name:    "no params yields zeros",
+			body:    `{"model":"glm-5.2","messages":[]}`,
+			wantOut: "", wantReq: "", wantMax: 0, wantDown: false,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, params := PrepareBodyOptWithEffortsAndParams([]byte(c.body), false, efforts)
+
+			// 1) 参数必须等于改写后报文里的真实字段值。
+			var sent map[string]any
+			if err := json.Unmarshal(out, &sent); err != nil {
+				t.Fatalf("unmarshal prepared body: %v", err)
+			}
+			sentEffort, _ := sent["reasoning_effort"].(string)
+			if sentEffort == "" {
+				sentEffort, _ = sent["reasoningEffort"].(string)
+			}
+			if sentEffort != params.Effort {
+				t.Errorf("记录的 effort=%q 与实发报文 %q 不一致（日志会误导排障）", params.Effort, sentEffort)
+			}
+			if sentEffort != c.wantOut {
+				t.Errorf("实发 effort=%q want %q", sentEffort, c.wantOut)
+			}
+
+			// 2) 客户端原始请求档位单独保留，便于识别降级。
+			if params.EffortReq != c.wantReq {
+				t.Errorf("请求 effort=%q want %q", params.EffortReq, c.wantReq)
+			}
+			if got := params.Downgraded(); got != c.wantDown {
+				t.Errorf("Downgraded()=%v want %v", got, c.wantDown)
+			}
+
+			// 3) 输出上限。
+			if params.MaxTokens != c.wantMax {
+				t.Errorf("MaxTokens=%d want %d", params.MaxTokens, c.wantMax)
+			}
+		})
+	}
+}
+
+// TestEffectiveParamsDoesNotChangeBody 日志能力必须零副作用：
+// 与不含参数的旧 API 产出逐字节相同（否则会悄悄改变发往上游的请求）。
+func TestEffectiveParamsDoesNotChangeBody(t *testing.T) {
+	efforts := map[string][]string{"glm-5.2-mini": {"low", "medium"}}
+	bodies := []string{
+		`{"model":"glm-5.2-mini","reasoning_effort":"high","max_tokens":100}`,
+		`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`,
+		`{"model":"x","tool_choice":{"type":"none"},"tools":[{"a":1}]}`,
+		`not json`,
+		``,
+	}
+	for _, b := range bodies {
+		oldOut := PrepareBodyOptWithEfforts([]byte(b), true, efforts)
+		newOut, _ := PrepareBodyOptWithEffortsAndParams([]byte(b), true, efforts)
+		if string(oldOut) != string(newOut) {
+			t.Errorf("body changed for %q:\n old=%s\n new=%s", b, oldOut, newOut)
+		}
+	}
+}
