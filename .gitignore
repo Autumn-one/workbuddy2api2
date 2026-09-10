@@ -9,6 +9,24 @@ data/
 /credit
 /wb2api
 /signin_bin
+# Windows 构建产物（*.ps1 脚本用 go build -o xxx.exe 生成）
+/login.exe
+/credit.exe
+/wb2api.exe
+/signin_bin.exe
+/wb2api-gui.exe
+/wb2api-gui-console.exe
+# 临时调试构建（build-gui.ps1 的 -Dbg 变体等）
+/gui-dbg.exe
+/wb2api-gui-test.exe
+/wb2api-test.exe
+
+# 运行期日志与调试产物
+/gui.log
+/goroutine-dump.txt
+*.log
+# 桌面窗口枚举调试产物（非本项目源码生成）
+/.winlist.txt
 
 # Config with secrets (use config.example.json)
 config.json
@@ -31,3 +49,4 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+!使用指南.md

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"workbuddy2api/internal/appconfig"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
@@ -24,12 +25,12 @@ func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
-	cfg, err := Load(*cfgPath)
+	cfg, err := appconfig.Load(*cfgPath)
 	if err != nil {
 		// 配置文件不存在时给一次机会用纯默认 + env
 		if os.IsNotExist(err) {
 			log.Printf("config %s not found, using defaults+env", *cfgPath)
-			cfg, err = Load("")
+			cfg, err = appconfig.Load("")
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)

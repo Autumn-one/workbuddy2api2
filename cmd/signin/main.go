@@ -115,13 +115,9 @@ func main() {
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
 }
 
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样
+// 已签判定复用 upstream.IsAlreadyCheckedIn（与调度器同一套规则，避免两处漂移）
 func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
+	return upstream.IsAlreadyCheckedIn(msg)
 }
 
 func trunc(s string, n int) string {

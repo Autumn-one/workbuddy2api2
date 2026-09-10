@@ -1,5 +1,5 @@
 // config.go 加载 JSON 配置 + 环境变量覆盖。
-package main
+package appconfig
 
 import (
 	"encoding/json"
@@ -27,6 +27,11 @@ type Config struct {
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
+		// CreditRefresh 额度刷新间隔（duration 字符串，如 "30m"）。
+		// 空/非法/<=0 表示关闭定时刷新（仅保留签到与手动刷新）。
+		// 上游 billing 接口对频率敏感（项目自带 credit 工具都串行加 200ms 间隔），
+		// 故默认 30m：一天 48 次/账号，足以反映签到后的余额变化，限流风险低。
+		CreditRefresh string `json:"credit_refresh"`
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -69,6 +74,8 @@ type Config struct {
 	BreakerCooldownMaxD time.Duration `json:"-"`
 	SessionTTL          time.Duration `json:"-"`
 	SessionGCInterval   time.Duration `json:"-"`
+	// CreditRefreshDur 解析后的额度刷新间隔；0 表示关闭定时刷新。
+	CreditRefreshDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -82,6 +89,7 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "60s"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.CreditRefresh = "30m"
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -172,6 +180,17 @@ func (c *Config) normalize() error {
 	}
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
+	}
+	// 额度刷新：空串视为未设置 → 用默认 30m；显式 "0" / "0s" → 关闭定时刷新。
+	// 其余非法格式报错，避免用户写了错值却以为已生效。
+	if c.Schedule.CreditRefresh == "" {
+		c.Schedule.CreditRefresh = "30m"
+	}
+	if c.CreditRefreshDur, err = time.ParseDuration(c.Schedule.CreditRefresh); err != nil {
+		return fmt.Errorf("schedule.credit_refresh: %w", err)
+	}
+	if c.CreditRefreshDur < 0 {
+		c.CreditRefreshDur = 0
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
