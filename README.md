@@ -267,6 +267,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 健康 | `disabled` / `until` / `breakerUntil` | `healthy = !disabled && !until && !breakerUntil` |
 | 并发 | `inFlight` | 在途租约（运行态，不持久化），上限 `max_in_flight` |
 | 痕迹 | `inFlightPeak` / `peakAt` | 近 10s 内的在途峰值（运行态，不持久化）：短请求整体落在 GUI 采样间隔内时，瞬时 `inFlight` 读不到，靠峰值呈现"刚忙过" |
+| 观测 | `creditsKnown` / 积分变动历史 | `credits` 是否为上游可信值（随 state 落盘）；每次变动追加一条 `data/credit-log.jsonl` 记录（签到 +100、调用消耗、额度刷新），仅观测不参与选号/冷却/熔断决策。GUI「日志」页可按单个账号过滤查看（双击账号行直达） |
 | 统计 | `successCount` / `errTotal` / `lastUsed` | 供成功率权重与闲置补偿 |
 
 ```text
@@ -319,16 +320,87 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 容器时区由 `TZ` 控制（compose 默认 `Asia/Shanghai`）。
 
+### 积分变动历史（data/credit-log.jsonl）
+
+每次账号积分发生变动都会**追加**一条记录，用于回答"我的积分怎么少了/多了"：
+
+```json
+{"at":"09-11 06:32:31","uid":"2b145025-...","old":2078,"new":2077,"delta":-1,"reason":"自动刷新"}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `at` | 变动时刻 `MM-DD HH:MM:SS`（本地时区，与签到记录同格式） |
+| `uid` | 完整账号 UID（存 UID 而非昵称：昵称会变，UID 不变，按 UID 过滤不会因改名而失效） |
+| `old` / `new` | 变动前后余额快照 |
+| `delta` | `new - old`；首次拿到余额时无参照系，`delta=0` 且带 `first:true` |
+| `reason` | 变动来源：`签到` / `签到（今天已签到）` / `自动刷新` / `手动刷新` / `签到（启动补签）` 等 |
+
+**为什么是 JSONL 而不是 JSON 数组**：数组格式每次落盘都要整体重写，代价随历史长度增长。
+而积分写入很频繁：实测本地示例数据 3 个账号在 56 分钟内写了 26 条（与 `credit_refresh`
+设为 2 分钟一致），即约 90 条/小时。原实现下磁盘上限 2000 条（约 22 小时）、
+界面只显示最新 500 条（约 5.5 小时），更早的记录就看不到了。JSONL 只 append 一行，
+代价与历史长度无关，因此保留上限提高到 20000 条（约 9 天），界面与落盘同一口径，
+且单行损坏只丢那一行（数组格式下一处损坏会丢全部）。
+
+**升级兼容**：旧的 `credit-log.json`（数组格式）在新文件不存在时会被自动读入，
+旧文件保留原地不删不改，便于回退与人工核对。
+
+**只观测**：本机制不参与选号、冷却、熔断任何决策；落盘失败也不影响签到/刷新主流程。
+
 ## 🔌 API 端点
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存） |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）**含扩展参数**：思考深度档位、能力标志、消耗倍率 |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503 |
 
 > 鉴权规则：仅当 `api_key` 非空才校验 `Authorization: Bearer <api_key>`；**`api_key` 为空时上述端点直接放行**；`/healthz` 恒无鉴权。
+
+### 模型列表的扩展参数
+
+`/v1/models` 除 OpenAI 标准字段（`id`/`object`/`created`/`owned_by`）外，透出上游
+`/console/enterprises/personal/models` 提供的扩展信息。标准客户端可忽略这些增量字段：
+
+```json
+{
+  "id": "glm-5.3",
+  "object": "model",
+  "context_length": 1000000,
+  "max_output_tokens": 48000,
+  "name": "GLM-5.3",
+  "description": "能力均衡，适合日常使用",
+  "reasoning": {
+    "default_effort": "high",
+    "supported_efforts": ["low", "high", "max"],
+    "can_disable_thinking": true,
+    "only_reasoning": true
+  },
+  "capabilities": { "images": true, "tool_calls": true, "reasoning": true },
+  "credits_multiplier": 0.79
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `reasoning.default_effort` | 模型默认思考档（如 `high`） |
+| `reasoning.supported_efforts` | **可选**思考档列表；缺失=固定单档模型（上游只给 `default_effort`） |
+| `reasoning.can_disable_thinking` | 是否允许关闭思考链 |
+| `reasoning.only_reasoning` | 是否只能推理 |
+| `capabilities.*` | 图片输入 / 工具调用 / 推理能力 |
+| `credits_multiplier` | 消耗倍率（非额度）：账号积分池按此折算各模型可用量 |
+| `description` | 中文简介（缺失回落英文） |
+
+> **档位降级**：请求体带 `reasoning_effort` / `reasoningEffort` 时，网关按
+> `supported_efforts` 自动降级（请求档不支持则取 ≤ 请求档的最高支持档；全部高于
+> 请求档则 floor 到最低档），并在日志打 `reasoning_effort downgraded/floored`。
+> 见 [`internal/upstream/payload.go`](internal/upstream/payload.go)。
+
+> **注意**：上游按**账号统一积分池**扣费，**不存在模型级额度**——`credits_multiplier`
+> 反映的是消耗速率差异，不是"该模型还剩多少"。同一账号的积分由多个套餐包叠加而成
+> （`get-user-resource` 的 `Accounts[]`，每个包有独立到期日）。
 
 ### 流式行为细节
 
@@ -340,7 +412,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 每个 `/v1/chat/completions` 请求结束时输出一行表格日志（stdout）：
 
 ```text
-| #001 | 18:31:31 | deepseek-v4 | stream | 200 | uid=0851ce35 | TTFB=801ms | tok=60 | 23.5tok/s | total=2.6s |
+| #001 | 18:31:31 | deepseek-v4.1-flash | stream | 200 | uid=0851ce35 | effort=low max=16 | ctx=32 | TTFB=801ms | tok=60 | think=16 | 23.5tok/s | total=2.6s |
 ```
 
 | 字段 | 说明 |
@@ -351,10 +423,31 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `stream` / `sync` | 请求模式 |
 | `200` | 状态码 |
 | `uid=0851ce35` | 账号 UID 前 8 位 |
+| `effort=` | **实际发往上游**的思考深度档位（`reasoning_effort` / `reasoningEffort`）；未指定为 `-` |
+| `max=` | 客户端指定的输出上限（`max_completion_tokens` 优先，其次 `max_tokens`）；未指定为 `-` |
+| `ctx=` | 输入（上下文）token 数，来自末帧 `usage.prompt_tokens`；缺失为 `-` |
 | `TTFB` | 流式首帧耗时（非流式为 `-`） |
-| `tok` / `tok/s` / `total` | 输出 token 数 / 速率 / 总时长 |
+| `tok` | 输出 token 数，来自末帧 `usage.completion_tokens`；缺失为 `-` |
+| `think=` | **思考 token 数**，来自 `usage.completion_tokens_details.reasoning_tokens`（缺失回落 `completion_thinking_tokens`）。它是"档位是否真的生效"的直接证据：`effort=` 只说明请求了什么，`think=` 才说明思考了多少 |
+| `tok/s` / `total` | 输出速率 / 总时长 |
 
-**敏感度**：日志不含任何 token 明文（详见[安全与合规](#-安全与合规)），无落盘日志文件。
+### 参数展示的三条规则
+
+1. **`effort=` 记的是实际值，不是客户端原值。** 取值发生在请求体改写【之后】
+   （`PrepareBodyOptWithEffortsAndParams` 与出站报文同一次解析），因此日志与上游收到的请求
+   永远一致。
+2. **档位被降级时显示 `effort=high←max`：** `←` 右侧是客户端原始请求值。例如
+   `hy4-preview` 只支持 `high`，请求 `max` 会被改写为 `high`，日志不会静默改变含义。
+3. **缺失一律显示 `-`，不显示 `0`。** `ctx=-` / `think=-` 表示上游未上报该字段，
+   与"上下文为 0" / "思考为 0"是两回事；`max=-` 表示客户端没传输出上限（由上游默认值兜底）。
+   实现上用 `*int`（而非 `int`）区分"缺字段"与"真是 0"。
+
+> **为什么不用 `tok` 直接代表思考量？** 上游的 `completion_tokens` 实测**已包含**思考 token
+> （`completion_tokens=16` 时 `reasoning_tokens=16`），所以单看 `tok` 无法区分"思考"与"回答"。
+> `think` 单独列出后才能算出回答本身的长度。
+
+**敏感度**：日志不含任何 token 明文（详见[安全与合规](#-安全与合规)）；GUI 模式下日志同时进入
+界面面板与 exe 旁的 `gui.log`（CLI 模式仅 stdout）。
 
 ## 🛡️ 安全与合规
 
@@ -371,7 +464,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 ```
 
 - **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
-- **备份**：备份 `auths/`（凭证）与 `data/state.json`（池状态：积分/冷却/计数）；配置 Upstash 后状态另镜像至 Redis
+- **备份**：备份 `auths/`（凭证）、`data/state.json`（池状态：积分/冷却/计数）与观测记录 `data/checkin-log.json`（签到）、`data/credit-log.jsonl`（积分变动历史，JSONL 每行一条）；配置 Upstash 后状态另镜像至 Redis
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`
 
 ### 2. 网络暴露与日志敏感度
