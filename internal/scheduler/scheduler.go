@@ -136,7 +136,7 @@ func (s *Scheduler) RunCreditRefreshNow() int {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
-		s.cfg.Pool.SetCredits(st.UID, remain)
+		s.cfg.Pool.SetCreditsReason(st.UID, remain, "自动刷新")
 		ok++
 		if s.cfg.OnCreditRefresh != nil {
 			s.cfg.OnCreditRefresh(st.UID, remain, nil)
@@ -144,6 +144,18 @@ func (s *Scheduler) RunCreditRefreshNow() int {
 		time.Sleep(200 * time.Millisecond) // 防限流：串行 + 间隔
 	}
 	return ok
+}
+
+// checkinReason 把签到结果映射为积分变动归因文案（供积分历史展示）。
+func checkinReason(status CheckinStatus) string {
+	switch status {
+	case CheckinOK:
+		return "签到"
+	case CheckinAlready:
+		return "签到（今天已签到）"
+	default:
+		return "签到失败后余额查询"
+	}
 }
 
 func contains(hours []int, h int) bool {
@@ -192,7 +204,7 @@ func (s *Scheduler) RunCheckinNow() {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.ReenableIfCreditsReason(st.UID, remain, checkinReason(status))
 	}
 }
 

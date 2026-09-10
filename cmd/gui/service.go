@@ -42,6 +42,9 @@ type Service struct {
 	OnKeepalive       func(uid string, ok bool, detail string)
 	OnCreditRefresh   func(uid string, remain int64, err error)
 	OnAccountsChanged func()
+	// OnCreditsChanged 积分变动回调（GUI 落盘+刷新「积分记录」表格）。
+	// 可能从任意 goroutine 调用，实现必须并发安全且非阻塞。
+	OnCreditsChanged func(ch pool.CreditChange)
 }
 
 func NewService() *Service { return &Service{} }
@@ -121,13 +124,18 @@ func (s *Service) AuthByUID(uid string) *auth.Auth {
 
 // SetCredits 更新账号积分显示值（供手动/启动刷新额度用）。服务未启动时空操作。
 func (s *Service) SetCredits(uid string, credits int64) {
+	s.SetCreditsReason(uid, credits, "手动刷新")
+}
+
+// SetCreditsReason 与 SetCredits 相同，但显式标注变动来源（供积分历史归因）。
+func (s *Service) SetCreditsReason(uid string, credits int64, reason string) {
 	s.mu.Lock()
 	p := s.pool
 	s.mu.Unlock()
 	if p == nil {
 		return
 	}
-	p.SetCredits(uid, credits)
+	p.SetCreditsReason(uid, credits, reason)
 }
 
 // Start 按配置装配并启动服务（幂等）。
@@ -157,6 +165,7 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
+	p.SetCreditChangeHook(s.OnCreditsChanged)
 
 	up := upstream.New()
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second

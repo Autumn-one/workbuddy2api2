@@ -1435,3 +1435,180 @@ func TestInFlightPeakConcurrentStress(t *testing.T) {
 		t.Errorf("peak=0 want >0（应留有痕迹）")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// T5 积分变动历史（观测，不参与决策）
+// ---------------------------------------------------------------------------
+
+// TestCreditChangeCheckinGain 签到场景：930 → 1030 应记录 delta=+100、来源=签到。
+func TestCreditChangeCheckinGain(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	var got []CreditChange
+	p.SetCreditChangeHook(func(ch CreditChange) { got = append(got, ch) })
+
+	p.SetCreditsReason("u1", 930, "自动刷新") // 首个可信值（首次）
+	p.ReenableIfCreditsReason("u1", 1030, "签到")
+
+	if len(got) != 2 {
+		t.Fatalf("记录数=%d want 2: %+v", len(got), got)
+	}
+	if !got[0].First || got[0].Delta != 0 {
+		t.Errorf("首条应为首次且 delta=0: %+v", got[0])
+	}
+	if got[1].Old != 930 || got[1].New != 1030 || got[1].Delta != 100 {
+		t.Errorf("签到变动应 930→1030 delta=+100: %+v", got[1])
+	}
+	if got[1].Reason != "签到" {
+		t.Errorf("来源=%q want 签到", got[1].Reason)
+	}
+}
+
+// TestCreditChangeConsume 消耗场景：1030 → 980 应记录 delta=-50。
+func TestCreditChangeConsume(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	var last CreditChange
+	p.SetCreditChangeHook(func(ch CreditChange) { last = ch })
+
+	p.SetCreditsReason("u1", 1030, "自动刷新")
+	p.SetCreditsReason("u1", 980, "自动刷新")
+
+	if last.Old != 1030 || last.New != 980 || last.Delta != -50 {
+		t.Errorf("消耗变动应 1030→980 delta=-50: %+v", last)
+	}
+	if last.First {
+		t.Errorf("第二次变动不该是首次: %+v", last)
+	}
+}
+
+// TestCreditChangeFirstIsNotFabricated 首次获取不谎报涨跌：从未知 0 → 500 时
+// delta 必须为 0 且标记 First（否则会被误读成"涨了 500"）。
+func TestCreditChangeFirstIsNotFabricated(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	var got []CreditChange
+	p.SetCreditChangeHook(func(ch CreditChange) { got = append(got, ch) })
+
+	p.SetCreditsReason("u1", 500, "自动刷新")
+	if len(got) != 1 {
+		t.Fatalf("记录数=%d want 1", len(got))
+	}
+	if !got[0].First || got[0].Delta != 0 {
+		t.Errorf("首次应 First=true delta=0（不谎报）: %+v", got[0])
+	}
+}
+
+// TestCreditChangeNoChangeIsSilent 值未变化时不产生记录（避免刷新噪声刷屏）。
+func TestCreditChangeNoChangeIsSilent(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	n := 0
+	p.SetCreditChangeHook(func(ch CreditChange) { n++ })
+
+	p.SetCreditsReason("u1", 500, "自动刷新") // 首次：记录
+	p.SetCreditsReason("u1", 500, "自动刷新") // 无变化：不记录
+	if n != 1 {
+		t.Errorf("记录数=%d want 1（无变化应静默）", n)
+	}
+}
+
+// TestCreditChangeHookNilNoPanic 未装配回调时不得 panic（网关可独立运行，无 GUI）。
+func TestCreditChangeHookNilNoPanic(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsReason("u1", 100, "自动刷新")
+	p.ReenableIfCreditsReason("u1", 200, "签到")
+	st, _ := p.Status("u1")
+	if st.Credits != 200 {
+		t.Errorf("credits=%d want 200（记录不得改变数值）", st.Credits)
+	}
+}
+
+// TestCreditChangeDoesNotAlterReenableSemantics 回归：ReenableIfCredits 的解冻语义
+// 必须与加记录前完全一致——remain>0 才解冻，remain=0 只更新数值且保持冷却。
+func TestCreditChangeDoesNotAlterReenableSemantics(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Cooldown("u1", CoolHard, time.Hour, "balance")
+	// remain=0：不解冻，保持冷却
+	p.ReenableIfCreditsReason("u1", 0, "签到")
+	st, _ := p.Status("u1")
+	if !st.Cooling {
+		t.Error("remain=0 不该解冻（既有语义）")
+	}
+	if st.Credits != 0 {
+		t.Errorf("credits=%d want 0", st.Credits)
+	}
+	// remain>0：解冻
+	p.ReenableIfCreditsReason("u1", 100, "签到")
+	st, _ = p.Status("u1")
+	if st.Cooling {
+		t.Error("remain>0 应解冻（既有语义）")
+	}
+	if st.Credits != 100 {
+		t.Errorf("credits=%d want 100", st.Credits)
+	}
+}
+
+// TestSetCreditsBackwardCompatible SetCredits（旧签名）仍生效且默认来源可读。
+func TestSetCreditsBackwardCompatible(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsReason("u1", 10, "自动刷新")
+	p.SetCredits("u1", 20) // 旧调用点
+	st, _ := p.Status("u1")
+	if st.Credits != 20 {
+		t.Errorf("credits=%d want 20", st.Credits)
+	}
+}
+
+// TestCreditsKnownPersistsAcrossReload 回归：重启后首次刷新不应被误判为"首次获取"。
+// credits_known 必须随 state 落盘，否则每次重启都会把真实涨跌吞成 delta=0。
+func TestCreditsKnownPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	var got []CreditChange
+	p.SetCreditChangeHook(func(ch CreditChange) { got = append(got, ch) })
+	p.SetCreditsReason("u1", 1000, "自动刷新") // 首次：记录 First=true
+	p.Flush()
+
+	// 模拟进程重启
+	p2 := New(fp)
+	p2.RestoreFromSnapshot()
+	var got2 []CreditChange
+	p2.SetCreditChangeHook(func(ch CreditChange) { got2 = append(got2, ch) })
+	p2.SetCreditsReason("u1", 950, "自动刷新") // 真实消耗 -50
+
+	if len(got2) != 1 {
+		t.Fatalf("重启后应产生 1 条记录, got %d: %+v", len(got2), got2)
+	}
+	if got2[0].First {
+		t.Errorf("重启后不该判为首次: %+v", got2[0])
+	}
+	if got2[0].Delta != -50 || got2[0].Old != 1000 || got2[0].New != 950 {
+		t.Errorf("应记录真实变动 1000→950 delta=-50: %+v", got2[0])
+	}
+}
+
+// TestCreditsKnownOldStateFile 旧 state.json 无 credits_known 字段：
+// 读为 false（无法区分真 0 与未知），首次变更仍按首次处理——不误报涨跌。
+func TestCreditsKnownOldStateFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+	old := `{"accounts":{"u1":{"credits":777,"disabled":false}}}`
+	if err := os.WriteFile(fp, []byte(old), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p := New(fp)
+	p.RestoreFromSnapshot()
+	var got []CreditChange
+	p.SetCreditChangeHook(func(ch CreditChange) { got = append(got, ch) })
+	p.SetCreditsReason("u1", 777, "自动刷新")
+	if len(got) != 1 || !got[0].First || got[0].Delta != 0 {
+		t.Errorf("旧文件应保守判为首次 delta=0: %+v", got)
+	}
+}

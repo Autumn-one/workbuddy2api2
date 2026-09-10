@@ -35,11 +35,12 @@ func (a *app) buildUI() error {
 		Title:    appName + " · 控制台",
 		Icon:     ic,
 		MinSize:  dcl.Size{Width: 880, Height: 600},
-		Size:     dcl.Size{Width: 1000, Height: 700},
+		Size:     dcl.Size{Width: 1080, Height: 720},
 		Font:     dcl.Font{Family: "Segoe UI", PointSize: 9},
 		Layout:   dcl.VBox{MarginsZero: false},
 		Children: []dcl.Widget{
 			dcl.TabWidget{
+				AssignTo: &a.tabs,
 				Pages: []dcl.TabPage{
 					// ══════════════ 服务 ══════════════
 					{
@@ -113,6 +114,8 @@ func (a *app) buildUI() error {
 								Model:            a.accounts,
 								AlternatingRowBG: true,
 								StretchFactor:    1,
+								// 双击一行 = 直接看该账号的积分变化历史（跳到「日志」页并过滤）。
+								OnItemActivated: a.onAccountActivated,
 								Columns: []dcl.TableViewColumn{
 									{Title: "昵称", Width: 150},
 									{Title: "UID", Width: 150},
@@ -122,7 +125,7 @@ func (a *app) buildUI() error {
 									{Title: "成功/总", Width: 90, Alignment: dcl.AlignFar},
 								},
 							},
-							dcl.Label{Text: "提示：账号来自 auths 目录下的凭证文件。选中一行可删除；删完记得服务里点一下「重启」。"},
+							dcl.Label{AssignTo: &a.lblAccountsHint, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行可删除；双击一行看该账号的积分变化历史。"},
 						},
 					},
 
@@ -131,21 +134,41 @@ func (a *app) buildUI() error {
 						Title:  "模型",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "模型消耗倍率（来自上游 models 接口的 credits 字段）。" +
-								"\r\n倍率越低越省积分：账号剩余积分 ÷ 倍率 ≈ 该模型可用次数当量。" +
-								"\r\n注意：上游按【账号统一积分池】扣费，不存在模型级额度；此表只反映消耗速率差异。"},
-							dcl.PushButton{AssignTo: &btnReloadRates, Text: "重新加载倍率", MinSize: dcl.Size{Width: 110}, OnClicked: func() { go a.loadModelRates() }},
+							dcl.Label{Text: "模型参数（全部来自上游 models 接口实时拉取，非本地写死；缓存 1 小时）。" +
+								"\r\n· 思考深度：默认档（上游 defaultEffort）+ 可选档（supportedEfforts）。可调档模型才能切档，" +
+								"其余为固定单档。请求里写 reasoning_effort 时，网关会按可选档自动降级。" +
+								"\r\n· 倍率越低越省积分：账号剩余积分 ÷ 倍率 ≈ 可用次数当量。" +
+								"\r\n· 注意：上游按【账号统一积分池】扣费，不存在模型级额度；倍率仅反映消耗速率差异。" +
+								"\r\n提示：表格列较多，可拖动表头边界或横向滚动查看全部参数。"},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.PushButton{AssignTo: &btnReloadRates, Text: "重新加载参数", MinSize: dcl.Size{Width: 110}, OnClicked: func() { go a.loadModelRates() }},
+									dcl.HSpacer{},
+									dcl.Label{AssignTo: &a.lblModelHint, Text: ""},
+								},
+							},
 							dcl.TableView{
 								AssignTo:         &a.tvModelRates,
 								Model:            a.modelRates,
 								AlternatingRowBG: true,
 								StretchFactor:    1,
 								Columns: []dcl.TableViewColumn{
-									{Title: "模型 ID", Width: 260},
-									{Title: "名称", Width: 220},
-									{Title: "倍率", Width: 100, Alignment: dcl.AlignFar},
+									{Title: "模型 ID", Width: 160},
+									{Title: "名称", Width: 150},
+									{Title: "默认思考", Width: 80},
+									{Title: "可选思考档", Width: 110},
+									{Title: "可关思考", Width: 80},
+									{Title: "倍率", Width: 70, Alignment: dcl.AlignFar},
+									{Title: "上下文", Width: 90, Alignment: dcl.AlignFar},
+									{Title: "最大输出", Width: 90, Alignment: dcl.AlignFar},
+									{Title: "图片", Width: 55},
+									{Title: "工具", Width: 55},
+									{Title: "厂商", Width: 55},
+									{Title: "说明", Width: 200},
 								},
 							},
+							dcl.Label{AssignTo: &a.lblModelDetail, Text: "选中一行查看该模型的完整参数。"},
 						},
 					},
 
@@ -199,6 +222,41 @@ func (a *app) buildUI() error {
 											{Title: "账号", Width: 190},
 											{Title: "结果", Width: 100},
 											{Title: "详情", Width: 420},
+										},
+									},
+								},
+							},
+							dcl.GroupBox{
+								Title:         "积分记录（每次积分变动都在这里：签到 +100、调用消耗、额度刷新）",
+								Layout:        dcl.VBox{},
+								StretchFactor: 1,
+								Children: []dcl.Widget{
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 8},
+										Children: []dcl.Widget{
+											dcl.Label{Text: "按账号过滤"},
+											dcl.ComboBox{
+												AssignTo:              &a.cbCreditFilter,
+												Model:                 []string{creditAllLabel},
+												CurrentIndex:          0,
+												OnCurrentIndexChanged: a.onCreditFilterChanged,
+											},
+											dcl.PushButton{Text: "显示全部", MinSize: dcl.Size{Width: 80}, OnClicked: func() { a.setCreditFilter(creditAllUIDs) }},
+											dcl.HSpacer{},
+											dcl.Label{AssignTo: &a.lblCreditFilter, Text: ""},
+										},
+									},
+									dcl.TableView{
+										AssignTo:         &a.tvCredits,
+										Model:            a.credits,
+										AlternatingRowBG: true,
+										StretchFactor:    1,
+										Columns: []dcl.TableViewColumn{
+											{Title: "时间", Width: 120},
+											{Title: "账号", Width: 160},
+											{Title: "变动", Width: 90, Alignment: dcl.AlignFar},
+											{Title: "积分变化", Width: 170, Alignment: dcl.AlignFar},
+											{Title: "来源", Width: 200},
 										},
 									},
 								},
@@ -326,9 +384,42 @@ func (a *app) buildUI() error {
 	a.chkAuto.SetChecked(autoStartEnabled())
 	logf("自动启动开关已同步")
 
+	// 模型表选中行 → 详情标签（展示完整参数，含表格放不下的字段）。
+	a.tvModelRates.CurrentIndexChanged().Attach(func() {
+		r, ok := a.modelRates.At(a.tvModelRates.CurrentIndex())
+		if !ok {
+			return
+		}
+		a.lblModelDetail.SetText(modelDetailText(r))
+	})
+
 	a.initTray()
 	logf("托盘已就绪")
 	return nil
+}
+
+// modelDetailText 把一行的完整参数拼成详情文本（含表格未直接展示的字段）。
+func modelDetailText(r modelRateRow) string {
+	cap := fmt.Sprintf("%d", r.ContextWindow)
+	out := fmt.Sprintf("%d", r.MaxTokens)
+	detail := fmt.Sprintf(
+		"%s（%s）\r\n"+
+			"思考深度：默认档 %s ｜ 可选档 %s ｜ 可关闭思考 %s ｜ 只能推理 %s\r\n"+
+			"容量：上下文 %s tokens ｜ 最大输出 %s tokens\r\n"+
+			"能力：图片输入 %s ｜ 工具调用 %s ｜ 推理 %s\r\n"+
+			"计费：消耗倍率 %s\r\n"+
+			"元信息：厂商 %s ｜ 标签 %s ｜ 默认模型 %s",
+		r.ID, r.Name,
+		r.Effort, r.Supported, r.CanDisable, r.OnlyReason,
+		cap, out,
+		r.Images, r.ToolCall, orDash(r.Reason),
+		r.Rate,
+		r.Vendor, r.Tags, r.IsDeflt,
+	)
+	if r.Desc != "" {
+		detail += "\r\n说明：" + r.Desc
+	}
+	return detail
 }
 
 // initTray 系统托盘：关闭窗口时收进托盘，服务继续在后台跑。
@@ -416,6 +507,11 @@ func (a *app) quit() {
 	}
 	if a.svc != nil {
 		a.svc.Stop()
+	}
+	// 关闭积分历史的常开追加句柄（flush 到盘并释放文件锁）。
+	// 必须在退出前做：Windows 下被占用的文件会阻止后续删除/重命名。
+	if a.creditLog != nil {
+		a.creditLog.Close()
 	}
 	if a.mw != nil {
 		a.mw.Close()

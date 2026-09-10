@@ -67,6 +67,25 @@ type Status struct {
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
 }
 
+// CreditChange 一次积分变动（观测用，不参与任何决策）。
+//
+// Old/New 是该账号积分的前后快照；Delta = New - Old。First 标记本次为该账号
+// 首次拿到余额（此前无可信“旧值”，此时 Delta 语义不成立，调用方应展示为“首次获取”）。
+// Reason 是变动来源（签到/自动刷新/手动刷新/未知），由写路径归因，不猜。
+type CreditChange struct {
+	UID    string    `json:"uid"`
+	Old    int64     `json:"old"`
+	New    int64     `json:"new"`
+	Delta  int64     `json:"delta"`
+	First  bool      `json:"first,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// CreditChangeFunc 积分变动回调（GUI 用来落盘+刷新表格）。可能从任意 goroutine 调用，
+// 必须是并发安全的且不得阻塞（慢操作请自行异步化）。
+type CreditChangeFunc func(CreditChange)
+
 type entry struct {
 	a            *auth.Auth
 	credits      int64
@@ -89,6 +108,10 @@ type entry struct {
 
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+
+	// creditsKnown 标记 credits 是否已从上游拿到过可信值。
+	// 从未刷新过额度时 credits=0 只代表“未知”而非“真 0”，首次变动不参与涨跌归因。
+	creditsKnown bool
 
 	// inFlightPeak / peakAt 为「忙闲痕迹」运行态（不持久化）：记录近 peakWindow 内的
 	// 在途峰值与其最后一次统计时刻。短请求的 +1/−1 可能整体落在 GUI 采样间隔之间
@@ -173,6 +196,9 @@ func (e *entry) fallbackKind(now time.Time) string {
 // stateAccount 单个账号的持久化状态（JSON tag 全小写下划线，向后兼容：缺字段零值）。
 type stateAccount struct {
 	Credits      int64     `json:"credits"`
+	// CreditsKnown 标记 credits 是否已从上游拿到过可信值。
+	// 缺字段（旧文件）为 false：旧 state 的 credits 无法区分"真 0"与"从未刷过"。
+	CreditsKnown bool      `json:"credits_known,omitempty"`
 	Disabled     bool      `json:"disabled"`
 	Reason       string    `json:"reason,omitempty"`
 	Until        time.Time `json:"until,omitempty"`
@@ -215,6 +241,11 @@ type Pool struct {
 	// store 池状态快照镜像（redisstore.Store）；nil = 无需镜像（未配置 Redis / Noop 之外也可能 nil）。
 	// SaveState/LoadState 经它接线，与本地 state.json 并存作启动恢复备份。
 	store StoreSnapshotter
+
+	// onCreditsChanged 积分变动回调；nil = 静默（不记录）。
+	// 在持锁路径上调用，必须非阻塞。
+	onCreditsChanged CreditChangeFunc
+
 
 	// 熔断器调优（SetBreaker 注入；默认值见 defaultBreaker*）。
 	breakerThreshold   int
@@ -696,11 +727,57 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	return w
 }
 
+// SetCreditChangeHook 注入积分变动回调（GUI 用它落盘+刷新表格）；nil = 关闭记录。
+func (p *Pool) SetCreditChangeHook(fn CreditChangeFunc) {
+	p.mu.Lock()
+	p.onCreditsChanged = fn
+	p.mu.Unlock()
+}
+
+// noteCreditsLocked 记录一次积分变动并触发回调。调用方必须已持有 p.mu。
+//
+// 注意：本函数只做观测，不改 credits——真实赋值已由调用方完成。
+// 回调在持锁下调用，因此实现必须非阻塞（本项目的回调只做内存追加 + 异步落盘）。
+func (p *Pool) noteCreditsLocked(e *entry, uid string, newCredits int64, reason string) {
+	old := e.credits
+	first := !e.creditsKnown
+	e.creditsKnown = true
+
+	if p.onCreditsChanged == nil {
+		return
+	}
+	// 无变化不记录（除非首次获取，首次即使 0 也值得留一条“已知余额”锚点？
+	// 不——首次 0 只是“未知”的另一种写法，记录它反而是噪声），故始终要求 old != new 或 first。
+	if !first && old == newCredits {
+		return
+	}
+	ch := CreditChange{
+		UID:    uid,
+		Old:    old,
+		New:    newCredits,
+		Delta:  newCredits - old,
+		First:  first,
+		Reason: reason,
+		At:     time.Now(),
+	}
+	if first {
+		// 首次拿到余额：delta 无参照系，显式归零避免谎报涨跌。
+		ch.Delta = 0
+	}
+	p.onCreditsChanged(ch)
+}
+
 // SetCredits 更新账号余额。
 func (p *Pool) SetCredits(uid string, credits int64) {
+	p.SetCreditsReason(uid, credits, "自动刷新")
+}
+
+// SetCreditsReason 与 SetCredits 相同，但显式标注变动来源（供积分历史归因）。
+func (p *Pool) SetCreditsReason(uid string, credits int64, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
+		p.noteCreditsLocked(e, uid, credits, reason)
 		e.credits = credits
 		p.dirty.Store(true)
 	}
@@ -770,7 +847,8 @@ func (p *Pool) Disable(uid, reason string) {
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
 // 调用方必须已持有 p.mu。
-func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
+func (p *Pool) reviveCoolingLocked(e *entry, uid string, credits int64, reason string) {
+	p.noteCreditsLocked(e, uid, credits, reason)
 	e.credits = credits
 	e.until = time.Time{}
 	e.coolKind = 0
@@ -780,12 +858,18 @@ func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
 func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+	p.ReenableIfCreditsReason(uid, remain, "签到")
+}
+
+// ReenableIfCreditsReason 与 ReenableIfCredits 相同，但显式标注变动来源。
+func (p *Pool) ReenableIfCreditsReason(uid string, remain int64, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
+			p.reviveCoolingLocked(e, uid, remain, reason)
 		} else {
+			p.noteCreditsLocked(e, uid, remain, reason)
 			e.credits = remain
 		}
 		p.dirty.Store(true)
@@ -1001,6 +1085,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		p.byUID[uid] = &entry{
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
+			creditsKnown: s.CreditsKnown,
 			disabled:     s.Disabled,
 			reason:       s.Reason,
 			until:        s.Until,
@@ -1076,6 +1161,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
 			Credits:      e.credits,
+			CreditsKnown: e.creditsKnown,
 			Disabled:     e.disabled,
 			Reason:       e.reason,
 			Until:        e.until,
