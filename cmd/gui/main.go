@@ -43,6 +43,22 @@ type logBuffer struct {
 	mu    sync.Mutex
 	lines []string
 	part  string
+	// consumed 已被 UI 消费（Drain）掉的行数。lines 只保留最近 logLines 行，
+	// 环形裁剪时同步回退，保证 Drain 语义始终是「上次之后的新行」。
+	consumed int
+}
+
+// maxLogLineRunes 单行最大字符数。超长行（如 6004 上游报文近 300 字符）会撑大
+// 日志框的横向滚动范围，且各行宽度差异让横向滚动条来回跳，写入前统一收敛。
+const maxLogLineRunes = 160
+
+// truncateLogLine 把超长行按 rune 截断并以省略号结尾；短行原样返回。
+func truncateLogLine(s string) string {
+	rs := []rune(s)
+	if len(rs) <= maxLogLineRunes {
+		return s
+	}
+	return string(rs[:maxLogLineRunes]) + "…"
 }
 
 func (b *logBuffer) Write(p []byte) (int, error) {
@@ -54,13 +70,34 @@ func (b *logBuffer) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		b.lines = append(b.lines, b.part[:i])
+		b.lines = append(b.lines, truncateLogLine(b.part[:i]))
 		b.part = b.part[i+1:]
 	}
 	if len(b.lines) > logLines {
-		b.lines = b.lines[len(b.lines)-logLines:]
+		drop := len(b.lines) - logLines
+		b.lines = b.lines[drop:]
+		if b.consumed > drop {
+			b.consumed -= drop
+		} else {
+			b.consumed = 0
+		}
 	}
 	return len(p), nil
+}
+
+// Drain 返回自上次 Drain 之后新增的行（并推进消费游标）。
+// UI 据此做【增量追加】而非全量 SetText——全量重设会重建 EDIT 控件的横向滚动
+// 范围并触发 ScrollToCaret，导致横向滚动条乱跳、用户滚动位置被冲掉。
+// 残行（无换行符）留在 part，待补齐换行后一起返回。
+func (b *logBuffer) Drain() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.consumed >= len(b.lines) {
+		return nil
+	}
+	out := b.lines[b.consumed:]
+	b.consumed = len(b.lines)
+	return out
 }
 
 func (b *logBuffer) Text() string {
@@ -1154,18 +1191,51 @@ func (a *app) tblSignature(items []pool.Status) string {
 	return b.String()
 }
 
+// shouldFollowTail 判定追加日志后是否自动滚到底：仅当视口此刻停在底部才跟随。
+// 用户往上翻历史时视口不在底部 → 不跟随，不再被每 1.5s 强制拽回，
+// 也避免 ScrollToCaret 把横向位置拉去长行末尾。
+func shouldFollowTail(atBottom bool) bool {
+	return atBottom
+}
+
+// logAtBottom 报告日志框垂直视口是否停在底部（容差 2px，规避像素级抖动）。
+// 实现走 GetScrollInfo（walk 未封装），细节见 textedit_ex.go。
+func (a *app) logAtBottom() bool {
+	if a.teLog == nil {
+		return true
+	}
+	return teVScrollAtBottom(a.teLog)
+}
+
+// refreshLog 把日志缓冲的新增行增量追加到界面日志框。
+//
+// 旧实现每 1.5s 全量 SetText + SetTextSelection(末尾) + ScrollToCaret，有三个副作用：
+//  1. 全量重设让 EDIT 控件重建横向滚动范围（最长行宽度），滚动条忽宽忽窄；
+//  2. ScrollToCaret 把光标滚到最后一行的【最右端】——最后一行是 6004 报文等长行时
+//     视口被甩到最右，下一轮短行结尾又弹回最左，横向滚动条因此乱跳；
+//  3. 用户手动往上翻历史时，视口每 1.5s 被强制拽回底部。
+//
+// 现实现：只追加新增行（控件保留既有滚动状态），且仅当用户本来就停在底部时
+// 才垂直跟随到底（EM_SCROLL/SB_BOTTOM 只动垂直、不动水平）。
 func (a *app) refreshLog() {
 	if a.teLog == nil {
 		return
 	}
-	txt := a.logs.Text()
-	if txt == a.lastLog {
+	newLines := a.logs.Drain()
+	if len(newLines) == 0 {
 		return
 	}
-	a.lastLog = txt
-	a.teLog.SetText(txt)
-	a.teLog.SetTextSelection(len(txt), len(txt))
-	a.teLog.ScrollToCaret()
+	follow := shouldFollowTail(a.logAtBottom())
+	// 追加（保留既有滚动位置），不再全量 SetText。
+	var b strings.Builder
+	for _, l := range newLines {
+		b.WriteString(l)
+		b.WriteString("\r\n")
+	}
+	a.teLog.AppendText(b.String())
+	if follow {
+		teScrollToBottom(a.teLog)
+	}
 }
 
 // ─────────────────────────── 配置读写 ───────────────────────────
