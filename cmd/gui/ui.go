@@ -226,7 +226,7 @@ func (a *app) buildUI() error {
 									dcl.ComboBox{AssignTo: &a.cbProbeModel, MinSize: dcl.Size{Width: 260}},
 									dcl.Label{Text: "提示词（可选）"},
 									dcl.Label{Text: "输出上限（可选）"},
-									dcl.LineEdit{AssignTo: &a.leProbePrompt, CueBanner: "留空 = 请回复：OK", MinSize: dcl.Size{Width: 260}},
+									dcl.LineEdit{AssignTo: &a.leProbePrompt, CueBanner: "留空 = 仅回复1", MinSize: dcl.Size{Width: 260}},
 									dcl.LineEdit{AssignTo: &a.leProbeTokens, CueBanner: "留空 = 32", MinSize: dcl.Size{Width: 260}},
 								},
 							},

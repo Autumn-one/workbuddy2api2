@@ -6,7 +6,7 @@ import (
 )
 
 // TestBuildProbeBodyCustomPrompt 自定义提示词：用户输入什么就发什么，
-// 空输入回落默认「请回复：OK」。max_tokens=0 时用默认上限。
+// 空输入回落默认 probeDefaultPrompt（「仅回复1」）。max_tokens=0 时用默认上限。
 func TestBuildProbeBodyCustomPrompt(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -19,7 +19,7 @@ func TestBuildProbeBodyCustomPrompt(t *testing.T) {
 			name:   "默认提示词",
 			model:  "glm-5.2",
 			prompt: "",
-			wantIn: "请回复：OK",
+			wantIn: probeDefaultPrompt,
 		},
 		{
 			name:   "自定义提示词原文透传",
@@ -37,7 +37,7 @@ func TestBuildProbeBodyCustomPrompt(t *testing.T) {
 			name:    "纯空白输入回落默认",
 			model:   "m",
 			prompt:  "   ",
-			wantIn:  "请回复：OK",
+			wantIn:  probeDefaultPrompt,
 			notWant: "   ",
 		},
 	}

@@ -1029,7 +1029,7 @@ type app struct {
 	// 测试页（手动探测账号×模型连通性）
 	cbProbeAcct   *walk.ComboBox
 	cbProbeModel  *walk.ComboBox
-	leProbePrompt *walk.LineEdit // 自定义提示词（空 = 默认「请回复：OK」）
+	leProbePrompt *walk.LineEdit // 自定义提示词（空 = 默认 probeDefaultPrompt「仅回复1」）
 	leProbeTokens *walk.LineEdit // 自定义 max_tokens（空/非法 = 默认 32）
 	btnProbe      *walk.PushButton
 	teProbe       *walk.TextEdit

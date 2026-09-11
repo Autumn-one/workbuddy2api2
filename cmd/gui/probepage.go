@@ -18,6 +18,15 @@ import (
 // probeMaxTokens 探测请求的默认输出上限：足够返回一句话，又把积分消耗压到最低。
 const probeMaxTokens = 32
 
+// probeDefaultPrompt 探测/检测的默认提示词。
+//
+// 取值原则（都是"把消耗压到最低 + 结论可预期"）：
+//   - 极短：「仅回复1」只有 3 个字符，输入 token 接近下限；
+//   - 回答可预期：要求只回一个字符，输出 token 稳定在 1~3，不会因模型"话多"抖动。
+//
+// 检测功能只用它，不接受自定义提示词（那是「测试」页的能力）。
+const probeDefaultPrompt = "仅回复1"
+
 // probeMaxTokensLimit 用户自定义输出上限的硬顶：防误填超大值意外烧积分。
 const probeMaxTokensLimit = 4096
 
@@ -86,17 +95,19 @@ func probeFailureText(kind upstream.ErrKind, detail string) string {
 }
 
 // buildProbeBody 组装探测请求体：单条 user 消息 + stream:true（上游拒绝非流式）
-// + max_tokens 上限。prompt 为空/纯空白时回落默认「请回复：OK」；否则原文透传
+// + max_tokens 上限。prompt 为空/纯空白时回落 probeDefaultPrompt；否则原文透传
 // （用户可能用提示词验证特定能力，如"请输出一段很长的回复"测长文、JSON 输出测工具格式）。
-// 刻意不带 reasoning_effort：探测关心的是"通不通"，不是思考质量，
-// 不带档位省积分也快（deepseek-v4.1-flash 不传档位思考为 0）。
+// 刻意【不带】reasoning_effort：探测关心的是"通不通"，不是思考质量。
+// 关键实测依据（见 使用指南.md）：deepseek 系模型不传档位时【思考 token 恒为 0】，
+// 比传最小档 low 还省（low 实测思考 522~685 token）。因此"不传"才是真正的
+// "思考深度最小"——不要为了"用最小档"改成传 low，那会让消耗显著增加。
 func buildProbeBody(model string, maxTokens int, prompt string) string {
 	if maxTokens <= 0 {
 		maxTokens = probeMaxTokens
 	}
 	content := strings.TrimSpace(prompt)
 	if content == "" {
-		content = "请回复：OK"
+		content = probeDefaultPrompt
 	}
 	obj := map[string]any{
 		"model": model,

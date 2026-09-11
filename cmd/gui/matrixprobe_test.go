@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -224,5 +225,37 @@ func TestMatrixModelChoicesPlaceholder(t *testing.T) {
 	// 正常模型名不应被误判为占位
 	if isPlaceholderModel("glm-5.2") || isPlaceholderModel("auto") {
 		t.Error("真实模型名不得被识别为占位")
+	}
+}
+
+// ─────────────── 检测请求的提示词与思考档 ───────────────
+
+// TestProbeDefaultPromptIsMinimal 检测/探测的默认提示词是「仅回复1」：
+// 极短（输入 token 最小），回答可预期（一个字符），适合只判断"通不通"。
+func TestProbeDefaultPromptIsMinimal(t *testing.T) {
+	if probeDefaultPrompt != "仅回复1" {
+		t.Fatalf("默认提示词=%q want %q", probeDefaultPrompt, "仅回复1")
+	}
+	body := buildProbeBody("deepseek-v4.1-flash", probeMaxTokens, "")
+	var obj struct {
+		Messages []struct {
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal([]byte(body), &obj); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(obj.Messages) != 1 || obj.Messages[0].Content != "仅回复1" {
+		t.Errorf("实际发出的提示词=%q want 仅回复1", obj.Messages[0].Content)
+	}
+}
+
+// TestProbeBodyHasNoEffortField 检测请求【刻意不传】思考档：实测 deepseek 系
+// 不传档位时思考 token 恒为 0，比传最小档（low）还省（low 实测思考 522~685）。
+// 本用例锁定"不传"，防止有人为了"用最小档"反而增加消耗。
+func TestProbeBodyHasNoEffortField(t *testing.T) {
+	body := buildProbeBody("deepseek-v4.1-flash", probeMaxTokens, "")
+	if strings.Contains(body, "reasoning_effort") || strings.Contains(body, "reasoningEffort") {
+		t.Fatalf("检测请求不得携带思考档（不传 = 思考 0，比最小档更省）: %s", body)
 	}
 }
