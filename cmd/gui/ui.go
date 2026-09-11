@@ -122,6 +122,10 @@ func (a *app) buildUI() error {
 									dcl.PushButton{Text: "设为优先消耗", MinSize: dcl.Size{Width: 110}, OnClicked: func() { a.doSetPriority(3.0) }},
 									dcl.PushButton{Text: "取消优先", MinSize: dcl.Size{Width: 80}, OnClicked: func() { a.doSetPriority(0) }},
 									dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
+									// 一键检测：指定模型，横向扫全部账号的可用性。
+									// 会消耗少量积分（每账号 1 次小请求），点击后有确认提示。
+									dcl.PushButton{AssignTo: &a.btnMatrixProbe, Text: "检测模型可用性", MinSize: dcl.Size{Width: 120}, OnClicked: a.doMatrixProbe},
+									dcl.PushButton{AssignTo: &a.btnMatrixStop, Text: "停止检测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doStopMatrixProbe},
 									dcl.HSpacer{},
 									dcl.Label{AssignTo: &a.lblAccts2, Text: ""},
 								},
@@ -507,6 +511,11 @@ func (a *app) buildUI() error {
 
 	a.chkAuto.SetChecked(autoStartEnabled())
 	logf("自动启动开关已同步")
+
+	// 停止检测按钮默认禁用（仅在检测进行中可用）。
+	if a.btnMatrixStop != nil {
+		a.btnMatrixStop.SetEnabled(false)
+	}
 
 	// 模型表选中行 → 详情标签（展示完整参数，含表格放不下的字段）。
 	a.tvModelRates.CurrentIndexChanged().Attach(func() {

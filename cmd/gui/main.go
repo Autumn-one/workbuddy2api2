@@ -1016,6 +1016,12 @@ type app struct {
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
 
+	// 账号页「检测模型可用性」：检测进行中标志 + 取消标志 + 按钮。
+	matrixBusy     bool
+	matrixCancel   bool
+	btnMatrixProbe *walk.PushButton
+	btnMatrixStop  *walk.PushButton
+
 	// 测试页（手动探测账号×模型连通性）
 	cbProbeAcct   *walk.ComboBox
 	cbProbeModel  *walk.ComboBox

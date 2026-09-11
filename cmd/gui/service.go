@@ -142,6 +142,19 @@ func (s *Service) SetCreditsReason(uid string, credits int64, reason string) {
 	p.SetCreditsReason(uid, credits, reason)
 }
 
+// IsModelCooling 报告某账号的某模型是否处于 6004 冷却中。
+// 供"一键检测"避开冷却中的账号（它们本来就不可用，探测只会把冷却误报成不可用）。
+// 服务未启动或无该账号时返回 false。
+func (s *Service) IsModelCooling(uid, model string) bool {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil {
+		return false
+	}
+	return p.IsModelCooling(uid, model)
+}
+
 // SetUsageStore 注入 token 用量统计（Start 之前调用）。
 func (s *Service) SetUsageStore(st *server.TokenUsageStore) {
 	s.mu.Lock()
