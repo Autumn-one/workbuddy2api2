@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1017,6 +1018,9 @@ type app struct {
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
 
+	// lePriority 优先级输入框：每个账号可单独设权重值（选号权重乘子）。
+	lePriority *walk.LineEdit
+
 	// 账号页「检测模型可用性」：模型下拉框 + 检测进行中标志 + 取消标志 + 按钮。
 	// cbMatrixModel 必须是账号页自己的控件——用户在点击检测前要能看到并修改模型。
 	cbMatrixModel    *walk.ComboBox
@@ -1325,10 +1329,24 @@ func (a *app) refreshAccounts() {
 	a.syncProbeChoices()
 }
 
+// tblSignature 生成"是否需要重建账号表格"的指纹。
+//
+// 只收录【变化慢、且需要重建表格才能反映】的字段：
+// UID（账号增删）/ 昵称 / 积分 / 冷却 / 禁用 / 熔断计数 / 优先级。
+//
+// 刻意【排除】InFlight / InFlightPeak / PeakActive：
+//   - 它们是高频运行态，每次请求都在变（实测请求间隔仅几秒），若进签名会让
+//     签名几乎每个 tick（1.5s）都变化 → 反复 Replace → PublishRowsReset
+//     重建表格 → 【用户选中的行被清空】（实测缺陷：选中几秒后自动取消）；
+//   - 它们本来就不需要重建：表格 Value() 每帧实时读取当前值，签名不变时
+//     单元格文字照样是最新的（walk 会重绘可见单元格）。
+//
+// 换言之：签名回答的是"表格结构/需要重置的内容变了吗"，不是"每个数字都变了吗"。
 func (a *app) tblSignature(items []pool.Status) string {
 	var b strings.Builder
 	for _, s := range items {
-		fmt.Fprintf(&b, "%s|%d|%v|%v|%d|%v|%d|%d|%g;", s.UID, s.Credits, s.Cooling, s.Disabled, s.InFlight, s.PeakActive, s.InFlightPeak, s.BreakerFails, s.Priority)
+		fmt.Fprintf(&b, "%s|%s|%d|%v|%v|%d|%g;",
+			s.UID, s.Nickname, s.Credits, s.Cooling, s.Disabled, s.BreakerFails, s.Priority)
 	}
 	return b.String()
 }
@@ -1745,6 +1763,41 @@ func (a *app) doSetPriority(priority float64) {
 			a.lblAccts2.SetText(fmt.Sprintf("%s 已取消优先消耗", a.displayName(st.UID)))
 		}
 	})
+}
+
+// doApplyPriority 把输入框里的权重值应用到选中账号。
+//
+// 权重值是选号的【权重乘子】：>1 更容易被选中（一次性账号希望优先消耗额度时用），
+// <1 降低优先级，0 或留空 = 取消设置（回到 1.0，行为与未标记一致）。
+func (a *app) doApplyPriority() {
+	raw := ""
+	if a.lePriority != nil {
+		raw = strings.TrimSpace(a.lePriority.Text())
+	}
+	if raw == "" {
+		a.lblAccts2.SetText("请先在「优先级」框里填写权重值（如 3 或 0.5）")
+		return
+	}
+	v, ok := parsePriorityInput(raw)
+	if !ok {
+		a.lblAccts2.SetText("权重值无效（需为非负数字，如 3 / 0.5 / 0）：" + raw)
+		return
+	}
+	a.doSetPriority(v)
+}
+
+// parsePriorityInput 解析优先级输入：接受非负浮点数（含科学计数法）；
+// 空串或非法输入返回 ok=false（调用方给提示，不静默当 0 处理）。
+func parsePriorityInput(raw string) (float64, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0, false
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil || v < 0 {
+		return 0, false
+	}
+	return v, true
 }
 
 // refreshAccountsNow 强制刷新账号表（绕过签名比对），用于标记等需要立即生效的场景。

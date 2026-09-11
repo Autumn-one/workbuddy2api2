@@ -119,8 +119,13 @@ func (a *app) buildUI() error {
 									dcl.PushButton{AssignTo: &btnRefresh, Text: "刷新", MinSize: dcl.Size{Width: 80}, OnClicked: a.refreshAccounts},
 									dcl.PushButton{AssignTo: &a.btnRefreshCredits, Text: "刷新额度", MinSize: dcl.Size{Width: 90}, OnClicked: a.doRefreshCredits},
 									dcl.PushButton{AssignTo: &btnCheckin, Text: "手动签到全部", MinSize: dcl.Size{Width: 110}, OnClicked: a.doCheckinAll},
-									dcl.PushButton{Text: "设为优先消耗", MinSize: dcl.Size{Width: 110}, OnClicked: func() { a.doSetPriority(3.0) }},
-									dcl.PushButton{Text: "取消优先", MinSize: dcl.Size{Width: 80}, OnClicked: func() { a.doSetPriority(0) }},
+									// 优先级：每个账号可单独设权重值（选号权重乘子）。
+									// 权重越大越常被选中（如一次性账号希望优先消耗其额度）；
+									// <1 表示降低优先级；0 = 取消设置（回到 1.0）。
+									dcl.Label{Text: "优先级"},
+									dcl.LineEdit{AssignTo: &a.lePriority, CueBanner: "如 3 / 0.5", MinSize: dcl.Size{Width: 70}},
+									dcl.PushButton{Text: "设置", MinSize: dcl.Size{Width: 60}, OnClicked: a.doApplyPriority},
+									dcl.PushButton{Text: "取消", MinSize: dcl.Size{Width: 60}, OnClicked: func() { a.doSetPriority(0) }},
 									dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
 									// 一键检测：先选模型，再横向扫全部账号的可用性。
 									// 模型下拉框必须在账号页——用户点击前要能看到并修改要测哪个模型。

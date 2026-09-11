@@ -129,3 +129,67 @@ func TestTotalCreditsTextServiceNotStarted(t *testing.T) {
 	a := &app{svc: svc}
 	a.refreshTotalCredits(items) // lblTotalCredits 为 nil → 直接返回
 }
+
+// ─────────────── 表格刷新与选中保持 ───────────────
+//
+// 缺陷（用户报告）：账号列表选中一行后几秒自动取消选中。
+// 根因：tblSignature 含 InFlight / InFlightPeak —— 这两个字段每个请求都在变
+// （实测请求频率每几秒一次），导致签名几乎每 1.5s 就变化 → Replace →
+// PublishRowsReset 重建表格 → 选中状态丢失。
+//
+// 修复：签名只保留"用户关心的、变化慢的"字段（用于决定要不要重建表格）；
+// 在途这类高频运行态不进签名（它由表格 Value() 实时读取，无需重建即会更新）。
+
+// TestTblSignatureExcludesVolatileRuntimeFields 在途数与峰值不得进入签名。
+func TestTblSignatureExcludesVolatileRuntimeFields(t *testing.T) {
+	a := &app{}
+	base := []pool.Status{{
+		UID: "u1", Nickname: "甲", Credits: 100, CreditsKnown: true,
+	}}
+	// 同一条数据，仅改变在途相关字段
+	withFlight := []pool.Status{{
+		UID: "u1", Nickname: "甲", Credits: 100, CreditsKnown: true,
+		InFlight: 3, InFlightPeak: 5, PeakActive: true,
+	}}
+	if a.tblSignature(base) != a.tblSignature(withFlight) {
+		t.Error("在途/峰值变化不得改变签名（会导致表格重建、选中丢失）")
+	}
+}
+
+// TestTblSignatureIncludesMeaningfulChanges 有意义的字段变化必须改变签名
+// （否则界面不更新）。
+func TestTblSignatureIncludesMeaningfulChanges(t *testing.T) {
+	a := &app{}
+	base := []pool.Status{{UID: "u1", Credits: 100, CreditsKnown: true}}
+
+	cases := []struct {
+		name string
+		mod  func(s *pool.Status)
+	}{
+		{"积分变化", func(s *pool.Status) { s.Credits = 200 }},
+		{"禁用状态变化", func(s *pool.Status) { s.Disabled = true }},
+		{"冷却状态变化", func(s *pool.Status) { s.Cooling = true }},
+		{"熔断计数变化", func(s *pool.Status) { s.BreakerFails = 2 }},
+		{"优先级变化", func(s *pool.Status) { s.Priority = 3 }},
+		{"昵称变化", func(s *pool.Status) { s.Nickname = "乙" }},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			mod := []pool.Status{{UID: "u1", Credits: 100, CreditsKnown: true}}
+			c.mod(&mod[0])
+			if a.tblSignature(base) == a.tblSignature(mod) {
+				t.Errorf("%s 应改变签名（否则界面不刷新）", c.name)
+			}
+		})
+	}
+}
+
+// TestTblSignatureAccountSetChange 账号增删必须改变签名。
+func TestTblSignatureAccountSetChange(t *testing.T) {
+	a := &app{}
+	one := []pool.Status{{UID: "u1"}}
+	two := []pool.Status{{UID: "u1"}, {UID: "u2"}}
+	if a.tblSignature(one) == a.tblSignature(two) {
+		t.Error("账号数变化应改变签名")
+	}
+}

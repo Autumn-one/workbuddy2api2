@@ -1162,6 +1162,35 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
 	e.breakerUntil = time.Now().Add(d)
 }
 
+// CooldownSoftOnly 只设置冷却、【不喂熔断计数】。
+//
+// 与 Cooldown 的区别（重要）：Cooldown 的语义是"冷却入口同时是熔断器的失败信号"，
+// 适用于账号本身出故障的场景（429/404/5xx）。但有些场景里账号是健康的、
+// 只是【暂时不可用】——典型是 11140 内容安全拒绝（上游把账号临时标记，
+// 换其他账号立刻成功）。此时喂熔断会把好账号熔断掉（指数退避最长数小时），
+// 误伤过重；只设一段固定冷却即可（到期自动恢复）。
+//
+// 不变量：本方法不改变 fails/retryCount/breakerUntil（熔断器状态完全不受影响）。
+func (p *Pool) CooldownSoftOnly(uid string, d time.Duration, reason string) {
+	if d <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	// 已有更长的硬冷却（余额耗尽到次日 4 点）时，不用较短的软冷却把它缩短。
+	if e.coolKind == CoolHard && time.Now().Before(e.until) && e.until.After(time.Now().Add(d)) {
+		return
+	}
+	e.until = time.Now().Add(d)
+	e.coolKind = CoolSoft
+	e.reason = reason
+	p.dirty.Store(true)
+}
+
 // CooldownUntilTomorrow4AM 冷却到次日 04:00（本地时区）。
 // 用于 ErrHardCredit 场景：积分耗尽账号等签到任务（09:00/21:00）恢复。
 func (p *Pool) CooldownUntilTomorrow4AM(uid string, reason string) {

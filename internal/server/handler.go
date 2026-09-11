@@ -429,6 +429,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 连续撞墙翻倍、封顶 maxModelCooldown（60 分钟），见 pool.NoteModelRateLimit。
 const modelRateCooldownBase = 10 * time.Minute
 
+// contentRejectCooldown 内容安全拒绝（code=11140）的账号短期冷却时长。
+//
+// 为什么是短期而非禁用：生产实证（2026-09-12）显示某账号 2 小时内 189 次
+// 全被 11140 拒绝、成功 0 次，但风控标记通常是临时的；禁用会让账号永久退场，
+// 误伤风险大。冷却到期自动恢复，也可在「测试」页手动复测确认是否已解除。
+const contentRejectCooldown = 10 * time.Minute
+
 // truncateMsg 截断报文用于日志（避免长报文刷屏）。
 func truncateMsg(s string) string {
 	if len(s) > 200 {
@@ -494,6 +501,22 @@ func (h *Handler) applyErrorPolicy(acct *auth.Auth, model string, kind upstream.
 			break
 		}
 		log.Printf("model_rate_limit acct=%s model=%s 冷却=%s status=%d", logAccountName(acct), model, d, status)
+	case upstream.ErrContentRejected:
+		// 内容安全拒绝（11140）：给【该账号】短期冷却。
+		//
+		// 关键判断依据（生产实证，见 upstream.ErrContentRejected 注释）：
+		// 同一个请求体，被标记的账号必被拒、换其他账号立刻 200——
+		// 所以这不是内容问题，而是账号被上游风控标记。
+		// 若按"客户端错误只换号不罚"处理，被标记账号会反复被选中、每次白撞
+		// 一次上游往返（实测 189 次），既浪费轮换也让请求多一跳延迟。
+		//
+		// 不喂熔断、不禁用：账号本身健康（上游明确说是内容问题），
+		// 喂熔断会把好账号熔断掉；禁用则误伤过重（风控多为临时）。
+		// 用 CooldownSoftOnly 而非 Cooldown：账号是健康的（上游明确是内容审核问题），
+		// 喂熔断会把它错误地熔断（指数退避最长数小时），误伤过重。
+		h.cfg.Pool.CooldownSoftOnly(uid, contentRejectCooldown, "11140 内容安全拒绝")
+		log.Printf("content_rejected acct=%s model=%s 冷却=%s status=%d（该账号被上游风控标记，换号重试）",
+			logAccountName(acct), model, contentRejectCooldown, status)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

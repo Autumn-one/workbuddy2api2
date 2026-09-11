@@ -162,3 +162,117 @@ func TestStatusExposesPriority(t *testing.T) {
 		t.Errorf("Status.Priority=%.2f want 3.0（GUI 需要它来显示标记）", st.Priority)
 	}
 }
+
+// ─────────────── 每账号独立权重值 ───────────────
+//
+// 需求：优先级不再只有"固定高优先级"，而是每个账号可单独设权重值。
+// 保留 SetPriority 的语义，新增更细的取值能力（任意 >0 的浮点），
+// 并保证：权重值直接影响选号概率（越大越常选中）。
+
+// TestPriorityArbitraryValues 任意权重值均生效（不再限于 3.0 这类固定档）。
+func TestPriorityArbitraryValues(t *testing.T) {
+	p := newModelTestPool(t)
+	p.Add(&auth.Auth{UID: "a1"})
+	p.SetCredits("a1", 100)
+
+	base := func() float64 {
+		p.mu.RLock()
+		defer p.mu.RUnlock()
+		return p.weightOf(p.byUID["a1"], 100, time.Now())
+	}
+	p.SetPriority("a1", 0)
+	w0 := base()
+	for _, v := range []float64{0.5, 1.5, 2.7, 7.25, 20} {
+		p.SetPriority("a1", v)
+		if got := base(); got != w0*v {
+			t.Errorf("权重值 %v: 权重=%.4f want %.4f", v, got, w0*v)
+		}
+	}
+}
+
+// TestPriorityFractionalLessThanOne 权重值 <1 表示"降低优先级"（也应支持）。
+func TestPriorityFractionalLessThanOne(t *testing.T) {
+	p := newModelTestPool(t)
+	p.Add(&auth.Auth{UID: "a1"})
+	p.SetCredits("a1", 100)
+	p.SetPriority("a1", 1.0)
+	p.mu.RLock()
+	w1 := p.weightOf(p.byUID["a1"], 100, time.Now())
+	p.mu.RUnlock()
+	p.SetPriority("a1", 0.25)
+	p.mu.RLock()
+	w025 := p.weightOf(p.byUID["a1"], 100, time.Now())
+	p.mu.RUnlock()
+	if w025 >= w1 {
+		t.Errorf("权重 0.25 应低于 1.0: %.4f vs %.4f", w025, w1)
+	}
+	if w025 != w1*0.25 {
+		t.Errorf("权重 0.25: %.4f want %.4f", w025, w1*0.25)
+	}
+}
+
+// TestPriorityIndependentPerAccount 每个账号的权重互不影响。
+func TestPriorityIndependentPerAccount(t *testing.T) {
+	p := newModelTestPool(t)
+	for _, u := range []string{"a1", "a2", "a3"} {
+		p.Add(&auth.Auth{UID: u})
+		p.SetCredits(u, 100)
+	}
+	p.SetPriority("a1", 5)
+	p.SetPriority("a2", 2)
+	p.SetPriority("a3", 0.5)
+
+	p.mu.RLock()
+	w1 := p.weightOf(p.byUID["a1"], 100, time.Now())
+	w2 := p.weightOf(p.byUID["a2"], 100, time.Now())
+	w3 := p.weightOf(p.byUID["a3"], 100, time.Now())
+	p.mu.RUnlock()
+	// 三者基于同一 base，权重比应等于优先级比
+	if !(w1 > w2 && w2 > w3) {
+		t.Errorf("权重排序错误: a1=%.2f a2=%.2f a3=%.2f", w1, w2, w3)
+	}
+	if w1/w3 != 10 { // 5 / 0.5
+		t.Errorf("a1/a3 权重比=%.2f want 10", w1/w3)
+	}
+}
+
+// TestPriorityPickOrderByValue 选号概率应随权重值单调（值大者更常被选中）。
+func TestPriorityPickOrderByValue(t *testing.T) {
+	withNoPickGap(t)
+	p := newModelTestPool(t)
+	p.Add(&auth.Auth{UID: "hi"})
+	p.Add(&auth.Auth{UID: "mid"})
+	p.Add(&auth.Auth{UID: "lo"})
+	for _, u := range []string{"hi", "mid", "lo"} {
+		p.SetCredits(u, 1000)
+	}
+	p.SetPriority("hi", 6)
+	p.SetPriority("mid", 3)
+	p.SetPriority("lo", 1)
+
+	counts := map[string]int{}
+	for i := 0; i < 3000; i++ {
+		counts[p.Pick().UID]++
+	}
+	if counts["hi"] <= counts["mid"] || counts["mid"] <= counts["lo"] {
+		t.Fatalf("选中次数应随权重单调: %v", counts)
+	}
+	t.Logf("选中分布（权重 6/3/1）: %v", counts)
+}
+
+// TestPriorityPersistArbitraryValue 非整数权重值也要能持久化并原样恢复。
+func TestPriorityPersistArbitraryValue(t *testing.T) {
+	dir := t.TempDir()
+	fp := dir + "/state.json"
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "a1"})
+	p.SetPriority("a1", 7.25)
+	p.Flush()
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "a1"})
+	st, _ := p2.Status("a1")
+	if st.Priority != 7.25 {
+		t.Fatalf("重启后权重=%.4f want 7.25", st.Priority)
+	}
+}

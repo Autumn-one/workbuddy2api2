@@ -44,6 +44,24 @@ const (
 	// 因此当前仅做【识别 + 详细记录】，不做冷却处置：先观测真实频率与分布，
 	// 拿到足够样本后再决定退避策略。切勿据报文时间冷却（会误伤数十小时）。
 	ErrModelRateLimit
+
+	// ErrContentRejected 内容安全拒绝（code=11140，HTTP 403）。
+	//
+	// 实测文案（2026-09-12）：
+	//   {"code":11140,"msg":"request illegal",
+	//    "displayMsg":{"zh":"内容未通过安全审核，请调整后重试",
+	//                  "en":"The content did not pass the safety review..."}}
+	//
+	// 生产实证（关键，决定了处置策略）：
+	//   账号 eedf4e88：11140 共 189 次、成功 0 次（100% 被拒）
+	//   账号 d4937369：11140 共 4 次、成功 0 次
+	//   其他 10 个账号：11140 共 0 次、成功 1000+ 次
+	//   且每次都「该账号撞 11140 → 换号 → 立刻 200」——【同一个请求体换账号就通过】。
+	//
+	// 因此这【不是内容问题，而是账号被上游风控标记】：若真是内容违规，换账号
+	// 也应被拒。按"客户端错误只换号不罚"处理会让被标记的账号反复被选中、
+	// 每次白撞一次上游往返（并让请求多一跳延迟），故需要独立的短期冷却。
+	ErrContentRejected
 )
 
 func (k ErrKind) String() string {
@@ -62,6 +80,8 @@ func (k ErrKind) String() string {
 		return "client"
 	case ErrModelRateLimit:
 		return "model_rate_limit"
+	case ErrContentRejected:
+		return "content_rejected"
 	default:
 		return "none"
 	}
@@ -202,6 +222,39 @@ func parseModelRateLimitModel(msg string) string {
 	return ""
 }
 
+// contentRejectMarkers 内容安全拒绝的判据：业务码 11140（权威）+ 文案兜底。
+// 只认 code 字段能避免把其它 4xx 误吸进来；文案作为 code 缺失时的补充。
+var contentRejectMarkers = []string{
+	"did not pass the safety review", "safety review",
+}
+
+// isContentRejection 判定报文是否为内容安全拒绝（code=11140）。
+// 只解析 code 字段：字符串型 code（"11140"）保守不认，避免类型混乱导致误判；
+// 截断/畸形 JSON 返回 false（绝不 panic）。
+func isContentRejection(body string) bool {
+	if body == "" {
+		return false
+	}
+	var env struct {
+		Code *int `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil && env.Code != nil {
+		if *env.Code == 11140 {
+			return true
+		}
+		// code 存在且不是 11140：不做文案兜底，避免误判（文案可能出现在别的错误里）。
+		return false
+	}
+	// code 解析不到（非 JSON / 截断）→ 文案兜底（仅英文特征串，语义明确）。
+	lower := strings.ToLower(body)
+	for _, m := range contentRejectMarkers {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
+}
+
 // Classify 按 HTTP 状态码 + body 判定错误类别。
 //
 // 判定顺序（重要）：
@@ -231,6 +284,11 @@ func Classify(status int, body string) ErrKind {
 		if strings.Contains(body, m) {
 			return ErrSessionDead
 		}
+	}
+	// 内容安全拒绝（11140）：先于通用 4xx，避免被 ErrClient 吞掉而失去观测与处置。
+	// 放在余额/session/6004 之后：那些类别优先级更高（同报文可能叠加多种特征）。
+	if isContentRejection(body) {
+		return ErrContentRejected
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
