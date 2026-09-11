@@ -844,6 +844,8 @@ type app struct {
 	checkins *checkinModel
 	// checkinLog 签到记录持久化（重启不丢）。nil = 降级为纯内存。
 	checkinLog *checkinStore
+	// logRot gui.log 的轮转 writer（退出时关闭，释放 Windows 文件占用）。
+	logRot *rotatingLogWriter
 	// credits 积分变动记录表 + 持久化（重启不丢）。
 	credits   *creditModel
 	creditLog *creditStore
@@ -927,15 +929,15 @@ func (f faultTolerantWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-// setupLogging 让标准日志同时流向：内存日志面板、磁盘日志文件、控制台（若有）。
+// setupLogging 让标准日志同时流向：内存日志面板、磁盘日志文件（带轮转）、控制台（若有）。
 // 顺序刻意为 [内存, 文件, stdout]：
 //   - 文件在 stdout 之前：stdout 失效（windowsgui 双击启动）不再殃及落盘；
 //   - stdout 用容错包装：无控制台时静默跳过，有控制台时照常输出。
 //
 // 落盘位置按 exe 同目录 → %AppData% → 临时目录 依次尝试（环境里可能缺 APPDATA）。
-func setupLogging(mem io.Writer) io.Writer {
+func setupLogging(mem io.Writer) (io.Writer, *rotatingLogWriter) {
 	// 先不把 os.Stdout 放进列表，等确定文件成功后再按 [内存, 文件, stdout] 顺序组装。
-	var fileW io.Writer
+	var fileW *rotatingLogWriter
 
 	var cands []string
 	if exe, err := os.Executable(); err == nil {
@@ -950,11 +952,13 @@ func setupLogging(mem io.Writer) io.Writer {
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			continue
 		}
-		f, err := os.OpenFile(p, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-		if err != nil {
-			continue
+		// 用带轮转的 writer：按天切 + 单文件超 5MB 切，归档保留 14 天。
+		// 打开失败时 rotate writer 自身会在下次 Write 重试，这里不需要额外兜底。
+		rw := newRotatingLogWriter(p, guiLogMaxBytes, guiLogKeepDays*24*time.Hour)
+		if err := rw.ensureForSetup(); err != nil {
+			continue // 该候选路径完全不可用（目录建不了/打不开）→ 换下一个候选
 		}
-		fileW = f
+		fileW = rw
 		logFilePath = p
 		break
 	}
@@ -964,7 +968,7 @@ func setupLogging(mem io.Writer) io.Writer {
 		writers = append(writers, fileW)
 	}
 	writers = append(writers, faultTolerantWriter{os.Stdout})
-	return io.MultiWriter(writers...)
+	return io.MultiWriter(writers...), fileW
 }
 
 func main() {
@@ -982,8 +986,9 @@ func main() {
 	// 积分表的昵称解析：模型内只存原始 UID，渲染时才查昵称（改名不会影响过滤）。
 	a.credits.display = a.displayName
 
-	// 标准日志 → 内存面板 + 磁盘文件；请求日志也接到同一条链上
-	sink := setupLogging(a.logs)
+	// 标准日志 → 内存面板 + 磁盘文件（带轮转）；请求日志也接到同一条链上
+	sink, logRot := setupLogging(a.logs)
+	a.logRot = logRot
 	log.SetOutput(sink)
 	server.SetChatLogWriter(sink)
 

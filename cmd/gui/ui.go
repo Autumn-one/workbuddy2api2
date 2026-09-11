@@ -513,6 +513,10 @@ func (a *app) quit() {
 	if a.creditLog != nil {
 		a.creditLog.Close()
 	}
+	// 关闭 gui.log 的轮转句柄：同理释放文件占用，也避免退出瞬间丢缓冲日志。
+	if a.logRot != nil {
+		_ = a.logRot.Close()
+	}
 	if a.mw != nil {
 		a.mw.Close()
 	}
