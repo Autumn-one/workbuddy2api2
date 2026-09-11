@@ -561,9 +561,16 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 && modelAware {
-		// 模型级冷却把候选压空：不得落回全冷却兜底——那是账号级语义，可能挑出一个
-		// "最早到期"但对该模型照样 6004 的账号。保持 nil 让 handler 直接 503：
-		// 比起再浪费一次注定失败的上游调用，快速失败更诚实也更便宜。
+		// 模型级冷却把候选压空。两层兜底（按优先级）：
+		//
+		// 1) 半开探测：若有（账号×模型）冷却已过安静期，以 halfOpenProbeRate 概率
+		//    放行一次真实探测——成功立即清冷却（NoteModelProbeSuccess），上游恢复后
+		//    服务在几十秒内自愈，而不是干等 10m~1h 冷却截止（20:22 事故的教训）。
+		// 2) 全部不可用 → 返回 nil 让 handler 直接 503 快速失败，
+		//    比起再浪费一次注定失败的上游调用更诚实也更便宜。
+		if a := p.pickHalfOpenLocked(model, now); a != nil {
+			return a
+		}
 		return nil
 	}
 	if len(cands) == 0 {
@@ -623,6 +630,49 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	}
 	e.lastUsed = time.Now()
 	return e.a
+}
+
+// pickHalfOpenLocked 从处于"冷却中但安静期已过"的候选里按概率挑一个探测。
+// 优先选【冷却剩余最短】的（最可能已恢复，探测成功率高）；
+// 无候选或未命中概率时返回 nil。调用方需已持 p.mu。
+func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
+	var cands []*entry
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue
+		}
+		st, ok := e.modelCool[model]
+		if !ok || st == nil {
+			continue // 无冷却的账号不该走到这里（它们在正常候选里）
+		}
+		if !now.Before(st.until) {
+			continue // 已过期 → 属于正常候选路径（理论上不会到这里）
+		}
+		if now.Sub(st.lastHit) < halfOpenQuiet {
+			continue // 安静期内：探测大概率再撞，不放行
+		}
+		cands = append(cands, e)
+	}
+	if len(cands) == 0 {
+		return nil
+	}
+	// 概率放行：不命中直接放弃本轮（下个请求再试，避免瞬间全量打上游）。
+	// 随机源与 pickWeighted 同约定：randInt64N 仅供测试注入，生产走全局源。
+	rnd := rand.Int64N
+	if p.randInt64N != nil {
+		rnd = p.randInt64N
+	}
+	const scale = 1_000_000
+	if int64(halfOpenProbeRate*float64(scale)) <= rnd(scale) {
+		return nil
+	}
+	// 剩余冷却最短者优先（最可能已恢复）
+	sort.Slice(cands, func(i, j int) bool {
+		return cands[i].modelCool[model].until.Before(cands[j].modelCool[model].until)
+	})
+	best := cands[0]
+	best.lastUsed = now
+	return best.a
 }
 
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
@@ -796,14 +846,34 @@ func (p *Pool) noteCreditsLocked(e *entry, uid string, newCredits int64, reason 
 
 // modelCoolState 单个（账号×模型）对的模型级限流冷却状态（运行态）。
 type modelCoolState struct {
-	until    time.Time // 本次冷却截止
-	lastHit  time.Time // 最近一次撞墙时刻
-	backoffN int       // 已连续撞墙次数（指数退避的指数；成功清零）
+	until      time.Time // 本次冷却截止
+	lastHit    time.Time // 最近一次撞墙时刻
+	backoffN   int       // 已连续撞墙次数（指数退避的指数；成功清零）
+	probeFails int       // 半开探测连续失败次数（成功清零，仅观测）
 }
 
-// 模型级限流冷却：起步 10 分钟，连续撞墙翻倍，封顶 60 分钟（用户指定）。
+// 模型级限流冷却：起步 10 分钟，连续撞墙翻倍，封顶 15 分钟。
+//
+// 封顶从 60 分钟下调的依据：有半开探测兜底（见下），不需要靠长冷却挡子弹——
+// 冷却进入安静期后就有概率被真实请求试探，上游恢复后几十秒内自愈；
+// 长冷却反而拉长"上游已恢复但服务还在 503"的断供窗口（20:22 事故断供 9 分钟）。
+//
+// 半开探测（half-open）：冷却进入 halfOpenQuiet 安静期后，允许以
+// halfOpenProbeRate 概率把冷却中的（账号×模型）作为候选发一次真实探测——
+// 成功立即清冷却，失败维持冷却。没有它，上游对某模型的全局限流会把所有账号
+// 先后推进长冷却（20:22 事故：6 账号全部冷却、服务断供 9 分钟），而上游实际
+// 恢复远早于冷却截止。
 const (
-	maxModelCooldown = 60 * time.Minute
+	maxModelCooldown = 15 * time.Minute
+
+	// halfOpenQuiet 半开探测前的安静期：撞墙后先静默这么久再允许试探，
+	// 避免刚限流就立刻重试（必然再撞）。取值远小于起步冷却 10 分钟。
+	halfOpenQuiet = 2 * time.Minute
+
+	// halfOpenProbeRate 半开探测概率：安静期过后每次 pick 的探测放行比例。
+	// 概率而非必然：N 个账号同时半开时不会瞬间全部打上游；10% 配合
+	// 生产请求频率意味着恢复后约几十秒内必被探测到。
+	halfOpenProbeRate = 0.10
 )
 
 // modelCooldownFor 返回第 n 次连续撞墙应冷却的时长：base × 2^(n-1)，封顶 maxModelCooldown。
@@ -834,7 +904,7 @@ func (e *entry) modelCooling(model string, now time.Time) bool {
 
 // NoteModelRateLimit 记录一次【账号×模型】撞上 6004，返回本次冷却时长。
 //
-// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（60 分钟）。
+// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（15 分钟）。
 // 同账号的其他模型、其他账号不受影响（模型级，不是账号级）。
 // 返回 0 表示未记录：账号不存在/已禁用/入参非法。
 //
@@ -877,6 +947,53 @@ func (p *Pool) NoteModelRateLimit(uid, model string, base time.Duration) time.Du
 	st.lastHit = now
 	p.dirty.Store(true)
 	return d
+}
+
+// HalfOpenAllowed 报告该（账号×模型）当前是否允许作为【半开探测候选】：
+// 冷却中（正常路径会被排除）且距上次撞墙已过安静期。无冷却状态时返回 true
+// （此时不走半开路径，账号本来就可选）。
+// 概率放行在 pick 内做（需要随机源），这里只做确定性判定。
+func (p *Pool) HalfOpenAllowed(uid, model string) bool {
+	if uid == "" || strings.TrimSpace(model) == "" {
+		return false
+	}
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	st, ok := e.modelCool[model]
+	if !ok || st == nil {
+		return true // 无冷却 → 正常可选
+	}
+	// 冷却已过期 → 正常可选，不算半开
+	if !time.Now().Before(st.until) {
+		return true
+	}
+	// 冷却中：安静期已过才允许探测
+	return time.Since(st.lastHit) >= halfOpenQuiet
+}
+
+// NoteModelProbeSuccess 记录一次半开探测成功：立即清除该（账号×模型）冷却，
+// 让账号恢复正常选号（上游已恢复，没必要干等冷却截止）。
+// 退避计数同时清零——探测成功是最强的"已恢复"信号。
+func (p *Pool) NoteModelProbeSuccess(uid, model string) {
+	if uid == "" || strings.TrimSpace(model) == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if st, ok := e.modelCool[model]; ok && st != nil {
+		st.until = time.Time{}
+		st.backoffN = 0
+		st.probeFails = 0
+	}
+	p.dirty.Store(true)
 }
 
 // IsModelCooling 报告该（账号×模型）是否处于模型级冷却中。
@@ -1072,11 +1189,14 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
-		// 该账号的模型级退避计数清零：一次成功即证明账号对此模型可用，
-		// 退避记忆作废，下次撞 6004 从第一档 5 分钟起步。
-		// 注意只清计数不清 until——未到期的冷却窗口仍有效（时间恢复语义）。
+		// 该账号的全部模型级冷却立即清除：一次成功请求是"上游已恢复"的最强信号，
+		// 半开探测正是靠它自愈（探测请求成功会走到 NoteSuccess）。
+		// 若只清计数不清 until，冷却中的账号成功后仍要干等到截止——
+		// 20:22 事故里 138 账号被多晾 10 分钟就是这个原因。
 		for _, st := range e.modelCool {
+			st.until = time.Time{}
 			st.backoffN = 0
+			st.probeFails = 0
 		}
 		p.dirty.Store(true)
 	}

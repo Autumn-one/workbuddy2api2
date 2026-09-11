@@ -53,8 +53,8 @@ func TestModelCooldownBlocksPickAndExpires(t *testing.T) {
 	}
 }
 
-// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：10m → 20m → 40m → 60m（封顶）。
-// 用户明确要求：起步 10 分钟，封顶 60 分钟。
+// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：10m → 20m → 15m 封顶。
+// 起步 10 分钟；封顶 15 分钟（有半开探测兜底后下调，无需长冷却挡子弹）。
 func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
@@ -63,8 +63,8 @@ func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 	if d != base {
 		t.Fatalf("首次=%v want %v", d, base)
 	}
-	// 600 → 1200 → 2400 → 3600（封顶）
-	want := []time.Duration{1200, 2400, 3600, 3600, 3600, 3600, 3600, 3600, 3600, 3600}
+	// 600s(10m) 翻倍 1200s(20m) 超封顶 900s(15m) → 钳到 15m
+	want := []time.Duration{900, 900, 900, 900, 900, 900, 900, 900, 900, 900}
 	for i, w := range want {
 		if got := p.NoteModelRateLimit("a1", "glm-5.3", base); got != time.Duration(w)*time.Second {
 			t.Fatalf("第 %d 次=%v want %vs", i+1, got, w)
@@ -86,15 +86,18 @@ func TestModelCooldownCapsEvenWithLargerBase(t *testing.T) {
 	}
 }
 
-// TestModelCooldownResetOnSuccess 成功一次即清退避计数（信任恢复），
-// 但【当前冷却窗口】本身不清零——它还没到期，到期由时间自然恢复。
+// TestModelCooldownResetOnSuccess 成功请求 = "上游已恢复"的最强信号：
+// 该账号全部模型级冷却立即清除（半开探测的自愈通道），下次撞墙从第一档起步。
 func TestModelCooldownResetOnSuccess(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
 	p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase)
-	p.NoteSuccess("a1")
-	if p.ModelCooldownUntil("a1", "glm-5.3").IsZero() {
-		t.Fatal("NoteSuccess 不应清掉未到期的冷却窗口")
+	if !p.IsModelCooling("a1", "glm-5.3") {
+		t.Fatal("前置：撞墙后应在冷却")
+	}
+	p.NoteSuccess("a1") // 该账号的一次成功请求（含半开探测请求）
+	if p.IsModelCooling("a1", "glm-5.3") {
+		t.Fatal("成功后冷却应立即清除（自愈，不再干等到截止）")
 	}
 	if d := p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase); d != modelCooldownBase {
 		t.Fatalf("成功后重新撞墙应回到第一档 %v，got %v", modelCooldownBase, d)
@@ -111,8 +114,8 @@ func TestModelCooldownBackoffSurvivesExpiry(t *testing.T) {
 	if p.IsModelCooling("a1", "m") {
 		t.Fatal("到期后应视为已恢复")
 	}
-	if d := p.NoteModelRateLimit("a1", "m", modelCooldownBase); d != 2*modelCooldownBase {
-		t.Fatalf("到期后再撞墙应按第二档 %v，got %v", 2*modelCooldownBase, d)
+	if d := p.NoteModelRateLimit("a1", "m", modelCooldownBase); d != maxModelCooldown {
+		t.Fatalf("到期后再撞墙应封顶 %v，got %v", maxModelCooldown, d)
 	}
 }
 
