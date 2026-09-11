@@ -42,6 +42,10 @@ type Service struct {
 	OnKeepalive       func(uid string, ok bool, detail string)
 	OnCreditRefresh   func(uid string, remain int64, err error)
 	OnAccountsChanged func()
+	// usageStore token 用量统计（账号×模型×日期）。由 GUI 装配时创建并注入 handler；
+	// Service 持有引用供界面读取与退出时落盘。
+	usageStore *server.TokenUsageStore
+
 	// OnCreditsChanged 积分变动回调（GUI 落盘+刷新「积分记录」表格）。
 	// 可能从任意 goroutine 调用，实现必须并发安全且非阻塞。
 	OnCreditsChanged func(ch pool.CreditChange)
@@ -138,6 +142,20 @@ func (s *Service) SetCreditsReason(uid string, credits int64, reason string) {
 	p.SetCreditsReason(uid, credits, reason)
 }
 
+// SetUsageStore 注入 token 用量统计（Start 之前调用）。
+func (s *Service) SetUsageStore(st *server.TokenUsageStore) {
+	s.mu.Lock()
+	s.usageStore = st
+	s.mu.Unlock()
+}
+
+// UsageStore 返回用量统计（未注入时为 nil）。
+func (s *Service) UsageStore() *server.TokenUsageStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.usageStore
+}
+
 // SetPriority 设置账号优先级（权重乘子，0 = 未设置）。
 // 供 GUI 标记"一次性登录"账号，让它们优先被消耗。服务未启动时空操作。
 func (s *Service) SetPriority(uid string, priority float64) {
@@ -214,6 +232,7 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
+		UsageStore:   s.usageStore,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  func() int { return 0 },

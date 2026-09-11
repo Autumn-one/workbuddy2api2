@@ -60,6 +60,12 @@ type chatStat struct {
 	// thinkTok 思考（推理）token 用量，来自 usage 的 reasoning_tokens / completion_thinking_tokens；
 	// <0 = 缺失。它是"思考深度档位是否真的生效"的直接证据（比 effort= 更接近事实）。
 	thinkTok int
+	// cachedTok 命中缓存的输入 token；<0 = 缺失。
+	cachedTok int
+
+	// usageSink 用量统计落点（由 server.Config 注入；nil = 不统计）。
+	// 放在 chatStat 上而不是全局变量：便于测试隔离，也让"谁在统计"显式可见。
+	usageSink *TokenUsageStore
 
 	logged bool
 }
@@ -70,7 +76,7 @@ func newChatStat(now time.Time, body []byte, stream bool) *chatStat {
 	if stream {
 		mode = "stream"
 	}
-	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, inTok: -1, thinkTok: -1}
+	return &chatStat{start: now, model: parseModelFromBody(body), mode: mode, toks: -1, inTok: -1, thinkTok: -1, cachedTok: -1}
 }
 
 // done 幂等落一行表格日志。
@@ -79,7 +85,27 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.acct, s.status, s.toks, s.inTok, s.thinkTok, s.params)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.acct, s.status, s.toks, s.inTok, s.cachedTok, s.thinkTok, s.params)
+	// 用量统计（账号 × 模型 × 日期）。无论成功失败都计一次请求数；
+	// token 在失败请求里为 -1（上游不返回 usage）→ 由 store 钳 0 并计入 Missing。
+	s.recordUsage()
+}
+
+// recordUsage 把本次请求的用量写入统计存储（未注入 sink 时为空操作）。
+func (s *chatStat) recordUsage() {
+	if s.usageSink == nil {
+		return
+	}
+	uid := ""
+	if s.acct != nil {
+		uid = s.acct.UID
+	}
+	s.usageSink.Record(uid, s.model, s.start, TokenDelta{
+		In:     s.inTok,
+		Out:    s.toks,
+		Think:  s.thinkTok,
+		Cached: s.cachedTok,
+	})
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -102,7 +128,12 @@ type chatStatsReader struct {
 	// 优先取标准字段，缺失时回落自有字段；只采信上游上报值，不做任何估算。
 	hasThink bool
 	thinkTok int
-	pend     []byte // 已读未返回的行缓存
+	// hasCached/cachedTok 命中缓存的输入 token（cached_tokens / cache_read_input_tokens）。
+	// 单独统计的意义：ctx 很大时若大部分命中缓存，实际计费输入远小于 ctx——
+	// 这是"token 花在哪"里最容易被误读的一项，必须能看到。
+	hasCached bool
+	cachedTok int
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -158,6 +189,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			Details *struct {
 				ReasoningTokens *int `json:"reasoning_tokens"`
 			} `json:"completion_tokens_details"`
+			// 命中缓存的输入 token：上游给两个同源字段，优先标准字段。
+			CachedTokens    *int `json:"cached_tokens"`
+			CacheReadTokens *int `json:"cache_read_input_tokens"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -177,6 +211,22 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasThink = true
 		s.thinkTok = *chunk.Usage.ThinkingTokens
 	}
+	// 缓存命中的输入：cached_tokens 优先，回落 cache_read_input_tokens（同源字段）。
+	if chunk.Usage.CachedTokens != nil {
+		s.hasCached = true
+		s.cachedTok = *chunk.Usage.CachedTokens
+	} else if chunk.Usage.CacheReadTokens != nil {
+		s.hasCached = true
+		s.cachedTok = *chunk.Usage.CacheReadTokens
+	}
+}
+
+// CachedTokens 返回命中缓存的输入 token 数；缺失返回 -1。
+func (s *chatStatsReader) CachedTokens() int {
+	if !s.hasCached {
+		return -1
+	}
+	return s.cachedTok
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
@@ -216,6 +266,22 @@ func completionTokens(resp map[string]any) int {
 // promptTokens 从 Aggregate 返回的响应中提取 usage.prompt_tokens（输入/上下文用量）；缺失返回 -1。
 func promptTokens(resp map[string]any) int {
 	return usageInt(resp, "prompt_tokens")
+}
+
+// cachedTokens 从 Aggregate 返回的响应中提取命中缓存的输入 token；缺失返回 -1。
+// 优先 cached_tokens，回落 cache_read_input_tokens（同源字段）。
+func cachedTokens(resp map[string]any) int {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return -1
+	}
+	if v, ok := u["cached_tokens"].(float64); ok {
+		return int(v)
+	}
+	if v, ok := u["cache_read_input_tokens"].(float64); ok {
+		return int(v)
+	}
+	return -1
 }
 
 // thinkingTokens 从 Aggregate 返回的响应中提取思考（推理）token 数；缺失返回 -1。
@@ -303,7 +369,7 @@ func padModelName(model string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks/inTok <0 表示 usage 缺失，显示 "-"；params 零值字段同样显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, status int, toks, inTok, thinkTok int, params upstream.EffectiveParams) {
+func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, status int, toks, inTok, cachedTok, thinkTok int, params upstream.EffectiveParams) {
 	if !chatLogEnabled {
 		return
 	}
@@ -323,7 +389,7 @@ func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | acct=%s | %s | ctx=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | acct=%s | %s | ctx=%s | cache=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
@@ -332,6 +398,7 @@ func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, 
 		logAccountName(acct),
 		paramsText(params),
 		intOrDash(inTok),
+		intOrDash(cachedTok),
 		ttfbMS,
 		tokField,
 		intOrDash(thinkTok),

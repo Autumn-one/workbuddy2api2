@@ -158,7 +158,7 @@ func TestLogAccountNameFallback(t *testing.T) {
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", &auth.Auth{UID: "00e26541abcdef"}, http.StatusOK, 1234, 5000, 1800, upstream.EffectiveParams{Effort: "high", EffortReq: "high", MaxTokens: 8192})
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", &auth.Auth{UID: "00e26541abcdef"}, http.StatusOK, 1234, 5000, 1200, 1800, upstream.EffectiveParams{Effort: "high", EffortReq: "high", MaxTokens: 8192})
 	})
 	for _, want := range []string{
 		"| #", "deepseek-v4", "| stream |", "| 200 |", "00e26541", "effort=high", "max=8192", "ctx=5000", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
@@ -175,7 +175,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", &auth.Auth{UID: "s1"}, http.StatusServiceUnavailable, -1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "glm-5.2", "sync", &auth.Auth{UID: "s1"}, http.StatusServiceUnavailable, -1, -1, -1, -1, upstream.EffectiveParams{})
 	})
 	for _, want := range []string{"effort=-", "max=-", "ctx=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -187,8 +187,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, upstream.EffectiveParams{})
-		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, -1, upstream.EffectiveParams{})
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {

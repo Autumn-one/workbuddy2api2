@@ -60,7 +60,7 @@ func TestPadModelNameEmpty(t *testing.T) {
 func TestLogChatRowShowsFullModel(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, 0, "deepseek-v4.1-flash", "stream", &auth.Auth{UID: "uid-12345678"}, 200, -1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, 0, "deepseek-v4.1-flash", "stream", &auth.Auth{UID: "uid-12345678"}, 200, -1, -1, -1, -1, upstream.EffectiveParams{})
 	})
 	if !strings.Contains(out, "deepseek-v4.1-flash") {
 		t.Errorf("日志应含完整模型名 deepseek-v4.1-flash:\n%s", out)

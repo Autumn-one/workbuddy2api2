@@ -307,6 +307,65 @@ type checkinRow struct {
 	Detail string
 }
 
+// usageRow 界面上的一行用量（账号级汇总或账号×模型明细）。
+type usageRow struct {
+	UID      string
+	Model    string
+	Day      string
+	In       int64
+	Out      int64
+	Think    int64
+	Cached   int64
+	Requests int64
+	Missing  int64
+}
+
+// usageModel 用量表模型：支持两种视图（账号×模型明细 / 账号级汇总）。
+type usageModel struct {
+	walk.TableModelBase
+	items []usageRow
+}
+
+func (m *usageModel) RowCount() int { return len(m.items) }
+
+func (m *usageModel) Value(row, col int) interface{} {
+	if row < 0 || row >= len(m.items) {
+		return ""
+	}
+	r := m.items[row]
+	switch col {
+	case 0:
+		return r.UID
+	case 1:
+		if r.Model == "" {
+			return "（账号汇总）"
+		}
+		return r.Model
+	case 2:
+		if r.Day == "" {
+			return "（全部日期）"
+		}
+		return r.Day
+	case 3:
+		return itoa(r.Requests)
+	case 4:
+		return itoa(r.Cached)
+	case 5:
+		return itoa(r.In)
+	case 6:
+		return itoa(r.Out)
+	case 7:
+		return itoa(r.Think)
+	default:
+		return ""
+	}
+}
+
+func (m *usageModel) Replace(items []usageRow) {
+	m.items = items
+	m.PublishRowsReset()
+}
+
 type checkinModel struct {
 	walk.TableModelBase
 	items []checkinRow
@@ -551,19 +610,29 @@ func (a *app) showCreditHistoryFor(uid string) {
 	log.Printf("查看账号 %s 的积分变化历史（共 %d 条）", a.displayName(uid), a.credits.RowCount())
 }
 
-// logTabIndex 返回「日志」页的页签序号。
-// 不再用硬编码常量：页签数量会随功能增减（如本次新增「测试」页），
-// 硬编码会在插页后悄悄跳错页。按页标题查找，找不到回落 0（最差也回到首页）。
-func (a *app) logTabIndex() int {
+// usageTabIndex 返回「用量」页的页签序号（按标题查找，避免插页后错位）。
+func (a *app) usageTabIndex() int {
+	return a.tabIndexByTitle("用量")
+}
+
+// tabIndexByTitle 按页签标题查找序号；找不到回落 0。
+func (a *app) tabIndexByTitle(title string) int {
 	if a.tabs == nil {
 		return 0
 	}
 	for i := 0; i < a.tabs.Pages().Len(); i++ {
-		if a.tabs.Pages().At(i).Title() == "日志" {
+		if a.tabs.Pages().At(i).Title() == title {
 			return i
 		}
 	}
 	return 0
+}
+
+// logTabIndex 返回「日志」页的页签序号。
+// 不再用硬编码常量：页签数量会随功能增减（如本次新增「测试」页），
+// 硬编码会在插页后悄悄跳错页。按页标题查找，找不到回落 0（最差也回到首页）。
+func (a *app) logTabIndex() int {
+	return a.tabIndexByTitle("日志")
 }
 
 // At 返回账号表第 i 行（供双击等交互使用）。
@@ -902,6 +971,8 @@ type app struct {
 	checkinLog *checkinStore
 	// logRot gui.log 的轮转 writer（退出时关闭，释放 Windows 文件占用）。
 	logRot *rotatingLogWriter
+	// usageStore token 用量统计（账号×模型×日期）；退出时落盘。
+	usageStore *server.TokenUsageStore
 	// credits 积分变动记录表 + 持久化（重启不丢）。
 	credits   *creditModel
 	creditLog *creditStore
@@ -933,6 +1004,15 @@ type app struct {
 	lblLogin  *walk.Label
 	oauth     *oauthflow.Client
 	loginBusy bool
+
+	// 用量页（token 统计：账号×模型 明细 + 账号级/全局汇总）
+	tvUsage       *walk.TableView
+	cbUsageScope  *walk.ComboBox
+	cbUsageDay    *walk.ComboBox
+	lblUsageTotal *walk.Label
+	usage         *usageModel
+	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
+	usageDays []string
 
 	// 测试页（手动探测账号×模型连通性）
 	cbProbeAcct   *walk.ComboBox
@@ -1051,6 +1131,7 @@ func main() {
 		accounts:   &accountModel{},
 		checkins:   &checkinModel{},
 		credits:    &creditModel{},
+		usage:      &usageModel{},
 		modelRates: &modelRateModel{},
 		oauth:      oauthflow.NewClient(),
 	}
@@ -1072,6 +1153,9 @@ func main() {
 	a.checkinLog = newCheckinStore(filepath.Join(filepath.Dir(a.cfg.StateFile), checkinLogFile))
 	// 积分变动历史持久化：同目录，重启不丢。
 	a.creditLog = newCreditStore(filepath.Join(filepath.Dir(a.cfg.StateFile), creditLogFile))
+	// token 用量统计（账号×模型×日期）：同目录。仅观测，不参与任何决策。
+	a.usageStore = server.NewTokenUsageStore(filepath.Join(filepath.Dir(a.cfg.StateFile), tokenUsageFile))
+	a.svc.SetUsageStore(a.usageStore)
 
 	// 积分变动回调：pool 写路径触发（可能任意 goroutine）→ 表格刷新必须在 UI 线程，
 	// 故用 Synchronize 投递；落盘在 creditStore 内部自行加锁，与 UI 线程解耦。
@@ -1137,6 +1221,7 @@ func main() {
 	a.refreshAll()
 	a.loadCheckinHistory()
 	a.loadCreditHistory()
+	a.refreshUsage()
 
 	go a.tickLoop()
 	// 启动补签：在服务起来后异步执行，不阻塞 UI。
@@ -1159,6 +1244,11 @@ func (a *app) tickLoop() {
 			a.refreshStatus()
 			a.refreshAccounts()
 			a.refreshLog()
+			// 用量统计按需刷新：只在「用量」页可见时刷（其它页面刷了也看不见，
+			// 白白重建表格）。周期与 tick 一致即可，token 统计不是实时指标。
+			if a.tabs != nil && a.tabs.CurrentIndex() == a.usageTabIndex() {
+				a.refreshUsage()
+			}
 		})
 	}
 }

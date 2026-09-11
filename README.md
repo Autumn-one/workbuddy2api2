@@ -439,6 +439,33 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 出站请求强制 `stream:true`；SSE 帧按 OpenAI 规范**白名单重建**（`reasoning_content` 保留、工具调用按 index 合并、未知字段剥离）
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`；`error` 帧原样透传
 
+## 📊 Token 用量统计
+
+GUI「用量」页记录所有账号、所有模型的 token 用量，维度是**账号 × 模型 × 日期**
+（日期必须记，否则无法回答"今天用了多少"）。
+
+- **明细视图**：每（账号×模型×日期）一行；
+- **账号级汇总**：对明细 sum（自然 rollup），另有全局合计；
+- 日期下拉可只看某一天（默认全部）。
+
+| 列 | 来源 |
+|---|---|
+| 请求数 | 该组合的请求次数（**含失败请求**） |
+| 缓存输入 | `usage.cached_tokens`（缺失回落 `cache_read_input_tokens`）——命中缓存的输入 token |
+| 输入 | `usage.prompt_tokens`（上下文） |
+| 输出 | `usage.completion_tokens`（按上游口径**已含**思考） |
+| 其中思考 | `usage.completion_tokens_details.reasoning_tokens`（缺失回落 `completion_thinking_tokens`） |
+
+落盘 `data/token-usage.json`（重启不丢，退出时写盘）。
+
+> **两个必须知道的口径**
+> 1. **只统计成功请求的 token**：失败请求（6004 限流、402 余额不足）上游不返回 `usage`，
+>    只计一次请求数并计入"未返回 usage"提示。因此本表**不能用于核对积分扣减**
+>    （积分变化看 `data/credit-log.jsonl`），它的用途是 token 维度的**成本归因**。
+> 2. **上下文大 ≠ 计费多**：`输入` 是上下文总量，`缓存输入` 是其中命中缓存的部分。
+>    两者接近时说明缓存复用率高、实际计费输入远小于上下文——这是判断"哪个账号/模型
+>    更划算"的关键，只看 `输入` 会严重高估成本。
+
 ## 📋 请求级日志
 
 每个 `/v1/chat/completions` 请求结束时输出一行表格日志（stdout）：
@@ -458,6 +485,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `effort=` | **实际发往上游**的思考深度档位（`reasoning_effort` / `reasoningEffort`）；未指定为 `-` |
 | `max=` | 客户端指定的输出上限（`max_completion_tokens` 优先，其次 `max_tokens`）；未指定为 `-` |
 | `ctx=` | 输入（上下文）token 数，来自末帧 `usage.prompt_tokens`；缺失为 `-` |
+| `cache=` | 其中命中缓存的输入 token（`cached_tokens`，缺失回落 `cache_read_input_tokens`）；缺失为 `-`。与 `ctx=` 接近说明缓存复用率高、实际计费输入小 |
 | `TTFB` | 流式首帧耗时（非流式为 `-`） |
 | `tok` | 输出 token 数，来自末帧 `usage.completion_tokens`；缺失为 `-` |
 | `think=` | **思考 token 数**，来自 `usage.completion_tokens_details.reasoning_tokens`（缺失回落 `completion_thinking_tokens`）。它是"档位是否真的生效"的直接证据：`effort=` 只说明请求了什么，`think=` 才说明思考了多少 |

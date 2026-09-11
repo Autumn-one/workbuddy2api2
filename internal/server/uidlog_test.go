@@ -38,7 +38,7 @@ func TestLogChatRowShowsNickname(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRow(0, time.Second, "glm-5.2", "sync",
 			&auth.Auth{UID: "d44304c5-xx", Nickname: "19396392726"},
-			200, 10, 5, 3, upstream.EffectiveParams{})
+			200, 10, 5, 3, 3, upstream.EffectiveParams{})
 	})
 	if !strings.Contains(out, "1939639") {
 		t.Errorf("请求行应显示昵称前 7 字符: %s", out)

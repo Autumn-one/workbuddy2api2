@@ -334,6 +334,61 @@ func (a *app) buildUI() error {
 						},
 					},
 
+					// ══════════════ 用量 ══════════════
+					{
+						Title:  "用量",
+						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+						Children: []dcl.Widget{
+							dcl.Label{Text: "Token 用量统计（账号 × 模型 × 日期），数据来自上游响应里的 usage 字段。" +
+								"\r\n· 只统计【成功请求】：失败请求（限流/余额不足）上游不返回 usage，仅计一次请求数。" +
+								"\r\n· 缓存：命中缓存的输入 token。上下文很大但缓存命中率高时，实际计费输入远小于「输入」列。" +
+								"\r\n· 本表是 token 维度的成本归因，不能用于核对积分扣减（那看「日志」页的积分记录）。"},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.Label{Text: "视图"},
+									dcl.ComboBox{
+										AssignTo:              &a.cbUsageScope,
+										Model:                 []string{"账号 × 模型 明细", "账号级汇总"},
+										CurrentIndex:          0,
+										OnCurrentIndexChanged: a.refreshUsage,
+									},
+									dcl.Label{Text: "日期"},
+									dcl.ComboBox{
+										AssignTo:              &a.cbUsageDay,
+										Model:                 []string{"全部日期"},
+										CurrentIndex:          0,
+										OnCurrentIndexChanged: a.refreshUsage,
+									},
+									dcl.PushButton{Text: "刷新", MinSize: dcl.Size{Width: 70}, OnClicked: a.refreshUsage},
+									dcl.HSpacer{},
+								},
+							},
+							dcl.Label{
+								AssignTo: &a.lblUsageTotal,
+								Text:     "—",
+								Font:     dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+							},
+							dcl.TableView{
+								AssignTo:         &a.tvUsage,
+								Model:            a.usage,
+								AlternatingRowBG: true,
+								StretchFactor:    1,
+								Columns: []dcl.TableViewColumn{
+									{Title: "账号", Width: 140},
+									{Title: "模型", Width: 190},
+									{Title: "日期", Width: 95},
+									{Title: "请求数", Width: 70, Alignment: dcl.AlignFar},
+									{Title: "缓存输入", Width: 90, Alignment: dcl.AlignFar},
+									{Title: "输入", Width: 100, Alignment: dcl.AlignFar},
+									{Title: "输出", Width: 100, Alignment: dcl.AlignFar},
+									{Title: "其中思考", Width: 100, Alignment: dcl.AlignFar},
+								},
+							},
+							dcl.Label{Text: "提示：双击「账号」页某行看该账号的积分变化；本表看 token 花在哪个账号/模型/日期。"},
+						},
+					},
+
 					// ══════════════ 配置 ══════════════
 					{
 						Title:  "配置",
@@ -599,6 +654,10 @@ func (a *app) quit() {
 	// 关闭 gui.log 的轮转句柄：同理释放文件占用，也避免退出瞬间丢缓冲日志。
 	if a.logRot != nil {
 		_ = a.logRot.Close()
+	}
+	// token 用量统计落盘（内部 Flush；失败仅忽略——属观测数据）。
+	if a.usageStore != nil {
+		a.usageStore.Close()
 	}
 	if a.mw != nil {
 		a.mw.Close()

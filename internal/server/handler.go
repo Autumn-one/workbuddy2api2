@@ -31,6 +31,9 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429 冷却，默认 60s
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+	// UsageStore token 用量统计（账号×模型×日期）；nil = 不统计。
+	// 仅观测，不参与任何决策。
+	UsageStore *TokenUsageStore
 }
 
 // Handler 主路由。
@@ -265,6 +268,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
+	st.usageSink = h.cfg.UsageStore
 	defer st.done()
 
 	tried := map[string]bool{}
@@ -393,6 +397,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.toks, _ = stats.Tokens()
 			st.inTok = stats.PromptTokens()
 			st.thinkTok = stats.ThinkingTokens()
+			st.cachedTok = stats.CachedTokens()
 			rc.Close()
 			return
 		}
@@ -409,6 +414,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		st.inTok = promptTokens(resp)
 		st.thinkTok = thinkingTokens(resp)
+		st.cachedTok = cachedTokens(resp)
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

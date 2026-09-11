@@ -37,6 +37,9 @@ const (
 
 	// creditLogLegacyFile 旧版数组格式文件名。启动时若新文件不存在而它存在，则导入并保留原文件。
 	creditLogLegacyFile = "credit-log.json"
+
+	// tokenUsageFile token 用量统计落盘文件名（账号×模型×日期，见 server/tokenusage.go）。
+	tokenUsageFile = "token-usage.json"
 )
 
 // creditRow 一条积分变动记录。
