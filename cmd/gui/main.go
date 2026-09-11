@@ -540,13 +540,25 @@ func (a *app) showCreditHistoryFor(uid string) {
 	}
 	a.setCreditFilter(uid)
 	if a.tabs != nil {
-		_ = a.tabs.SetCurrentIndex(logTabIndex)
+		_ = a.tabs.SetCurrentIndex(a.logTabIndex())
 	}
 	log.Printf("查看账号 %s 的积分变化历史（共 %d 条）", a.displayName(uid), a.credits.RowCount())
 }
 
-// logTabIndex 「日志」页在页签中的序号（依次为：服务/账号/模型/登录/日志/配置）。
-const logTabIndex = 4
+// logTabIndex 返回「日志」页的页签序号。
+// 不再用硬编码常量：页签数量会随功能增减（如本次新增「测试」页），
+// 硬编码会在插页后悄悄跳错页。按页标题查找，找不到回落 0（最差也回到首页）。
+func (a *app) logTabIndex() int {
+	if a.tabs == nil {
+		return 0
+	}
+	for i := 0; i < a.tabs.Pages().Len(); i++ {
+		if a.tabs.Pages().At(i).Title() == "日志" {
+			return i
+		}
+	}
+	return 0
+}
 
 // At 返回账号表第 i 行（供双击等交互使用）。
 func (m *accountModel) At(i int) (pool.Status, bool) {
@@ -839,6 +851,7 @@ func (a *app) loadModelRates() {
 		if a.lblModelDetail != nil && len(rows) > 0 {
 			a.lblModelDetail.SetText("选中一行查看该模型的完整参数。")
 		}
+		a.syncProbeChoices()
 	})
 	log.Printf("模型参数已加载：%d 个模型", len(rows))
 }
@@ -912,6 +925,17 @@ type app struct {
 	lblLogin  *walk.Label
 	oauth     *oauthflow.Client
 	loginBusy bool
+
+	// 测试页（手动探测账号×模型连通性）
+	cbProbeAcct  *walk.ComboBox
+	cbProbeModel *walk.ComboBox
+	btnProbe     *walk.PushButton
+	teProbe      *walk.TextEdit
+	probeBusy    bool
+	// probeUIDs 与 cbProbeAcct 的选项平行（下拉框索引 → uid）。
+	probeUIDs []string
+	// lastProbeModels 上次填充模型下拉框的选项（判断是否需要重建）。
+	lastProbeModels []string
 
 	// logs page
 	tabs      *walk.TabWidget
@@ -1178,9 +1202,10 @@ func (a *app) refreshAccounts() {
 	if a.lblAccts2 != nil {
 		a.lblAccts2.SetText(fmt.Sprintf("共 %d 个账号", len(items)))
 	}
-	// 账号集可能变了（登录新增/删除/昵称更新）：同步积分过滤下拉框。
-	// syncCreditFilter 内部自行比较，选项未变时不会重置下拉框。
+	// 账号集可能变了（登录新增/删除/昵称更新）：同步积分过滤下拉框与测试页选择。
+	// sync* 内部自行比较，选项未变时不会重置下拉框。
 	a.syncCreditFilter()
+	a.syncProbeChoices()
 }
 
 func (a *app) tblSignature(items []pool.Status) string {

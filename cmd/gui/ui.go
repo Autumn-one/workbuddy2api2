@@ -172,6 +172,40 @@ func (a *app) buildUI() error {
 						},
 					},
 
+					// ══════════════ 测试 ══════════════
+					{
+						Title:  "测试",
+						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+						Children: []dcl.Widget{
+							dcl.Label{Text: "手动探测：选定账号 + 模型，用该账号凭证直接打一次上游（绕过网关轮换）。" +
+								"\r\n用途：判断某账号不可用是账号问题还是模型问题；探测请求固定小 max_tokens，积分消耗极小。"},
+							dcl.Composite{
+								Layout: dcl.Grid{Columns: 2, Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.Label{Text: "账号"},
+									dcl.Label{Text: "模型"},
+									dcl.ComboBox{AssignTo: &a.cbProbeAcct, MinSize: dcl.Size{Width: 260}},
+									dcl.ComboBox{AssignTo: &a.cbProbeModel, MinSize: dcl.Size{Width: 260}},
+								},
+							},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.PushButton{AssignTo: &a.btnProbe, Text: "开始测试", MinSize: dcl.Size{Width: 100}, OnClicked: a.doProbe},
+									dcl.HSpacer{},
+								},
+							},
+							dcl.GroupBox{
+								Title:  "结果",
+								Layout: dcl.VBox{},
+								Children: []dcl.Widget{
+									dcl.TextEdit{AssignTo: &a.teProbe, ReadOnly: true, VScroll: true, StretchFactor: 1,
+										Font: dcl.Font{Family: "Cascadia Mono", PointSize: 9}},
+								},
+							},
+						},
+					},
+
 					// ══════════════ 登录 ══════════════
 					{
 						Title:  "登录",
