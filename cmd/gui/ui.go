@@ -6,6 +6,7 @@ import (
 
 	"github.com/lxn/walk"
 	dcl "github.com/lxn/walk/declarative"
+	"github.com/lxn/win"
 )
 
 // buildUI 装配主窗口（5 个页签）+ 系统托盘。
@@ -498,7 +499,12 @@ func (a *app) initTray() {
 	quit.Triggered().Attach(func() { a.quit() })
 	_ = ni.ContextMenu().Actions().Add(quit)
 
-	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+	// 左键点击 → 显示/还原主窗口。
+	// 用 MouseUp 而非 MouseDown：与 Windows 托盘惯例一致（按下不触发、松开才动作），
+	// 也避免用户按下后拖开仍被当成点击。
+	// 右键不在此处理——walk 的 notifyIconWndProc 已在 WM_RBUTTONUP 上弹出
+	// ContextMenu（见 walk/notifyicon.go），保持默认行为。
+	ni.MouseUp().Attach(func(x, y int, button walk.MouseButton) {
 		if button == walk.LeftButton {
 			a.showWindow()
 		}
@@ -529,11 +535,34 @@ func (a *app) initTray() {
 	})
 }
 
+// showCommandFor 依据窗口当前状态返回 ShowWindow 命令。
+//
+// 为什么不能只用 walk 的 Show()：FormBase.Show → setWindowVisible(true) →
+// ShowWindow(SW_SHOWNA)。SW_SHOWNA 的语义是"显示但不激活"，对【最小化】状态的
+// 窗口不产生任何效果——窗口不会还原，用户点了托盘图标看不到反应（实测缺陷）。
+// 因此最小化时必须显式用 SW_RESTORE。
+func showCommandFor(minimized, visible bool) int32 {
+	if minimized {
+		return win.SW_RESTORE
+	}
+	return win.SW_SHOWNORMAL
+}
+
+// showWindow 从托盘把主窗口带回前台：还原（若最小化）→ 显示 → 置前。
 func (a *app) showWindow() {
 	if a.mw == nil {
 		return
 	}
+	minimized := win.IsIconic(a.mw.Handle())
+	if minimized {
+		// 最小化：显式还原。SW_RESTORE 同时会激活窗口。
+		win.ShowWindow(a.mw.Handle(), showCommandFor(minimized, true))
+		return
+	}
+	// 未最小化：走 walk 的 Show()（内部 SW_SHOWNA）+ 置前 + 抢焦点，
+	// 保持既有"收进托盘后再点出来"的行为不变。
 	a.mw.Show()
+	_ = a.mw.Activate()
 	_ = a.mw.SetFocus()
 }
 
