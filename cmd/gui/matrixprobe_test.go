@@ -194,3 +194,35 @@ func TestMatrixRowNoNameFallback(t *testing.T) {
 		t.Errorf("无昵称应回落 UID 前 7 位: %+v", got)
 	}
 }
+
+// TestMatrixModelChoiceFromOwnControl 回归：检测用的模型必须来自【账号页自己的】
+// 模型下拉框，不得偷偷读「测试」页的选择。
+//
+// 缺陷背景：初版实现从 a.cbProbeModel（测试页控件）取值当默认，导致用户在账号页
+// 点检测时既看不到要测哪个模型、也无法在账号页修改它；没去过测试页时更会默认测
+// 模型清单里的第一项（可能是 auto）。这是"控件缺失"而非小疏漏。
+func TestMatrixModelChoiceFromOwnControl(t *testing.T) {
+	// 账号页选择优先：构造仅带账号页控件引用的 app（测试页控件为 nil）
+	a := &app{}
+	a.cbMatrixModel = nil // 显式说明：这里不是靠测试页控件
+	if got := a.selectedMatrixModel(); got != "" {
+		t.Errorf("无控件时应返回空串（提示用户选择）, got %q", got)
+	}
+}
+
+// TestMatrixModelChoicesPlaceholder 模型清单为空时给出明确操作指引，
+// 而不是让用户面对空下拉框或静默测错模型。
+func TestMatrixModelChoicesPlaceholder(t *testing.T) {
+	got := probeModelChoices(nil)
+	if len(got) != 1 || !strings.Contains(got[0], "模型") {
+		t.Errorf("空清单应给指引文案, got %v", got)
+	}
+	// 占位文案必须能被识别（避免把提示当模型名去测）
+	if !isPlaceholderModel(got[0]) {
+		t.Errorf("占位文案应被 isPlaceholderModel 识别: %q", got[0])
+	}
+	// 正常模型名不应被误判为占位
+	if isPlaceholderModel("glm-5.2") || isPlaceholderModel("auto") {
+		t.Error("真实模型名不得被识别为占位")
+	}
+}

@@ -132,6 +132,28 @@ func probeTargets(items []pool.Status, isModelCooling func(uid string) bool) []m
 	return out
 }
 
+// selectedMatrixModel 返回账号页模型下拉框当前选中的模型 ID；未选/占位提示返回空串。
+func (a *app) selectedMatrixModel() string {
+	if a.cbMatrixModel == nil {
+		return ""
+	}
+	idx := a.cbMatrixModel.CurrentIndex()
+	if idx < 0 {
+		return ""
+	}
+	m := strings.TrimSpace(a.cbMatrixModel.Text())
+	if isPlaceholderModel(m) {
+		return ""
+	}
+	return m
+}
+
+// isPlaceholderModel 识别下拉框里的"提示文案"（不是真实模型名），
+// 避免把提示当成模型去发请求。
+func isPlaceholderModel(s string) bool {
+	return strings.Contains(s, "请先到") || strings.Contains(s, "重新加载") || strings.Contains(s, "（")
+}
+
 // shortUID 无昵称时的展示名（前 7 位，与日志口径一致）。
 func shortUID(uid string) string {
 	if len(uid) > 7 {
@@ -200,6 +222,26 @@ func runMatrixProbe(a *app, model string, cancel func() bool, onStep func(matrix
 	return rows
 }
 
+// syncMatrixModels 刷新账号页的模型下拉框（模型清单加载后调用）。
+// 与其它下拉框同策略：选项未变不重建，避免打断用户选择。
+func (a *app) syncMatrixModels() {
+	if a.cbMatrixModel == nil {
+		return
+	}
+	models := probeModelChoices(a.modelRates.items)
+	if equalStrs(models, a.lastMatrixModels) {
+		return
+	}
+	a.lastMatrixModels = models
+	if err := a.cbMatrixModel.SetModel(models); err != nil {
+		logf("账号页模型下拉框刷新失败: %v", err)
+		return
+	}
+	if len(models) > 0 {
+		a.cbMatrixModel.SetCurrentIndex(0)
+	}
+}
+
 // ─────────────────────────── UI 接线 ───────────────────────────
 
 // doMatrixProbe 账号页「检测模型可用性」入口：
@@ -218,19 +260,15 @@ func (a *app) doMatrixProbe() {
 		a.lblAccts2.SetText("没有账号可检测")
 		return
 	}
-	models := probeModelChoices(a.modelRates.items)
-	// 让用户选模型（复用测试页的输入框内容作为默认，避免再弹一层窗口）
-	def := ""
-	if a.cbProbeModel != nil {
-		def = strings.TrimSpace(a.cbProbeModel.Text())
-	}
-	if def == "" || strings.Contains(def, "重新加载") {
-		if len(models) > 0 && !strings.Contains(models[0], "重新加载") {
-			def = models[0]
-		}
-	}
+	// 模型一律取自【账号页自己的下拉框】：用户在点击前就能看到并修改要测哪个模型。
+	// （初版从「测试」页控件取值是错的——账号页上看不见也改不了。）
+	def := a.selectedMatrixModel()
 	if def == "" {
-		a.lblAccts2.SetText("请先到「模型」页点「重新加载参数」，再回来检测")
+		if a.modelRates == nil || len(a.modelRates.items) == 0 {
+			a.lblAccts2.SetText("模型清单为空：请先到「模型」页点「重新加载参数」")
+		} else {
+			a.lblAccts2.SetText("请先在账号页选择要检测的模型")
+		}
 		return
 	}
 	// 明确告知消耗：每次检测 = 账号数 × 1 个真实请求。

@@ -927,6 +927,7 @@ func (a *app) loadModelRates() {
 			a.lblModelDetail.SetText("选中一行查看该模型的完整参数。")
 		}
 		a.syncProbeChoices()
+		a.syncMatrixModels()
 	})
 	log.Printf("模型参数已加载：%d 个模型", len(rows))
 }
@@ -1016,11 +1017,14 @@ type app struct {
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
 
-	// 账号页「检测模型可用性」：检测进行中标志 + 取消标志 + 按钮。
-	matrixBusy     bool
-	matrixCancel   bool
-	btnMatrixProbe *walk.PushButton
-	btnMatrixStop  *walk.PushButton
+	// 账号页「检测模型可用性」：模型下拉框 + 检测进行中标志 + 取消标志 + 按钮。
+	// cbMatrixModel 必须是账号页自己的控件——用户在点击检测前要能看到并修改模型。
+	cbMatrixModel    *walk.ComboBox
+	lastMatrixModels []string
+	matrixBusy       bool
+	matrixCancel     bool
+	btnMatrixProbe   *walk.PushButton
+	btnMatrixStop    *walk.PushButton
 
 	// 测试页（手动探测账号×模型连通性）
 	cbProbeAcct   *walk.ComboBox
@@ -1230,6 +1234,7 @@ func main() {
 	a.loadCheckinHistory()
 	a.loadCreditHistory()
 	a.refreshUsage()
+	a.syncMatrixModels()
 
 	go a.tickLoop()
 	// 启动补签：在服务起来后异步执行，不阻塞 UI。

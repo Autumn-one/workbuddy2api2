@@ -122,8 +122,11 @@ func (a *app) buildUI() error {
 									dcl.PushButton{Text: "设为优先消耗", MinSize: dcl.Size{Width: 110}, OnClicked: func() { a.doSetPriority(3.0) }},
 									dcl.PushButton{Text: "取消优先", MinSize: dcl.Size{Width: 80}, OnClicked: func() { a.doSetPriority(0) }},
 									dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
-									// 一键检测：指定模型，横向扫全部账号的可用性。
+									// 一键检测：先选模型，再横向扫全部账号的可用性。
+									// 模型下拉框必须在账号页——用户点击前要能看到并修改要测哪个模型。
 									// 会消耗少量积分（每账号 1 次小请求），点击后有确认提示。
+									dcl.Label{Text: "检测模型"},
+									dcl.ComboBox{AssignTo: &a.cbMatrixModel, Model: []string{"（请先到「模型」页加载参数）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 180}},
 									dcl.PushButton{AssignTo: &a.btnMatrixProbe, Text: "检测模型可用性", MinSize: dcl.Size{Width: 120}, OnClicked: a.doMatrixProbe},
 									dcl.PushButton{AssignTo: &a.btnMatrixStop, Text: "停止检测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doStopMatrixProbe},
 									dcl.HSpacer{},
