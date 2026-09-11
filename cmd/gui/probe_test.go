@@ -10,7 +10,7 @@ import (
 
 // TestBuildProbeBody 测试请求体：小 max_tokens 省积分，强制 stream（上游拒绝非流式）。
 func TestBuildProbeBody(t *testing.T) {
-	body := buildProbeBody("glm-5.2", 0)
+	body := buildProbeBody("glm-5.2", 0, "")
 	if !strings.Contains(body, `"model":"glm-5.2"`) {
 		t.Errorf("body 缺 model: %s", body)
 	}
@@ -89,7 +89,7 @@ func TestProbeAccountChoices(t *testing.T) {
 // 绝不能 panic（测试环境/异常装配下 a.svc 可能为 nil）。
 func TestRunProbeNilService(t *testing.T) {
 	a := &app{} // svc 为 nil
-	res := runProbe(a, "u1", "glm-5.2")
+	res := runProbe(a, "u1", "glm-5.2", 0, "")
 	if res == nil {
 		t.Fatal("runProbe 必须返回非 nil")
 	}

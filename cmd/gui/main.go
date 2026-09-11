@@ -927,11 +927,13 @@ type app struct {
 	loginBusy bool
 
 	// 测试页（手动探测账号×模型连通性）
-	cbProbeAcct  *walk.ComboBox
-	cbProbeModel *walk.ComboBox
-	btnProbe     *walk.PushButton
-	teProbe      *walk.TextEdit
-	probeBusy    bool
+	cbProbeAcct   *walk.ComboBox
+	cbProbeModel  *walk.ComboBox
+	leProbePrompt *walk.LineEdit // 自定义提示词（空 = 默认「请回复：OK」）
+	leProbeTokens *walk.LineEdit // 自定义 max_tokens（空/非法 = 默认 32）
+	btnProbe      *walk.PushButton
+	teProbe       *walk.TextEdit
+	probeBusy     bool
 	// probeUIDs 与 cbProbeAcct 的选项平行（下拉框索引 → uid）。
 	probeUIDs []string
 	// lastProbeModels 上次填充模型下拉框的选项（判断是否需要重建）。

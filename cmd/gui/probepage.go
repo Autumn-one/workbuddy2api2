@@ -8,14 +8,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
 	"workbuddy2api/internal/upstream"
 )
 
-// probeMaxTokens 探测请求的输出上限：足够返回一句话，又把积分消耗压到最低。
+// probeMaxTokens 探测请求的默认输出上限：足够返回一句话，又把积分消耗压到最低。
 const probeMaxTokens = 32
+
+// probeMaxTokensLimit 用户自定义输出上限的硬顶：防误填超大值意外烧积分。
+const probeMaxTokensLimit = 4096
 
 // probeResult 一次探测的结果。
 type probeResult struct {
@@ -82,16 +86,22 @@ func probeFailureText(kind upstream.ErrKind, detail string) string {
 }
 
 // buildProbeBody 组装探测请求体：单条 user 消息 + stream:true（上游拒绝非流式）
-// + 小 max_tokens。刻意不带 reasoning_effort：探测关心的是"通不通"，不是思考质量，
+// + max_tokens 上限。prompt 为空/纯空白时回落默认「请回复：OK」；否则原文透传
+// （用户可能用提示词验证特定能力，如"请输出一段很长的回复"测长文、JSON 输出测工具格式）。
+// 刻意不带 reasoning_effort：探测关心的是"通不通"，不是思考质量，
 // 不带档位省积分也快（deepseek-v4.1-flash 不传档位思考为 0）。
-func buildProbeBody(model string, maxTokens int) string {
+func buildProbeBody(model string, maxTokens int, prompt string) string {
 	if maxTokens <= 0 {
 		maxTokens = probeMaxTokens
+	}
+	content := strings.TrimSpace(prompt)
+	if content == "" {
+		content = "请回复：OK"
 	}
 	obj := map[string]any{
 		"model": model,
 		"messages": []map[string]any{
-			{"role": "user", "content": "请回复：OK"},
+			{"role": "user", "content": content},
 		},
 		"stream":     true,
 		"max_tokens": maxTokens,
@@ -133,7 +143,7 @@ func probeAccountLabel(nickname, uid, state string) string {
 
 // runProbe 用指定账号的凭证直接打一次上游 chat（绕过网关轮换）。
 // 同步执行——调用方放在 goroutine 里。结果保证非 nil。
-func runProbe(a *app, uid, model string) *probeResult {
+func runProbe(a *app, uid, model string, maxTokens int, prompt string) *probeResult {
 	start := time.Now()
 	res := &probeResult{InTok: -1, OutTok: -1}
 
@@ -155,7 +165,7 @@ func runProbe(a *app, uid, model string) *probeResult {
 		return res
 	}
 
-	rc, status, respBody, params, err := up.ChatStreamWithParams(acct, []byte(buildProbeBody(model, 0)))
+	rc, status, respBody, params, err := up.ChatStreamWithParams(acct, []byte(buildProbeBody(model, maxTokens, prompt)))
 	res.Elapsed = time.Since(start)
 	if err != nil {
 		res.Detail = err.Error()
@@ -298,13 +308,23 @@ func (a *app) doProbe() {
 		return
 	}
 
+	// 自定义输出上限：空/非法回落默认 32；给个合理上界防误填超大值烧积分。
+	maxTokens := probeMaxTokens
+	if v, err := strconv.Atoi(strings.TrimSpace(a.leProbeTokens.Text())); err == nil && v > 0 {
+		maxTokens = v
+		if maxTokens > probeMaxTokensLimit {
+			maxTokens = probeMaxTokensLimit
+		}
+	}
+	prompt := a.leProbePrompt.Text()
+
 	a.probeBusy = true
 	a.btnProbe.SetEnabled(false)
 	acctName := a.displayName(uid)
-	a.appendProbeLine(fmt.Sprintf("── %s × %s 探测中…", acctName, model))
+	a.appendProbeLine(fmt.Sprintf("── %s × %s 探测中…（max_tokens=%d）", acctName, model, maxTokens))
 
 	go func() {
-		res := runProbe(a, uid, model)
+		res := runProbe(a, uid, model, maxTokens, prompt)
 		a.mw.Synchronize(func() {
 			a.probeBusy = false
 			if a.btnProbe != nil {
