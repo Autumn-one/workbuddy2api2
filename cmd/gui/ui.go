@@ -55,7 +55,21 @@ func (a *app) buildUI() error {
 									dcl.Label{Text: "状态"},
 									dcl.Label{AssignTo: &a.lblState, Text: "未启动", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
 									dcl.Label{Text: "监听地址"},
-									dcl.Label{AssignTo: &a.lblAddr, Text: "—"},
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 6},
+										Children: []dcl.Widget{
+											dcl.Label{AssignTo: &a.lblAddr, Text: "—"},
+											dcl.PushButton{
+												Text:      "复制",
+												MinSize:   dcl.Size{Width: 52},
+												OnClicked: a.doCopyListenAddr,
+											},
+											// 复制结果提示：刻意不用 lblState —— 它每 1.5s 被
+											// refreshStatus 重写，提示会被立刻冲掉。
+											dcl.Label{AssignTo: &a.lblCopyHint, Text: ""},
+											dcl.HSpacer{},
+										},
+									},
 									dcl.Label{Text: "账号"},
 									dcl.Label{AssignTo: &a.lblAccts, Text: "—"},
 								},

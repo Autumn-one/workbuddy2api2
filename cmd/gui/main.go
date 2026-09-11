@@ -983,7 +983,9 @@ type app struct {
 	lblState *walk.Label
 	lblAddr  *walk.Label
 	lblAccts *walk.Label
-	chkAuto  *walk.CheckBox
+	// lblCopyHint 监听地址复制结果提示（独立于 lblState，避免被定时刷新冲掉）。
+	lblCopyHint *walk.Label
+	chkAuto     *walk.CheckBox
 
 	// 账号页
 	tvAccounts *walk.TableView
@@ -1273,7 +1275,7 @@ func (a *app) refreshStatus() {
 		a.lblState.SetText(msg)
 		a.lblState.SetTextColor(walk.RGB(0xA3, 0x2D, 0x2D))
 	}
-	a.lblAddr.SetText(a.svc.ListenAddr(a.cfg))
+	a.lblAddr.SetText(listenURLText(a.svc.ListenAddr(a.cfg)))
 
 	items := a.svc.Accounts()
 	healthy := 0
@@ -1572,6 +1574,27 @@ func (a *app) doOpenBrowser() {
 	// 用 rundll32 调系统默认浏览器，避免走 cmd
 	_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", url).Start()
 	a.lblLogin.SetText("已尝试在浏览器打开。若没反应，请手动复制上面的链接。")
+}
+
+// doCopyListenAddr 复制服务监听地址（带 http:// 前缀，可直接粘进浏览器/curl）。
+// 复制内容取自状态栏当前显示的 URL，保证"看到的"与"复制的"完全一致。
+func (a *app) doCopyListenAddr() {
+	if a.lblAddr == nil {
+		return
+	}
+	url := strings.TrimSpace(a.lblAddr.Text())
+	if url == "" || url == "—" {
+		return
+	}
+	if err := walk.Clipboard().SetText(url); err != nil {
+		if a.lblCopyHint != nil {
+			a.lblCopyHint.SetText("复制失败：" + firstLine(err.Error()))
+		}
+		return
+	}
+	if a.lblCopyHint != nil {
+		a.lblCopyHint.SetText("已复制 ✓")
+	}
 }
 
 func (a *app) doCopyURL() {
