@@ -60,8 +60,10 @@ func TestCooldownUntilTomorrow4AMIntervalUpperBound(t *testing.T) {
 		t.Fatal("no status")
 	}
 	d := st.Until.Sub(before)
-	if d <= 0 || d > 25*time.Hour {
-		t.Errorf("冷却间隔 %v 应落在 (0, 25h]", d)
+	// 上界：now=00:00:01 时间隔约 27h59m59s；now=23:59:59 时约 4h0m1s。
+	// 原 25h 上界在 23:00~00:59 时段运行必失败（时段敏感缺陷），放宽到 28h。
+	if d <= 0 || d > 28*time.Hour {
+		t.Errorf("冷却间隔 %v 应落在 (0, 28h]", d)
 	}
 	if st.Until.Hour() != 4 {
 		t.Errorf("until hour=%d want 4", st.Until.Hour())

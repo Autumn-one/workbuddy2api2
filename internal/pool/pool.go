@@ -656,15 +656,23 @@ func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
 	if len(cands) == 0 {
 		return nil
 	}
-	// 概率放行：不命中直接放弃本轮（下个请求再试，避免瞬间全量打上游）。
-	// 随机源与 pickWeighted 同约定：randInt64N 仅供测试注入，生产走全局源。
-	rnd := rand.Int64N
-	if p.randInt64N != nil {
-		rnd = p.randInt64N
-	}
-	const scale = 1_000_000
-	if int64(halfOpenProbeRate*float64(scale)) <= rnd(scale) {
-		return nil
+	// 概率门只压【首次】探测：N 个账号同时进入半开窗口时防惊群（10% 概率放行）。
+	// 已探测失败过的（probeFails>0）豁免概率门——每过安静期必然放行一次。
+	// 否则探测节奏被压成「2 分钟安静期 × 10% 概率」≈ 0.5 次/10 分钟，
+	// 生产实测（02:28:44~02:34 的 13 次请求 0 次放行）自愈通道形同虚设。
+	if cands[0].modelCool[model].probeFails > 0 {
+		// 已探测失败过：必放行（保底自愈节奏：每安静期至多 1 次探测）
+	} else {
+		// 多个新半开候选同时放行会惊群 → 概率门只放其中一部分。
+		// 随机源与 pickWeighted 同约定：randInt64N 仅供测试注入，生产走全局源。
+		rnd := rand.Int64N
+		if p.randInt64N != nil {
+			rnd = p.randInt64N
+		}
+		const scale = 1_000_000
+		if int64(halfOpenProbeRate*float64(scale)) <= rnd(scale) {
+			return nil
+		}
 	}
 	// 剩余冷却最短者优先（最可能已恢复）
 	sort.Slice(cands, func(i, j int) bool {
@@ -672,6 +680,9 @@ func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
 	})
 	best := cands[0]
 	best.lastUsed = now
+	// 打标「已探测过」：后续过安静期必放行（豁免概率门），保证保底自愈节奏。
+	// 清零点：NoteSuccess（探测成功）。
+	best.modelCool[model].probeFails++
 	return best.a
 }
 
