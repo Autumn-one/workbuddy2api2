@@ -117,7 +117,7 @@ type entry struct {
 	// modelCool 按模型冷却（运行态，不持久化）：6004 模型级限流用。
 	// 键是【模型 ID】而非账号——6004 是模型级限制，同账号其他模型照常可用；
 	// 账号级冷却会误伤其他模型（见 applyErrorPolicy 既有结论）。
-	// 生命周期短（60s~20min），与 inFlight 同类不落盘；重启后从零开始，可接受。
+	// 生命周期短（5min~30min），与 inFlight 同类不落盘；重启后从零开始，可接受。
 	modelCool map[string]*modelCoolState
 
 	// inFlightPeak / peakAt 为「忙闲痕迹」运行态（不持久化）：记录近 peakWindow 内的
@@ -801,13 +801,13 @@ type modelCoolState struct {
 	backoffN int       // 已连续撞墙次数（指数退避的指数；成功清零）
 }
 
-// 模型级限流冷却：起步 1 分钟，连续撞墙翻倍，封顶 20 分钟（用户指定）。
+// 模型级限流冷却：起步 5 分钟，连续撞墙翻倍，封顶 30 分钟（用户指定）。
 const (
-	maxModelCooldown = 20 * time.Minute
+	maxModelCooldown = 30 * time.Minute
 )
 
 // modelCooldownFor 返回第 n 次连续撞墙应冷却的时长：base × 2^(n-1)，封顶 maxModelCooldown。
-// base 为调用方传入的基础时长（生产用 60s；参数化便于测试与调优）。
+// base 为调用方传入的基础时长（生产用 5 分钟；参数化便于测试与调优）。
 func modelCooldownFor(base time.Duration, n int) time.Duration {
 	if base <= 0 {
 		base = time.Minute
@@ -834,15 +834,15 @@ func (e *entry) modelCooling(model string, now time.Time) bool {
 
 // NoteModelRateLimit 记录一次【账号×模型】撞上 6004，返回本次冷却时长。
 //
-// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（20 分钟）。
+// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（30 分钟）。
 // 同账号的其他模型、其他账号不受影响（模型级，不是账号级）。
 // 返回 0 表示未记录：账号不存在/已禁用/入参非法。
 //
 // 成功（NoteSuccess）清零连续计数：账号有正常成功请求即恢复信任，
-// 下次撞墙从第一档 60s 起步，避免一次偶发限流导致长期高冷却。
+// 下次撞墙从第一档 5 分钟起步，避免一次偶发限流导致长期高冷却。
 //
 // 到期后【退避记忆保留】（条目在过期后才被清扫）：再撞墙从当前档起步。
-// 否则每 60s 撞一次永远停在第一档，退避失去意义。
+// 否则每次到期就撞一次永远停在第一档，退避失去意义。
 func (p *Pool) NoteModelRateLimit(uid, model string, base time.Duration) time.Duration {
 	if uid == "" || strings.TrimSpace(model) == "" {
 		return 0
@@ -926,10 +926,10 @@ func (p *Pool) AdvanceModelCooldowns(_ time.Time) {
 const modelCoolSweepInterval = 5 * time.Minute
 
 // sweepModelCooldownsLocked 清理早已过期的模型级冷却条目，防止 map 无限增长。
-// 保留期 30 分钟（> 封顶 20 分钟）：到期≠信任恢复，退避记忆要保留一段时间，
+// 保留期 60 分钟（> 封顶 30 分钟）：到期≠信任恢复，退避记忆要保留一段时间，
 // 让"到期→再撞墙→升档"的退避链在跨窗口后仍然成立。
 func (p *Pool) sweepModelCooldownsLocked(now time.Time) {
-	const keep = 30 * time.Minute
+	const keep = time.Hour
 	for _, e := range p.byUID {
 		for m, st := range e.modelCool {
 			if now.Sub(st.until) > keep {
@@ -1073,7 +1073,7 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
 		// 该账号的模型级退避计数清零：一次成功即证明账号对此模型可用，
-		// 退避记忆作废，下次撞 6004 从第一档 60s 起步。
+		// 退避记忆作废，下次撞 6004 从第一档 5 分钟起步。
 		// 注意只清计数不清 until——未到期的冷却窗口仍有效（时间恢复语义）。
 		for _, st := range e.modelCool {
 			st.backoffN = 0

@@ -84,7 +84,7 @@ func TestModelRateLimitCooldownAfter6004(t *testing.T) {
 	}
 	d := time.Until(p.ModelCooldownUntil("u1", "deepseek-v4.1-flash"))
 	if d <= 0 || d > modelRateCooldownBase+time.Second {
-		t.Fatalf("首次冷却应约 60s，got %v", d)
+		t.Fatalf("首次冷却应约 %v，got %v", modelRateCooldownBase, d)
 	}
 
 	// 后续同模型请求：不得再打 u1（冷却中且无其他账号 → 直接 503，无上游调用）

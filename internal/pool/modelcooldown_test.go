@@ -13,6 +13,10 @@ func withNoPickGapAndDeterministic(t *testing.T) {
 	withNoPickGap(t)
 }
 
+// modelCooldownBase 与生产同值的起步冷却（5 分钟），测试直接引用同一常量，
+// 避免测试写死 60s 而生产改成 5 分钟时测试还绿着却测错了东西。
+const modelCooldownBase = 5 * time.Minute
+
 // newModelTestPool 建一个空池（不落盘：state_file 传空）。
 func newModelTestPool(t *testing.T) *Pool {
 	t.Helper()
@@ -26,12 +30,12 @@ func TestModelCooldownBlocksPickAndExpires(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
 
-	d := p.NoteModelRateLimit("a1", "glm-5.3", 60*time.Second)
-	if d != 60*time.Second {
-		t.Fatalf("首次冷却=%v want 60s", d)
+	d := p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase)
+	if d != modelCooldownBase {
+		t.Fatalf("首次冷却=%v want %v", d, modelCooldownBase)
 	}
 	if !p.IsModelCooling("a1", "glm-5.3") {
-		t.Fatal("60s 内应视为冷却中")
+		t.Fatal("起步冷却窗口内应视为冷却中")
 	}
 	if p.ModelCooldownUntil("a1", "glm-5.3").IsZero() {
 		t.Fatal("冷却后应存在截止时间")
@@ -49,17 +53,18 @@ func TestModelCooldownBlocksPickAndExpires(t *testing.T) {
 	}
 }
 
-// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：60s → 120s → … 封顶 20 分钟。
-// 用户明确要求：起步 1 分钟，封顶 20 分钟。
+// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：5m → 10m → 20m → 30m（封顶）。
+// 用户明确要求：起步 5 分钟，封顶 30 分钟。
 func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
-	const base = 60 * time.Second
+	const base = modelCooldownBase
 	d := p.NoteModelRateLimit("a1", "glm-5.3", base)
 	if d != base {
-		t.Fatalf("首次=%v want 60s", d)
+		t.Fatalf("首次=%v want %v", d, base)
 	}
-	want := []time.Duration{120, 240, 480, 960, 1200, 1200, 1200, 1200, 1200, 1200}
+	// 300 → 600 → 1200 → 1800（封顶）
+	want := []time.Duration{600, 1200, 1800, 1800, 1800, 1800, 1800, 1800, 1800, 1800}
 	for i, w := range want {
 		if got := p.NoteModelRateLimit("a1", "glm-5.3", base); got != time.Duration(w)*time.Second {
 			t.Fatalf("第 %d 次=%v want %vs", i+1, got, w)
@@ -68,7 +73,7 @@ func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 }
 
 // TestModelCooldownCapsEvenWithLargerBase 封顶必须对任意基础时长生效，
-// 不能因调用方传入更大的 base 而突破 20 分钟。
+// 不能因调用方传入更大的 base 而突破 30 分钟。
 func TestModelCooldownCapsEvenWithLargerBase(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
@@ -86,28 +91,28 @@ func TestModelCooldownCapsEvenWithLargerBase(t *testing.T) {
 func TestModelCooldownResetOnSuccess(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
-	p.NoteModelRateLimit("a1", "glm-5.3", 60*time.Second)
+	p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase)
 	p.NoteSuccess("a1")
 	if p.ModelCooldownUntil("a1", "glm-5.3").IsZero() {
 		t.Fatal("NoteSuccess 不应清掉未到期的冷却窗口")
 	}
-	if d := p.NoteModelRateLimit("a1", "glm-5.3", 60*time.Second); d != 60*time.Second {
-		t.Fatalf("成功后重新撞墙应回到第一档 60s，got %v", d)
+	if d := p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase); d != modelCooldownBase {
+		t.Fatalf("成功后重新撞墙应回到第一档 %v，got %v", modelCooldownBase, d)
 	}
 }
 
 // TestModelCooldownBackoffSurvivesExpiry 到期恢复后，退避记忆保留：
-// 再撞墙从【当前档】起步而非回到第一档（否则每 60s 撞一次永不升级）。
+// 再撞墙从【当前档】起步而非回到第一档（否则每次到期就撞一次永不升级）。
 func TestModelCooldownBackoffSurvivesExpiry(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
-	p.NoteModelRateLimit("a1", "m", 60*time.Second)
-	p.AdvanceModelCooldowns(time.Now().Add(61 * time.Second)) // 使 until 落到过去
+	p.NoteModelRateLimit("a1", "m", modelCooldownBase)
+	p.AdvanceModelCooldowns(time.Now().Add(modelCooldownBase + time.Minute)) // 使 until 落到过去
 	if p.IsModelCooling("a1", "m") {
 		t.Fatal("到期后应视为已恢复")
 	}
-	if d := p.NoteModelRateLimit("a1", "m", 60*time.Second); d != 120*time.Second {
-		t.Fatalf("到期后再撞墙应按第二档 120s，got %v", d)
+	if d := p.NoteModelRateLimit("a1", "m", modelCooldownBase); d != 2*modelCooldownBase {
+		t.Fatalf("到期后再撞墙应按第二档 %v，got %v", 2*modelCooldownBase, d)
 	}
 }
 
@@ -118,7 +123,7 @@ func TestModelCooldownPickExcludesCooledPair(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
 	p.Add(&auth.Auth{UID: "a2"})
-	p.NoteModelRateLimit("a1", "glm-5.3", 60*time.Second)
+	p.NoteModelRateLimit("a1", "glm-5.3", modelCooldownBase)
 	for i := 0; i < 50; i++ {
 		a := p.PickExcluding(nil, "glm-5.3")
 		if a == nil {
@@ -134,7 +139,7 @@ func TestModelCooldownPickExcludesCooledPair(t *testing.T) {
 func TestModelCooldownPerModelIsolation(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
-	p.NoteModelRateLimit("a1", "m1", 60*time.Second)
+	p.NoteModelRateLimit("a1", "m1", modelCooldownBase)
 	if p.IsModelCooling("a1", "m2") {
 		t.Error("m2 不应受 m1 冷却影响")
 	}
@@ -148,7 +153,7 @@ func TestModelCooldownDisabledAccountIgnored(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
 	p.Disable("a1", "test")
-	if d := p.NoteModelRateLimit("a1", "m", 60*time.Second); d != 0 {
+	if d := p.NoteModelRateLimit("a1", "m", modelCooldownBase); d != 0 {
 		t.Errorf("禁用账号应不记冷却（返回 0），got %v", d)
 	}
 }
