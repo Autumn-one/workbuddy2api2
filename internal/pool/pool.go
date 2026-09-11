@@ -117,7 +117,7 @@ type entry struct {
 	// modelCool 按模型冷却（运行态，不持久化）：6004 模型级限流用。
 	// 键是【模型 ID】而非账号——6004 是模型级限制，同账号其他模型照常可用；
 	// 账号级冷却会误伤其他模型（见 applyErrorPolicy 既有结论）。
-	// 生命周期短（5min~30min），与 inFlight 同类不落盘；重启后从零开始，可接受。
+	// 生命周期短（10min~60min），与 inFlight 同类不落盘；重启后从零开始，可接受。
 	modelCool map[string]*modelCoolState
 
 	// inFlightPeak / peakAt 为「忙闲痕迹」运行态（不持久化）：记录近 peakWindow 内的
@@ -801,9 +801,9 @@ type modelCoolState struct {
 	backoffN int       // 已连续撞墙次数（指数退避的指数；成功清零）
 }
 
-// 模型级限流冷却：起步 5 分钟，连续撞墙翻倍，封顶 30 分钟（用户指定）。
+// 模型级限流冷却：起步 10 分钟，连续撞墙翻倍，封顶 60 分钟（用户指定）。
 const (
-	maxModelCooldown = 30 * time.Minute
+	maxModelCooldown = 60 * time.Minute
 )
 
 // modelCooldownFor 返回第 n 次连续撞墙应冷却的时长：base × 2^(n-1)，封顶 maxModelCooldown。
@@ -834,7 +834,7 @@ func (e *entry) modelCooling(model string, now time.Time) bool {
 
 // NoteModelRateLimit 记录一次【账号×模型】撞上 6004，返回本次冷却时长。
 //
-// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（30 分钟）。
+// 冷却 = base × 2^(连续撞墙次数-1)，封顶 maxModelCooldown（60 分钟）。
 // 同账号的其他模型、其他账号不受影响（模型级，不是账号级）。
 // 返回 0 表示未记录：账号不存在/已禁用/入参非法。
 //
@@ -926,10 +926,10 @@ func (p *Pool) AdvanceModelCooldowns(_ time.Time) {
 const modelCoolSweepInterval = 5 * time.Minute
 
 // sweepModelCooldownsLocked 清理早已过期的模型级冷却条目，防止 map 无限增长。
-// 保留期 60 分钟（> 封顶 30 分钟）：到期≠信任恢复，退避记忆要保留一段时间，
+// 保留期 2 小时（> 封顶 60 分钟）：到期≠信任恢复，退避记忆要保留一段时间，
 // 让"到期→再撞墙→升档"的退避链在跨窗口后仍然成立。
 func (p *Pool) sweepModelCooldownsLocked(now time.Time) {
-	const keep = time.Hour
+	const keep = 2 * time.Hour
 	for _, e := range p.byUID {
 		for m, st := range e.modelCool {
 			if now.Sub(st.until) > keep {

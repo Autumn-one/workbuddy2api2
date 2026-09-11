@@ -13,9 +13,9 @@ func withNoPickGapAndDeterministic(t *testing.T) {
 	withNoPickGap(t)
 }
 
-// modelCooldownBase 与生产同值的起步冷却（5 分钟），测试直接引用同一常量，
-// 避免测试写死 60s 而生产改成 5 分钟时测试还绿着却测错了东西。
-const modelCooldownBase = 5 * time.Minute
+// modelCooldownBase 与生产同值的起步冷却（10 分钟），测试直接引用同一常量，
+// 避免测试写死具体数值而生产改参时测试还绿着却测错了东西。
+const modelCooldownBase = 10 * time.Minute
 
 // newModelTestPool 建一个空池（不落盘：state_file 传空）。
 func newModelTestPool(t *testing.T) *Pool {
@@ -53,8 +53,8 @@ func TestModelCooldownBlocksPickAndExpires(t *testing.T) {
 	}
 }
 
-// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：5m → 10m → 20m → 30m（封顶）。
-// 用户明确要求：起步 5 分钟，封顶 30 分钟。
+// TestModelCooldownExponentialBackoffCapsAtMax 连续撞墙：10m → 20m → 40m → 60m（封顶）。
+// 用户明确要求：起步 10 分钟，封顶 60 分钟。
 func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})
@@ -63,8 +63,8 @@ func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 	if d != base {
 		t.Fatalf("首次=%v want %v", d, base)
 	}
-	// 300 → 600 → 1200 → 1800（封顶）
-	want := []time.Duration{600, 1200, 1800, 1800, 1800, 1800, 1800, 1800, 1800, 1800}
+	// 600 → 1200 → 2400 → 3600（封顶）
+	want := []time.Duration{1200, 2400, 3600, 3600, 3600, 3600, 3600, 3600, 3600, 3600}
 	for i, w := range want {
 		if got := p.NoteModelRateLimit("a1", "glm-5.3", base); got != time.Duration(w)*time.Second {
 			t.Fatalf("第 %d 次=%v want %vs", i+1, got, w)
@@ -73,7 +73,7 @@ func TestModelCooldownExponentialBackoffCapsAtMax(t *testing.T) {
 }
 
 // TestModelCooldownCapsEvenWithLargerBase 封顶必须对任意基础时长生效，
-// 不能因调用方传入更大的 base 而突破 30 分钟。
+// 不能因调用方传入更大的 base 而突破 60 分钟。
 func TestModelCooldownCapsEvenWithLargerBase(t *testing.T) {
 	p := newModelTestPool(t)
 	p.Add(&auth.Auth{UID: "a1"})

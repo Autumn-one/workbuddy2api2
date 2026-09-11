@@ -141,7 +141,7 @@ func TestModelRateLimitCooldownBackoffIntegration(t *testing.T) {
 		t.Fatalf("连续撞墙应翻倍: 第一次=%v 第二次=%v", d1, d2)
 	}
 	if d2 < 2*modelRateCooldownBase-time.Second {
-		t.Fatalf("第二次应 ≥ 2 分钟: %v", d2)
+		t.Fatalf("第二次应 ≥ %v（翻倍档）: %v", 2*modelRateCooldownBase, d2)
 	}
 }
 

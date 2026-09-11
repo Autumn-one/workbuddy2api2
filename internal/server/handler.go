@@ -419,9 +419,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st.status = http.StatusServiceUnavailable
 }
 
-// modelRateCooldownBase 6004 模型级限流的起步冷却时长（用户指定 5 分钟）；
-// 连续撞墙翻倍、封顶 maxModelCooldown（30 分钟），见 pool.NoteModelRateLimit。
-const modelRateCooldownBase = 5 * time.Minute
+// modelRateCooldownBase 6004 模型级限流的起步冷却时长（用户指定 10 分钟）；
+// 连续撞墙翻倍、封顶 maxModelCooldown（60 分钟），见 pool.NoteModelRateLimit。
+const modelRateCooldownBase = 10 * time.Minute
 
 // truncateMsg 截断报文用于日志（避免长报文刷屏）。
 func truncateMsg(s string) string {
@@ -443,7 +443,7 @@ func truncateMsg(s string) string {
 //   - ErrSessionDead → Disable：session 死亡，永久禁用（需人工重登）。
 //   - ErrServer → NoteError：喂单一连续失败计数器 fails + 累计错误 errTotal，
 //     达到 breakerThreshold 触发熔断（指数退避）。
-//   - ErrModelRateLimit → 按【账号×模型】短冷却（5 分钟起、翻倍、封顶 30 分钟）：
+//   - ErrModelRateLimit → 按【账号×模型】短冷却（10 分钟起、翻倍、封顶 60 分钟）：
 //     不做账号级处置、不喂熔断；不采信报文里的重置时刻。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
@@ -466,8 +466,8 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, sta
 		// 5xx 上游故障：Classify 已把 ≥500 判为 ErrServer，在此喂熔断计数（不再手写 status>=500）。
 		h.cfg.Pool.NoteError(uid)
 	case upstream.ErrModelRateLimit:
-		// 模型级频率限制（code 6004）：按【账号×模型】短冷却——起步 5 分钟、
-		// 连续撞墙翻倍、封顶 30 分钟。刻意【不采信报文里的重置时刻】（实测预报
+		// 模型级频率限制（code 6004）：按【账号×模型】短冷却——起步 10 分钟、
+		// 连续撞墙翻倍、封顶 60 分钟。刻意【不采信报文里的重置时刻】（实测预报
 		// 22:56 实际 02:52 已恢复）。也不做账号级处置：该限制是模型级的，
 		// 同账号其他模型实测照常可用，账号级冷却会造成长时间误伤。
 		//
