@@ -525,6 +525,11 @@ func (a *app) buildUI() error {
 		a.btnMatrixStop.SetEnabled(false)
 	}
 
+	// 账号表选中变化 → 记录选中的 UID，供表格重建后恢复。
+	// 必须绑定：用户用鼠标点击选行走的是 LVN_ITEMCHANGED，walk 内部的
+	// currentItemID 不会更新，只有我们自己记录才能在重建后找回原行。
+	a.tvAccounts.CurrentIndexChanged().Attach(a.rememberAccountSelection)
+
 	// 模型表选中行 → 详情标签（展示完整参数，含表格放不下的字段）。
 	a.tvModelRates.CurrentIndexChanged().Attach(func() {
 		r, ok := a.modelRates.At(a.tvModelRates.CurrentIndex())

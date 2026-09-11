@@ -263,6 +263,46 @@ func (m *accountModel) Replace(items []pool.Status) {
 	m.PublishRowsReset()
 }
 
+// accountUIDAt 返回第 i 行的账号 UID；越界返回空串。
+func accountUIDAt(rows []pool.Status, i int) string {
+	if i < 0 || i >= len(rows) {
+		return ""
+	}
+	return rows[i].UID
+}
+
+// indexOfAccountUID 在账号列表里查找 UID 所在行；找不到返回 -1。
+func indexOfAccountUID(rows []pool.Status, uid string) int {
+	if uid == "" {
+		return -1
+	}
+	for i, r := range rows {
+		if r.UID == uid {
+			return i
+		}
+	}
+	return -1
+}
+
+// ID 实现 walk.IDProvider：返回该行的稳定标识（账号 UID）。
+//
+// 为什么必须实现它（实测缺陷）：walk 的 TableView 在 model 发布 RowsReset 时
+// （tableview.go:724）会判断 model 是否实现 IDProvider——
+//   - 实现了 → 按 ID 恢复原来选中的行（restoreCurrentItemOrFallbackToFirst）；
+//   - 没实现 → 无条件 SetCurrentIndex(-1)，即【清空选中】。
+//
+// 本项目此前未实现，导致任何一次表格重建（积分刷新、账号增删、冷却状态变化…）
+// 都会把用户选中的行刷没。返回 UID 而非行号：行序可能变（账号增删/排序），
+// 只有 UID 能稳定指向同一账号。
+//
+// 越界返回 nil（walk 可能用陈旧索引查询，必须安全）。
+func (m *accountModel) ID(index int) interface{} {
+	if index < 0 || index >= len(m.items) {
+		return nil
+	}
+	return m.items[index].UID
+}
+
 // accountState 把账号状态压成一个人眼可读的短标签。
 func accountState(s pool.Status) string {
 	switch {
@@ -1018,6 +1058,14 @@ type app struct {
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
 
+	// selectedAcctUID 用户当前选中的账号 UID。
+	//
+	// 为什么应用层要自己记：walk 只在 SetCurrentIndex 路径维护内部的
+	// currentItemID（tableview.go:1217），而用户【鼠标点击】选行走的是
+	// LVN_ITEMCHANGED，不更新它 → 重建时恢复循环匹配不到 → fallback 选中第 0 行。
+	// 因此必须自己记录 UID，重建后按 UID 找回原行（行序可能因增删而变化）。
+	selectedAcctUID string
+
 	// lePriority 优先级输入框：每个账号可单独设权重值（选号权重乘子）。
 	lePriority *walk.LineEdit
 
@@ -1323,6 +1371,10 @@ func (a *app) refreshAccounts() {
 	if a.lblAccts2 != nil {
 		a.lblAccts2.SetText(fmt.Sprintf("共 %d 个账号", len(items)))
 	}
+	// 重建后按 UID 恢复用户原来的选中行（Replace → PublishRowsReset 会清空选中，
+	// 且 walk 内置的 currentItemID 机制对鼠标点击无效——见 selectedAcctUID 注释）。
+	// 账号已被删除时 indexOfAccountUID 返回 -1，此时不恢复（避免误选中别的账号）。
+	a.restoreAccountSelection(items)
 	// 账号集可能变了（登录新增/删除/昵称更新）：同步积分过滤下拉框与测试页选择。
 	// sync* 内部自行比较，选项未变时不会重置下拉框。
 	a.syncCreditFilter()
@@ -1798,6 +1850,34 @@ func parsePriorityInput(raw string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+// restoreAccountSelection 表格重建后按 UID 恢复选中行。
+// 必须在 accounts.Replace 之后调用（Replace 会清空选中）。
+func (a *app) restoreAccountSelection(items []pool.Status) {
+	if a.tvAccounts == nil || a.selectedAcctUID == "" {
+		return
+	}
+	idx := indexOfAccountUID(items, a.selectedAcctUID)
+	if idx < 0 {
+		// 账号已被删除：清掉记录，避免下次误恢复。
+		a.selectedAcctUID = ""
+		return
+	}
+	if a.tvAccounts.CurrentIndex() != idx {
+		_ = a.tvAccounts.SetCurrentIndex(idx)
+	}
+}
+
+// rememberAccountSelection 记录当前选中行的 UID（表格选中变化时调用）。
+func (a *app) rememberAccountSelection() {
+	if a.tvAccounts == nil {
+		return
+	}
+	idx := a.tvAccounts.CurrentIndex()
+	if r, ok := a.accounts.At(idx); ok {
+		a.selectedAcctUID = r.UID
+	}
 }
 
 // refreshAccountsNow 强制刷新账号表（绕过签名比对），用于标记等需要立即生效的场景。
