@@ -112,6 +112,19 @@ func (a *app) buildUI() error {
 									dcl.Label{AssignTo: &a.lblAccts2, Text: ""},
 								},
 							},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									// 总积分统计：账号页一眼看到全部账号的积分总量。
+									// 字体加大加粗以便扫视；未知账号（未刷新过额度）不计入并明确提示。
+									dcl.Label{
+										AssignTo: &a.lblTotalCredits,
+										Text:     "总积分 0 · 0 个账号",
+										Font:     dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+									},
+									dcl.HSpacer{},
+								},
+							},
 							dcl.TableView{
 								AssignTo:         &a.tvAccounts,
 								Model:            a.accounts,

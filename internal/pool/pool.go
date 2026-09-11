@@ -47,9 +47,12 @@ func (k CoolKind) String() string {
 
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
-	UID             string    `json:"uid"`
-	Nickname        string    `json:"nickname,omitempty"`
-	Credits         int64     `json:"credits"`
+	UID      string `json:"uid"`
+	Nickname string `json:"nickname,omitempty"`
+	Credits  int64  `json:"credits"`
+	// CreditsKnown 标记 credits 是否为上游可信值：false = 从未刷新过额度（未知，
+	// 不能当作 0 参与求和/展示，否则总数会静默偏低）。
+	CreditsKnown    bool      `json:"credits_known"`
 	Cooling         bool      `json:"cooling"`
 	CoolKind        string    `json:"cool_kind,omitempty"`
 	CoolRemaining   int64     `json:"cool_remaining_sec,omitempty"`
@@ -1384,6 +1387,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		UID:             uid,
 		Nickname:        e.a.Nickname,
 		Credits:         e.credits,
+		CreditsKnown:    e.creditsKnown,
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:          e.reason,
 		Disabled:        e.disabled,

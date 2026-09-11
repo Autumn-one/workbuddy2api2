@@ -917,6 +917,8 @@ type app struct {
 	// 账号页
 	tvAccounts *walk.TableView
 	lblAccts2  *walk.Label
+	// lblTotalCredits 账号页的总积分统计（含未刷新额度的提示）。
+	lblTotalCredits *walk.Label
 	// btnRefreshCredits 手动批量刷新额度按钮（刷新期间禁用防重复点击）。
 	btnRefreshCredits *walk.PushButton
 	creditBusy        bool
@@ -1203,6 +1205,10 @@ func (a *app) refreshStatus() {
 
 func (a *app) refreshAccounts() {
 	items := a.svc.Accounts()
+	// 总积分统计独立于表格签名比对：签名相同只意味着"不必重建表格"，
+	// 不代表统计文案无需刷新（例如首次进入页面、或刷新额度后 credits 变化
+	// 恰好被其他字段的相同值掩盖）。统计是纯字符串计算，代价可忽略。
+	a.refreshTotalCredits(items)
 	if a.tblSignature(items) == a.lastSig {
 		return
 	}
@@ -1580,6 +1586,15 @@ func (a *app) doCheckinAll() {
 			a.refreshAccounts()
 		})
 	}()
+}
+
+// refreshTotalCredits 更新账号页的总积分统计（纯展示，不发任何上游请求）。
+// 放在 refreshAccounts 内：账号集/积分变化都会经过它。
+func (a *app) refreshTotalCredits(items []pool.Status) {
+	if a.lblTotalCredits == nil {
+		return
+	}
+	a.lblTotalCredits.SetText(totalCreditsText(items))
 }
 
 // doSetPriority 把选中账号设为目标优先级（0 = 取消）。
