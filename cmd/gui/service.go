@@ -138,6 +138,18 @@ func (s *Service) SetCreditsReason(uid string, credits int64, reason string) {
 	p.SetCreditsReason(uid, credits, reason)
 }
 
+// SetPriority 设置账号优先级（权重乘子，0 = 未设置）。
+// 供 GUI 标记"一次性登录"账号，让它们优先被消耗。服务未启动时空操作。
+func (s *Service) SetPriority(uid string, priority float64) {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.SetPriority(uid, priority)
+}
+
 // Start 按配置装配并启动服务（幂等）。
 func (s *Service) Start(cfg *appconfig.Config) error {
 	s.mu.Lock()

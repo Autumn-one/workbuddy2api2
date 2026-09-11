@@ -14,6 +14,7 @@ package pool
 import (
 	"encoding/json"
 	"log"
+	"math"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
@@ -61,6 +62,9 @@ type Status struct {
 	LastErrTime     time.Time `json:"last_err,omitempty"`
 
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
+	// Priority 账号优先级（权重乘子）：0 = 未设置。供 GUI 显示标记状态。
+	Priority float64 `json:"priority,omitempty"`
+
 	InFlight     int       `json:"in_flight"`
 	InFlightPeak int       `json:"in_flight_peak"` // 近 peakWindow 内的在途峰值（"忙过"痕迹）
 	PeakActive   bool      `json:"peak_active"`    // 峰值是否仍在可见窗口内
@@ -126,6 +130,13 @@ type entry struct {
 	// 纯读路径（statusOf）按 now-peakAt > peakWindow 判定过期，不回写。
 	inFlightPeak atomic.Int64
 	peakAt       atomic.Int64 // UnixNano；0 = 从未忙过
+
+	// priority 账号优先级（权重乘子，持久化）。0 = 未设置 → 视为 1.0（不加权）。
+	// 用途：用户手工标记"一次性登录"的账号（手机号一次性、失效后无法二次登录），
+	// 给它更高权重以优先消耗掉额度，避免这类账号的额度被浪费。
+	// 刻意做成【乘子】而非绝对优先：保持加权随机，使它在冷却/在途满时自动让位，
+	// 不会被集中打爆而更快撞模型级限流。
+	priority float64
 }
 
 // peakWindow 在途峰值的可见窗口：最后一次占用在途后的这段时间内，
@@ -217,6 +228,9 @@ type stateAccount struct {
 	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
 	LastSuccess time.Time `json:"last_success,omitempty"`
 	LastErr     time.Time `json:"last_err,omitempty"`
+	// Priority 账号优先级（权重乘子，用户手工标记一次性账号用）。
+	// 缺字段（旧文件）为 0 = 未设置，行为与引入该功能前一致。
+	Priority float64 `json:"priority,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -818,6 +832,12 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	} else {
 		w += 1.5 // 无请求记录 → 中性偏信任
 	}
+
+	// 4. 账号优先级（权重乘子）。未设置（<=0）视为 1.0，行为与未引入该功能时一致。
+	// 乘在总分上：让"高优先级 + 高积分/久置"的账号最优先被消耗。
+	if e.priority > 0 {
+		w *= e.priority
+	}
 	return w
 }
 
@@ -1063,6 +1083,27 @@ func (p *Pool) sweepModelCooldownsLocked(now time.Time) {
 				delete(e.modelCool, m)
 			}
 		}
+	}
+}
+
+// SetPriority 设置账号优先级（权重乘子）。<=0 或 NaN 视为未设置（恢复 1.0 不加权）。
+//
+// 用途：用户手工标记"一次性登录"账号，让其额度优先被消耗。
+// 乘子而非绝对优先：保持加权随机，账号在冷却/在途满时自动让位给其他账号，
+// 避免被集中打爆而更快触发模型级限流（那样反而更慢用完）。
+// 优先级持久化在 state.json，重启不丢。
+func (p *Pool) SetPriority(uid string, priority float64) {
+	if math.IsNaN(priority) || math.IsInf(priority, 0) {
+		priority = 0
+	}
+	if priority < 0 {
+		priority = 0
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.priority = priority
+		p.dirty.Store(true)
 	}
 }
 
@@ -1353,6 +1394,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Until:           e.until,
 		InFlight:        int(e.inFlight.Load()),
 		BreakerFails:    e.fails,
+		Priority:        e.priority,
 		BreakerUntil:    e.breakerUntil,
 	}
 	if pk, ok := e.peakVisible(now); ok {
@@ -1408,6 +1450,9 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal:     errTotal,
 			lastErr:      s.LastErr,
 			lastSuccess:  s.LastSuccess,
+			// 优先级从 state 恢复：重启后用户的手工标记不丢（无法二次登录的账号
+			// 重新标记成本很高，必须持久化）。
+			priority: s.Priority,
 		}
 	}
 }
@@ -1484,6 +1529,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:     e.errTotal,
 			LastSuccess:  e.lastSuccess,
 			LastErr:      e.lastErr,
+			Priority:     e.priority,
 		}
 	}
 	return sf

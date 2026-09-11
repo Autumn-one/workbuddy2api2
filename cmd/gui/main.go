@@ -230,6 +230,12 @@ func (m *accountModel) Value(row, col int) interface{} {
 	case 3:
 		return accountState(s)
 	case 4:
+		// 优先级列：0 = 未设置（未标记），否则显示乘子（如 ×3）。
+		if s.Priority > 0 {
+			return fmt.Sprintf("×%g", s.Priority)
+		}
+		return "—"
+	case 5:
 		// 在途列展示"忙闲痕迹"：瞬时值优先（正在忙）；瞬时为 0 但峰值仍在可见窗口内时
 		// 显示 "0（峰值 N）"，让整体落在 GUI 采样间隔之间的短请求也能被看见。
 		if s.InFlight > 0 {
@@ -242,7 +248,7 @@ func (m *accountModel) Value(row, col int) interface{} {
 			return fmt.Sprintf("峰 %d", s.InFlightPeak)
 		}
 		return "-"
-	case 5:
+	case 6:
 		if s.ErrTotal == 0 && s.SuccessCount == 0 {
 			return "-"
 		}
@@ -1213,7 +1219,7 @@ func (a *app) refreshAccounts() {
 func (a *app) tblSignature(items []pool.Status) string {
 	var b strings.Builder
 	for _, s := range items {
-		fmt.Fprintf(&b, "%s|%d|%v|%v|%d|%v|%d|%d;", s.UID, s.Credits, s.Cooling, s.Disabled, s.InFlight, s.PeakActive, s.InFlightPeak, s.BreakerFails)
+		fmt.Fprintf(&b, "%s|%d|%v|%v|%d|%v|%d|%d|%g;", s.UID, s.Credits, s.Cooling, s.Disabled, s.InFlight, s.PeakActive, s.InFlightPeak, s.BreakerFails, s.Priority)
 	}
 	return b.String()
 }
@@ -1574,6 +1580,38 @@ func (a *app) doCheckinAll() {
 			a.refreshAccounts()
 		})
 	}()
+}
+
+// doSetPriority 把选中账号设为目标优先级（0 = 取消）。
+//
+// 用途：标记"一次性登录"账号（手机号一次性、失效后无法二次登录），
+// 让它们的额度被优先消耗掉，避免浪费。
+// 语义是【权重乘子】而非绝对优先：高优先级账号被选中的概率显著更大，
+// 但仍保留随机性，因此限流/在途满时会自动让位给其他账号
+// （集中打一个账号会更快撞 6004，反而更慢用完）。
+func (a *app) doSetPriority(priority float64) {
+	items := a.svc.Accounts()
+	a.takeSelection(func(idx int) {
+		if idx < 0 || idx >= len(items) {
+			a.lblAccts2.SetText("请先在表格里选中一个账号")
+			return
+		}
+		st := items[idx]
+		a.svc.SetPriority(st.UID, priority)
+		// 立即回填显示（refreshAccounts 有签名比对，标记变化会让签名变化）
+		a.refreshAccountsNow()
+		if priority > 0 {
+			a.lblAccts2.SetText(fmt.Sprintf("%s 已设为优先消耗（×%g）", a.displayName(st.UID), priority))
+		} else {
+			a.lblAccts2.SetText(fmt.Sprintf("%s 已取消优先消耗", a.displayName(st.UID)))
+		}
+	})
+}
+
+// refreshAccountsNow 强制刷新账号表（绕过签名比对），用于标记等需要立即生效的场景。
+func (a *app) refreshAccountsNow() {
+	a.lastSig = ""
+	a.refreshAccounts()
 }
 
 func (a *app) doDeleteAccount() {
