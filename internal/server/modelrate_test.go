@@ -228,8 +228,8 @@ func TestChatLogAlwaysHasUID(t *testing.T) {
 			t.Fatalf("got %d", rec.Code)
 		}
 	})
-	if !strings.Contains(out, "uid=u1") {
-		t.Errorf("6004 行必须带账号: %s", out)
+	if !strings.Contains(out, "acct=u1") {
+		t.Errorf("6004 行必须带账号标识: %s", out)
 	}
 	if !strings.Contains(out, "effort=-") || !strings.Contains(out, "ctx=-") {
 		t.Errorf("失败行也应带参数位: %s", out)

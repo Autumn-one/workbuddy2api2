@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -44,8 +45,8 @@ func chatOut() io.Writer {
 type chatStat struct {
 	start  time.Time
 	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
+	mode   string     // "stream" | "sync"
+	acct   *auth.Auth // 完整账号（展示时取昵称前 7 字符，无昵称回落 UID 前 8 位）
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -78,7 +79,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks, s.inTok, s.thinkTok, s.params)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.acct, s.status, s.toks, s.inTok, s.thinkTok, s.params)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -249,15 +250,30 @@ func usageInt(resp map[string]any, key string) int {
 	return int(v)
 }
 
-// uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
-func uidPrefix(uid string) string {
-	if uid == "" {
+// logAccountName 生成日志/表格里的账号标识：昵称前 7 字符优先，无昵称回落 UID 前 8 位。
+//
+// 为什么优先昵称：日志是给人看的，昵称（GUI 里配置的账号名）比一串 UID 好认得多；
+// 保留 UID 回落是因为昵称可能为空（手工放置的凭证文件），此时退回 UID 仍可定位账号。
+// 昵称取前 7 字符是为了控制列宽（中文昵称 7 字已足够区分，且比 8 位 UID 更短）。
+func logAccountName(a *auth.Auth) string {
+	if a == nil {
 		return "-"
 	}
-	if len(uid) > 8 {
-		return uid[:8]
+	name := strings.TrimSpace(a.Nickname)
+	if name != "" {
+		rs := []rune(name)
+		if len(rs) > 7 {
+			return string(rs[:7])
+		}
+		return name
 	}
-	return uid
+	if a.UID == "" {
+		return "-"
+	}
+	if len(a.UID) > 8 {
+		return a.UID[:8]
+	}
+	return a.UID
 }
 
 // modelColWidth 模型列的显示宽度。
@@ -287,7 +303,7 @@ func padModelName(model string) string {
 
 // logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
 // toks/inTok <0 表示 usage 缺失，显示 "-"；params 零值字段同样显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks, inTok, thinkTok int, params upstream.EffectiveParams) {
+func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, status int, toks, inTok, thinkTok int, params upstream.EffectiveParams) {
 	if !chatLogEnabled {
 		return
 	}
@@ -307,13 +323,13 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | uid=%s | %s | ctx=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | acct=%s | %s | ctx=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
+		logAccountName(acct),
 		paramsText(params),
 		intOrDash(inTok),
 		ttfbMS,

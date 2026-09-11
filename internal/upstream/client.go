@@ -141,16 +141,27 @@ func isModelRateLimit(body string) bool {
 	return hasModelWord && hasResetWord
 }
 
-// uidPrefixForLog 日志用的账号标识：取 uid 前 8 位；空值显示 "-"。
-// 与 server 包请求表格日志的 uid= 口径一致，方便按账号对照两处日志。
-func uidPrefixForLog(uid string) string {
-	if uid == "" {
+// uidPrefixForLog 日志用的账号标识：昵称前 7 字符优先，无昵称回落 UID 前 8 位，空值 "-"。
+// 与 server 包请求表格日志的 acct= 口径一致，方便按账号对照两处日志。
+// 参数用 *auth.Auth 是因为改写日志的调用链上拿到的就是它（昵称直接可达）。
+func uidPrefixForLog(a *auth.Auth) string {
+	if a == nil {
 		return "-"
 	}
-	if len(uid) > 8 {
-		return uid[:8]
+	if name := strings.TrimSpace(a.Nickname); name != "" {
+		rs := []rune(name)
+		if len(rs) > 7 {
+			return string(rs[:7])
+		}
+		return name
 	}
-	return uid
+	if a.UID == "" {
+		return "-"
+	}
+	if len(a.UID) > 8 {
+		return a.UID[:8]
+	}
+	return a.UID
 }
 
 // ParseModelRateLimitFromMsg 从报文文本提取模型级频率限制证据。
@@ -300,15 +311,15 @@ func (c *Client) chatBase(a *auth.Auth) string {
 }
 
 // prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-func (c *Client) prepareBody(body []byte, uid string) []byte {
-	out, _ := c.prepareBodyWithParams(body, uid)
+func (c *Client) prepareBody(body []byte, a *auth.Auth) []byte {
+	out, _ := c.prepareBodyWithParams(body, a)
 	return out
 }
 
 // prepareBodyWithParams 组装出站请求体，并同时返回【改写后】的关键参数快照。
 // 两者在同一次解析中产生，保证日志展示的参数与真正发出的报文完全一致。
-func (c *Client) prepareBodyWithParams(body []byte, uid string) ([]byte, EffectiveParams) {
-	return PrepareBodyOptWithEffortsAndParams(body, c.SanitizeFingerprints, c.effortsSnapshot(), uid)
+func (c *Client) prepareBodyWithParams(body []byte, a *auth.Auth) ([]byte, EffectiveParams) {
+	return PrepareBodyOptWithEffortsAndParams(body, c.SanitizeFingerprints, c.effortsSnapshot(), a)
 }
 
 // effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
@@ -411,7 +422,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 // 不一致；对非 JSON 请求体返回零值（日志显示"-"），不影响转发本身。
 func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, params EffectiveParams, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	prepared, params := c.prepareBodyWithParams(body, a.UID)
+	prepared, params := c.prepareBodyWithParams(body, a)
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, params, err

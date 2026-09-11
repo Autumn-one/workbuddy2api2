@@ -325,7 +325,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusServiceUnavailable
 			break
 		}
-		st.uid = acct.UID
+		st.acct = acct
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -355,7 +355,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			if err := acct.SaveAtomic(); err != nil {
 				// 刷新成功但落盘失败：下次启动会用旧 token，必须暴露
-				log.Printf("chat refresh uid=%s: save auth failed: %v", acct.UID, err)
+				log.Printf("chat refresh acct=%s: save auth failed: %v", logAccountName(acct), err)
 			}
 		}
 
@@ -374,7 +374,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
-			h.applyErrorPolicy(acct.UID, st.model, kind, status, string(respBody))
+			h.applyErrorPolicy(acct, st.model, kind, status, string(respBody))
 			fail(acct.UID)
 			continue
 		}
@@ -449,7 +449,8 @@ func truncateMsg(s string) string {
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
 // 成功（NoteSuccess）清 fails/熔断；签到解冻（ReenableIfCredits→reviveCoolingLocked）只清冷却，不动熔断。
-func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, status int, respBody string) {
+func (h *Handler) applyErrorPolicy(acct *auth.Auth, model string, kind upstream.ErrKind, status int, respBody string) {
+	uid := acct.UID // 冷却/熔断状态机的键仍是 UID；日志展示用 logAccountName(acct)
 	switch kind {
 	case upstream.ErrHardCredit:
 		// 402 + 余额关键词即积分耗尽：同步冷却到次日 04:00（签到任务 09/21 点恢复），
@@ -473,19 +474,20 @@ func (h *Handler) applyErrorPolicy(uid, model string, kind upstream.ErrKind, sta
 		//
 		// 动机（生产日志实测）：不冷却时同一账号同模型间隔 1~2 分钟被反复选中
 		// 反复撞墙（02:41→03:20 撞 7 次），既浪费上游往返也加重限流。
+		uid := acct.UID
 		if model == "" {
 			// 请求体缺 model：无从建立（账号×模型）键，仅记录不冷却。
-			log.Printf("model_rate_limit uid=%s status=%d msg=%s (请求无 model 字段，未冷却)", uid, status, truncateMsg(respBody))
+			log.Printf("model_rate_limit acct=%s status=%d msg=%s (请求无 model 字段，未冷却)", logAccountName(acct), status, truncateMsg(respBody))
 			break
 		}
 		d := h.cfg.Pool.NoteModelRateLimit(uid, model, modelRateCooldownBase)
 		if ev, ok := upstream.ParseModelRateLimitFromMsg(status, respBody); ok && ev.Model != "" && ev.Model != model {
 			// 报文点名的模型 ≠ 本请求模型：仍按【请求模型】冷却（发出去的就是它），
 			// 但把差异亮出来，便于发现"上游把别的模型的额度记到这个请求头上"类异常。
-			log.Printf("model_rate_limit uid=%s model=%s(请求) vs %s(报文) 冷却=%s", uid, model, ev.Model, d)
+			log.Printf("model_rate_limit acct=%s model=%s(请求) vs %s(报文) 冷却=%s", logAccountName(acct), model, ev.Model, d)
 			break
 		}
-		log.Printf("model_rate_limit uid=%s model=%s 冷却=%s status=%d", uid, model, d, status)
+		log.Printf("model_rate_limit acct=%s model=%s 冷却=%s status=%d", logAccountName(acct), model, d, status)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

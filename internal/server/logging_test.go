@@ -139,25 +139,29 @@ func TestCompletionTokensExtraction(t *testing.T) {
 	}
 }
 
-func TestUIDPrefix(t *testing.T) {
-	if got := uidPrefix("00e26541abcdef012345"); got != "00e26541" {
+func TestLogAccountNameFallback(t *testing.T) {
+	// 无昵称时回落 UID 前 8 位（旧 uidPrefix 的语义在回落分支里保留）
+	if got := logAccountName(&auth.Auth{UID: "00e26541abcdef012345"}); got != "00e26541" {
 		t.Errorf("long uid -> %q", got)
 	}
-	if got := uidPrefix("abc"); got != "abc" {
+	if got := logAccountName(&auth.Auth{UID: "abc"}); got != "abc" {
 		t.Errorf("short uid -> %q", got)
 	}
-	if got := uidPrefix(""); got != "-" {
+	if got := logAccountName(&auth.Auth{}); got != "-" {
 		t.Errorf("empty uid -> %q", got)
+	}
+	if got := logAccountName(nil); got != "-" {
+		t.Errorf("nil acct -> %q", got)
 	}
 }
 
 func TestLogChatRowFormat(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", "00e26541abcdef", http.StatusOK, 1234, 5000, 1800, upstream.EffectiveParams{Effort: "high", EffortReq: "high", MaxTokens: 8192})
+		logChatRow(412*time.Millisecond, 27100*time.Millisecond, "deepseek-v4-flash", "stream", &auth.Auth{UID: "00e26541abcdef"}, http.StatusOK, 1234, 5000, 1800, upstream.EffectiveParams{Effort: "high", EffortReq: "high", MaxTokens: 8192})
 	})
 	for _, want := range []string{
-		"| #", "deepseek-v4", "| stream |", "| 200 |", "uid=00e26541", "effort=high", "max=8192", "ctx=5000", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
+		"| #", "deepseek-v4", "| stream |", "| 200 |", "00e26541", "effort=high", "max=8192", "ctx=5000", "TTFB=412ms", "tok=1234", "tok/s |", "total=",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
@@ -171,7 +175,7 @@ func TestLogChatRowFormat(t *testing.T) {
 func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "glm-5.2", "sync", "s1", http.StatusServiceUnavailable, -1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "glm-5.2", "sync", &auth.Auth{UID: "s1"}, http.StatusServiceUnavailable, -1, -1, -1, upstream.EffectiveParams{})
 	})
 	for _, want := range []string{"effort=-", "max=-", "ctx=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
@@ -183,8 +187,8 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 func TestLogChatRowSeqIncrements(t *testing.T) {
 	withChatLog(t)
 	out := captureStdout(t, func() {
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, -1, -1, upstream.EffectiveParams{})
-		logChatRow(0, time.Second, "m", "sync", "u", 200, 1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, upstream.EffectiveParams{})
+		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, upstream.EffectiveParams{})
 	})
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 2 {
@@ -217,7 +221,7 @@ func TestChatLogsStreamRow(t *testing.T) {
 			t.Fatalf("code=%d", rec.Code)
 		}
 	})
-	for _, want := range []string{"| stream |", "| 200 |", "uid=u1", "TTFB=", "tok=1"} {
+	for _, want := range []string{"| stream |", "| 200 |", "acct=u1", "TTFB=", "tok=1"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stream row missing %q:\n%s", want, out)
 		}
@@ -266,7 +270,7 @@ func TestChatLogsErrorRow(t *testing.T) {
 			t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
 		}
 	})
-	for _, want := range []string{"uid=u1", "| 503 |", "tok=-"} {
+	for _, want := range []string{"acct=u1", "| 503 |", "tok=-"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("error row missing %q:\n%s", want, out)
 		}
