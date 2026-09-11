@@ -563,9 +563,10 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	if len(cands) == 0 && modelAware {
 		// 模型级冷却把候选压空。两层兜底（按优先级）：
 		//
-		// 1) 半开探测：若有（账号×模型）冷却已过安静期，以 halfOpenProbeRate 概率
-		//    放行一次真实探测——成功立即清冷却（NoteModelProbeSuccess），上游恢复后
-		//    服务在几十秒内自愈，而不是干等 10m~1h 冷却截止（20:22 事故的教训）。
+		// 1) 半开探测：若有（账号×模型）冷却已过安静期，放行一次真实探测——
+		//    成功即清冷却（走 NoteSuccess：一次真实成功是"上游已恢复"的最强信号），
+		//    上游恢复后服务在几分钟内自愈，而不是干等 10m~15m 冷却截止
+		//    （20:22 事故的教训）。
 		// 2) 全部不可用 → 返回 nil 让 handler 直接 503 快速失败，
 		//    比起再浪费一次注定失败的上游调用更诚实也更便宜。
 		if a := p.pickHalfOpenLocked(model, now); a != nil {
@@ -641,28 +642,35 @@ func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
 		if e.disabled {
 			continue
 		}
-		st, ok := e.modelCool[model]
-		if !ok || st == nil {
-			continue // 无冷却的账号不该走到这里（它们在正常候选里）
-		}
-		if !now.Before(st.until) {
-			continue // 已过期 → 属于正常候选路径（理论上不会到这里）
-		}
-		if now.Sub(st.lastHit) < halfOpenQuiet {
-			continue // 安静期内：探测大概率再撞，不放行
+		// 与 HalfOpenAllowed 共用同一判定（entry.modelProbeWindow）
+		if !e.modelProbeWindow(model, now) {
+			continue
 		}
 		cands = append(cands, e)
 	}
 	if len(cands) == 0 {
 		return nil
 	}
+	// 先排序（剩余冷却最短者优先 = 最可能已恢复），再做判定与选取。
+	// 顺序很重要：判定必须基于【确定的】候选序，否则会依赖 map 遍历的随机顺序
+	// （审计缺陷：原先读 cands[0] 判定却在其后排序，混合场景下保底语义随机失效约 15%）。
+	sort.Slice(cands, func(i, j int) bool {
+		return cands[i].modelCool[model].until.Before(cands[j].modelCool[model].until)
+	})
+
 	// 概率门只压【首次】探测：N 个账号同时进入半开窗口时防惊群（10% 概率放行）。
-	// 已探测失败过的（probeFails>0）豁免概率门——每过安静期必然放行一次。
-	// 否则探测节奏被压成「2 分钟安静期 × 10% 概率」≈ 0.5 次/10 分钟，
-	// 生产实测（02:28:44~02:34 的 13 次请求 0 次放行）自愈通道形同虚设。
-	if cands[0].modelCool[model].probeFails > 0 {
-		// 已探测失败过：必放行（保底自愈节奏：每安静期至多 1 次探测）
-	} else {
+	// 只要有【任一】候选已探测过（probeFails>0）就豁免概率门——每过安静期必然放行
+	// 一次探测，保证自愈下限不被概率门随机拖延。
+	//
+	// 用「任一」而非「最优」：保底语义应当与候选顺序无关（审计缺陷的核心）。
+	alreadyProbed := false
+	for _, c := range cands {
+		if c.modelCool[model].probeFails > 0 {
+			alreadyProbed = true
+			break
+		}
+	}
+	if !alreadyProbed {
 		// 多个新半开候选同时放行会惊群 → 概率门只放其中一部分。
 		// 随机源与 pickWeighted 同约定：randInt64N 仅供测试注入，生产走全局源。
 		rnd := rand.Int64N
@@ -674,15 +682,13 @@ func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
 			return nil
 		}
 	}
-	// 剩余冷却最短者优先（最可能已恢复）
-	sort.Slice(cands, func(i, j int) bool {
-		return cands[i].modelCool[model].until.Before(cands[j].modelCool[model].until)
-	})
 	best := cands[0]
 	best.lastUsed = now
 	// 打标「已探测过」：后续过安静期必放行（豁免概率门），保证保底自愈节奏。
+	// 布尔语义（封顶 1）：该标记只回答"探测过没有"，不承载次数统计，
+	// 避免同一请求多轮 pick 反复打标导致无限增长。
 	// 清零点：NoteSuccess（探测成功）。
-	best.modelCool[model].probeFails++
+	best.modelCool[model].probeFails = 1
 	return best.a
 }
 
@@ -860,7 +866,7 @@ type modelCoolState struct {
 	until      time.Time // 本次冷却截止
 	lastHit    time.Time // 最近一次撞墙时刻
 	backoffN   int       // 已连续撞墙次数（指数退避的指数；成功清零）
-	probeFails int       // 半开探测连续失败次数（成功清零，仅观测）
+	probeFails int       // 半开是否已探测过（布尔语义 0/1；探测成功或普通成功时清零）
 }
 
 // 模型级限流冷却：起步 10 分钟，连续撞墙翻倍，封顶 15 分钟。
@@ -978,33 +984,26 @@ func (p *Pool) HalfOpenAllowed(uid, model string) bool {
 	if !ok || st == nil {
 		return true // 无冷却 → 正常可选
 	}
-	// 冷却已过期 → 正常可选，不算半开
 	if !time.Now().Before(st.until) {
-		return true
+		return true // 冷却已过期 → 正常可选，不算半开
 	}
-	// 冷却中：安静期已过才允许探测
-	return time.Since(st.lastHit) >= halfOpenQuiet
+	return e.modelProbeWindow(model, time.Now()) // 与选号路径同一判定
 }
 
-// NoteModelProbeSuccess 记录一次半开探测成功：立即清除该（账号×模型）冷却，
-// 让账号恢复正常选号（上游已恢复，没必要干等冷却截止）。
-// 退避计数同时清零——探测成功是最强的"已恢复"信号。
-func (p *Pool) NoteModelProbeSuccess(uid, model string) {
-	if uid == "" || strings.TrimSpace(model) == "" {
-		return
+// modelProbeWindow 报告该（账号×模型）是否处于【半开探测窗口】：
+// 冷却尚未到期（正常路径会被排除）且距上次撞墙已过安静期。
+// 这是半开判定的【唯一真源】：HalfOpenAllowed（对外查询/测试）与
+// pickHalfOpenLocked（选号）共用，避免两份拷贝各自漂移。
+// 调用方需已持锁（pick 持写锁，HalfOpenAllowed 持读锁）。
+func (e *entry) modelProbeWindow(model string, now time.Time) bool {
+	st, ok := e.modelCool[model]
+	if !ok || st == nil {
+		return false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return
+	if !now.Before(st.until) {
+		return false // 已过期 → 属正常候选路径，不算半开
 	}
-	if st, ok := e.modelCool[model]; ok && st != nil {
-		st.until = time.Time{}
-		st.backoffN = 0
-		st.probeFails = 0
-	}
-	p.dirty.Store(true)
+	return now.Sub(st.lastHit) >= halfOpenQuiet
 }
 
 // IsModelCooling 报告该（账号×模型）是否处于模型级冷却中。
