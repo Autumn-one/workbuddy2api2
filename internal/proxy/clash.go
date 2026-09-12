@@ -39,6 +39,9 @@ var nonNodeTypes = map[string]bool{
 	"Selector": true, "URLTest": true, "Fallback": true, "LoadBalance": true,
 	"Direct": true, "Reject": true, "Compatible": true, "Pass": true,
 	"RejectDrop": true, "Dns": true, "Relay": true,
+	// 内置规则项（实测漏网：PASS-RULE 被当成节点，导致 delay 结果里没有它、
+	// 探测时被判不可用，白占一个端口）
+	"PassRule": true, "Passrule": true,
 }
 
 // FetchNodes 从 Clash API 读取真实节点名（不含策略组/内置）。

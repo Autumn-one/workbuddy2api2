@@ -1136,9 +1136,15 @@ type app struct {
 	tvProxyBindings   *walk.TableView
 	lblProxyHint      *walk.Label
 	// btnProxyToggle 一键开关代理；lblProxyState 显示当前开关状态。
-	btnProxyToggle    *walk.PushButton
-	lblProxyState     *walk.Label
-	proxyBusy         bool
+	btnProxyToggle *walk.PushButton
+	lblProxyState  *walk.Label
+	proxyBusy      bool
+	// cbNodePick 可选节点下拉框（手动指定账号走哪个节点）；
+	// nodePickValues 与它平行（索引 → 节点名）。
+	cbNodePick     *walk.ComboBox
+	nodePickValues []string
+	// clashEP 缓存的 Clash 端点（自动发现结果）。
+	clashEP           *proxy.ClashEndpoint
 	teProxyCfg        *walk.Label // 生成的 listeners 配置（可复制）
 	lastListenersYAML string
 

@@ -36,10 +36,13 @@ func (a *app) buildUI() error {
 		AssignTo: &a.mw,
 		Title:    appName + " · 控制台",
 		Icon:     ic,
-		MinSize:  dcl.Size{Width: 880, Height: 600},
-		Size:     dcl.Size{Width: 1080, Height: 720},
-		Font:     dcl.Font{Family: "Segoe UI", PointSize: 9},
-		Layout:   dcl.VBox{MarginsZero: false},
+		MinSize:  dcl.Size{Width: 860, Height: 580},
+		// 默认宽度收窄：此前 1080 是为"模型"页的 12 列表格留的空间，
+		// 但多数页面用不到那么宽，默认开着偏空。表格本身可横向滚动，
+		// 需要更多空间时用户拖窗口即可。
+		Size:   dcl.Size{Width: 980, Height: 680},
+		Font:   dcl.Font{Family: "Segoe UI", PointSize: 9},
+		Layout: dcl.VBox{MarginsZero: false},
 		Children: []dcl.Widget{
 			dcl.TabWidget{
 				AssignTo: &a.tabs,
@@ -437,7 +440,19 @@ func (a *app) buildUI() error {
 									dcl.Label{AssignTo: &a.lblProxyState, Text: "○ 未开启（全部直连）", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
 									dcl.HSpacer{},
 									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
-									dcl.PushButton{Text: "切换选中账号节点", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 8},
+										Children: []dcl.Widget{
+											dcl.Label{Text: "指定节点"},
+											// 可选节点（含地区/延迟/可用状态），供手动选择；
+											// 不选时网关按“地区优先 + 可用”自动分配。
+											dcl.ComboBox{AssignTo: &a.cbNodePick, Model: []string{"（开启代理后可选）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 260}},
+											dcl.PushButton{Text: "指定给选中账号", MinSize: dcl.Size{Width: 120}, OnClicked: a.doSelectNodeForAccount},
+											dcl.PushButton{Text: "换一个节点（自动）", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
+											dcl.PushButton{Text: "交还自动分配", MinSize: dcl.Size{Width: 110}, OnClicked: a.doAutoAssignSelected},
+											dcl.HSpacer{},
+										},
+									},
 								},
 							},
 							dcl.Label{AssignTo: &a.lblProxyHint, Text: "点「一键开启代理」即可使用。"},

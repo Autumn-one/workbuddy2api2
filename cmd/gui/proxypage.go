@@ -107,6 +107,7 @@ func (a *app) refreshProxyBindings() {
 		})
 	}
 	a.proxyBindings.Replace(rows)
+	a.syncNodePickOptions()
 	if a.lblProxyHint != nil {
 		ls := a.proxyReg.Listeners()
 		a.lblProxyHint.SetText(fmt.Sprintf("共 %d 个节点可用（%s）· 已绑定 %d 个账号",
@@ -166,29 +167,154 @@ func (a *app) selectProxyBinding(uid string) {
 	}
 }
 
-// doProbeProxiesNow 立即探测一轮代理健康（用户手动触发，低成本：只连本地端口）。
+// probeProxyHealth 检测全部节点的真实连通性（Clash 批量延迟接口）。
+//
+// 为什么用延迟接口而非 TCP 探测：TCP 只能证明"Clash 在监听端口"，
+// 不能证明出口节点真能出网。延迟接口由 Clash 自己发探测（不经过本网关、
+// 不消耗上游模型积分），一次请求即拿到全部节点的真实可用性与延迟。
+func (a *app) probeProxyHealth() (healthy, total int, err error) {
+	if a.proxyReg == nil {
+		return 0, 0, fmt.Errorf("代理未启用")
+	}
+	ep := a.clashEndpoint()
+	delays, derr := proxy.FetchDelays(ep.API, ep.Secret, "GLOBAL", proxy.DelayTimeout)
+	if derr != nil {
+		return 0, 0, fmt.Errorf("延迟检测失败: %w", derr)
+	}
+	a.proxyReg.ApplyDelays(delays)
+	total = len(a.proxyReg.Listeners())
+	for _, l := range a.proxyReg.Listeners() {
+		if a.proxyReg.Healthy(l.Port) {
+			healthy++
+		}
+	}
+	return healthy, total, nil
+}
+
+// clashEndpoint 返回当前 Clash 端点（自动发现，缓存上次结果）。
+func (a *app) clashEndpoint() proxy.ClashEndpoint {
+	if a.clashEP != nil {
+		return *a.clashEP
+	}
+	ep, _ := proxy.DiscoverClashEndpoint(vergeDataDir(), "")
+	a.clashEP = &ep
+	return ep
+}
+
+// doProbeProxiesNow 立即检测一轮（用户手动触发，低成本）。
 func (a *app) doProbeProxiesNow() {
 	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用")
+		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
 		return
 	}
+	a.lblProxyHint.SetText("正在检测节点连通性…")
 	go func() {
-		results := proxy.ProbeAll(a.proxyReg.Listeners())
-		bad := 0
-		for port, ok := range results {
-			if ok {
-				a.proxyReg.MarkHealthy(port)
-			} else {
-				a.proxyReg.MarkUnhealthy(port)
-				bad++
-			}
-		}
+		healthy, total, err := a.probeProxyHealth()
 		a.mw.Synchronize(func() {
+			if err != nil {
+				a.lblProxyHint.SetText("检测失败：" + firstLine(err.Error()))
+				return
+			}
 			a.refreshProxyBindings()
-			a.lblProxyHint.SetText(fmt.Sprintf("探测完成：%d 个可用 · %d 个不可用",
-				len(results)-bad, bad))
+			a.lblProxyHint.SetText(fmt.Sprintf("检测完成：%d/%d 个节点真实可用（延迟探测，未消耗积分）", healthy, total))
 		})
 	}()
+}
+
+// doSelectNodeForAccount 把选中账号手动指定到你挑选的节点。
+func (a *app) doSelectNodeForAccount() {
+	if a.proxyReg == nil {
+		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		return
+	}
+	if a.tvProxyBindings == nil || a.cbNodePick == nil {
+		return
+	}
+	row, ok := a.proxyBindings.At(a.tvProxyBindings.CurrentIndex())
+	if !ok || row.UID == "" {
+		a.lblProxyHint.SetText("请先在上面的列表里选中一个账号")
+		return
+	}
+	idx := a.cbNodePick.CurrentIndex()
+	if idx < 0 || idx >= len(a.nodePickValues) {
+		a.lblProxyHint.SetText("请先在下拉框里选择一个节点")
+		return
+	}
+	node := a.nodePickValues[idx]
+	before := a.proxyReg.NodeFor(row.UID)
+	if !a.proxyReg.SetNodeForAccount(row.UID, node) {
+		a.lblProxyHint.SetText("指定失败：节点不存在")
+		return
+	}
+	a.proxyReg.SaveBindings(a.proxyBindingsPath)
+	a.refreshProxyBindings()
+	a.selectProxyBinding(row.UID)
+	a.lblProxyHint.SetText(fmt.Sprintf("%s：%s → %s（手动指定）",
+		a.displayName(row.UID), orDash(before), node))
+	log.Printf("代理：手动指定 %s 的节点 %s → %s", a.displayName(row.UID), orDash(before), node)
+}
+
+// doAutoAssignSelected 把选中账号交还自动分配（按地区优先+可用挑节点）。
+func (a *app) doAutoAssignSelected() {
+	if a.proxyReg == nil {
+		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		return
+	}
+	if a.tvProxyBindings == nil {
+		return
+	}
+	row, ok := a.proxyBindings.At(a.tvProxyBindings.CurrentIndex())
+	if !ok || row.UID == "" {
+		a.lblProxyHint.SetText("请先在上面的列表里选中一个账号")
+		return
+	}
+	before := a.proxyReg.NodeFor(row.UID)
+	l, ok := a.proxyReg.ClearNodeForAccount(row.UID)
+	if !ok {
+		a.lblProxyHint.SetText("没有可用节点可分配")
+		return
+	}
+	a.proxyReg.SaveBindings(a.proxyBindingsPath)
+	a.refreshProxyBindings()
+	a.selectProxyBinding(row.UID)
+	a.lblProxyHint.SetText(fmt.Sprintf("%s：%s → %s（已交还自动分配）",
+		a.displayName(row.UID), orDash(before), l.Node))
+	log.Printf("代理：%s 交还自动分配 %s → %s", a.displayName(row.UID), orDash(before), l.Node)
+}
+
+// syncNodePickOptions 刷新"可选节点"下拉框（含健康状态与延迟）。
+func (a *app) syncNodePickOptions() {
+	if a.cbNodePick == nil || a.proxyReg == nil {
+		return
+	}
+	opts := a.proxyReg.NodeOptions()
+	names := make([]string, 0, len(opts))
+	values := make([]string, 0, len(opts))
+	for _, o := range opts {
+		label := o.Node
+		if o.Healthy {
+			if o.Delay > 0 {
+				label = fmt.Sprintf("%s（%s %dms）", o.Node, o.Region, o.Delay)
+			} else {
+				label = fmt.Sprintf("%s（%s 可用）", o.Node, o.Region)
+			}
+		} else {
+			label = fmt.Sprintf("%s（%s 不可用）", o.Node, o.Region)
+		}
+		names = append(names, label)
+		values = append(values, o.Node)
+	}
+	if equalStrs(values, a.nodePickValues) {
+		return // 选项未变不重建，避免打断选择
+	}
+	a.nodePickValues = values
+	if err := a.cbNodePick.SetModel(names); err != nil {
+		logf("节点下拉框刷新失败: %v", err)
+		return
+	}
+	if len(names) > 0 {
+		a.cbNodePick.SetCurrentIndex(0)
+	}
 }
 
 // vergeDataDir 返回 Clash Verge 的数据目录（定位渲染出的完整配置）。
@@ -300,11 +426,21 @@ func (a *app) enableProxyNow() (string, error) {
 	}
 	time.Sleep(1200 * time.Millisecond) // 等 Clash 重载
 
-	// 探测端口，统计可用数
+	// 检测真实连通性（延迟接口）。失败时回落 TCP 探测（至少确认端口在监听）。
+	delayNote := ""
+	if delays, derr := proxy.FetchDelays(ep.API, ep.Secret, "GLOBAL", proxy.DelayTimeout); derr == nil {
+		reg.ApplyDelays(delays)
+	} else {
+		for _, l := range ls {
+			if proxy.ProbePort(l.Port) {
+				reg.MarkHealthy(l.Port)
+			}
+		}
+		delayNote = "（延迟检测不可用，已回落端口探测）"
+	}
 	ok := 0
 	for _, l := range ls {
-		if proxy.ProbePort(l.Port) {
-			reg.MarkHealthy(l.Port)
+		if reg.Healthy(l.Port) {
 			ok++
 		}
 	}
@@ -327,8 +463,8 @@ func (a *app) enableProxyNow() (string, error) {
 	go reg.HealthLoop(ctx, proxy.DefaultHealthInterval)
 
 	reg.SaveBindings(bindPath)
-	return fmt.Sprintf("已启用：%d 个节点（%s），%d/%d 个端口就绪",
-		len(ls), regionSummary(ls), ok, len(ls)), nil
+	return fmt.Sprintf("已启用：%d 个节点（%s），%d/%d 个真实可用%s",
+		len(ls), regionSummary(ls), ok, len(ls), delayNote), nil
 }
 
 // disableProxyNow 在【运行期】关闭代理：立刻回落直连，不重启。

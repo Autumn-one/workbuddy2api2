@@ -95,6 +95,9 @@ type Registry struct {
 	listeners []Listener        // 按地区优先级排好序
 	byUID     map[string]int    // uid → listeners 下标
 	unhealthy map[int]time.Time // 端口 → 标记不健康的时间
+	// delays 最近一次延迟探测结果（节点名 → 毫秒；0/缺失 = 不可用）。
+	// 仅用于"按延迟自动选节点"与界面展示，不参与健康判定（健康看 unhealthy）。
+	delays map[string]int
 }
 
 // NewRegistry 构建注册表；listeners 会按地区优先级稳定排序。
@@ -112,6 +115,7 @@ func NewRegistry(ls []Listener) *Registry {
 		listeners: sorted,
 		byUID:     map[string]int{},
 		unhealthy: map[int]time.Time{},
+		delays:    map[string]int{},
 	}
 }
 
