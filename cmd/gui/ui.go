@@ -35,8 +35,8 @@ func (a *app) buildUI() error {
 	mw := dcl.MainWindow{
 		AssignTo: &a.mw,
 		Title:    appName + " · 控制台",
-		Icon:    ic,
-		MinSize: dcl.Size{Width: 800, Height: 540},
+		Icon:     ic,
+		MinSize:  dcl.Size{Width: 800, Height: 540},
 		// 尺寸：多数页面用不到宽窗口（表格可横向滚动，需要时用户拖大即可）。
 		// 从 1080 逐步收窄到 880。
 		Size:   dcl.Size{Width: 880, Height: 620},
@@ -185,7 +185,7 @@ func (a *app) buildUI() error {
 						Title:  "模型",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "模型参数（全部来自上游 models 接口实时拉取，非本地写死；缓存 1 小时）。" +
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "模型参数（全部来自上游 models 接口实时拉取，非本地写死；缓存 1 小时）。" +
 								"\r\n· 思考深度：默认档（上游 defaultEffort）+ 可选档（supportedEfforts）。可调档模型才能切档，" +
 								"其余为固定单档。请求里写 reasoning_effort 时，网关会按可选档自动降级。" +
 								"\r\n· 倍率越低越省积分：账号剩余积分 ÷ 倍率 ≈ 可用次数当量。" +
@@ -228,7 +228,7 @@ func (a *app) buildUI() error {
 						Title:  "测试",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "手动探测：选定账号 + 模型，用该账号凭证直接打一次上游（绕过网关轮换）。" +
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "手动探测：选定账号 + 模型，用该账号凭证直接打一次上游（绕过网关轮换）。" +
 								"\r\n用途：判断某账号不可用是账号问题还是模型问题；探测请求固定小 max_tokens，积分消耗极小。"},
 							dcl.Composite{
 								Layout: dcl.Grid{Columns: 2, Spacing: 8},
@@ -266,7 +266,7 @@ func (a *app) buildUI() error {
 						Title:  "登录",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "添加 CodeBuddy 账号：先生成授权链接，在浏览器里完成登录，再回来确认。" +
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "添加 CodeBuddy 账号：先生成授权链接，在浏览器里完成登录，再回来确认。" +
 								"\r\n成功后会自动保存凭证并热加载进账号池，不需要重启服务。"},
 							dcl.Composite{
 								Layout: dcl.HBox{Spacing: 8},
@@ -373,7 +373,7 @@ func (a *app) buildUI() error {
 						Title:  "用量",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "Token 用量统计（账号 × 模型 × 日期），数据来自上游响应里的 usage 字段。" +
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "Token 用量统计（账号 × 模型 × 日期），数据来自上游响应里的 usage 字段。" +
 								"\r\n· 只统计【成功请求】：失败请求（限流/余额不足）上游不返回 usage，仅计一次请求数。" +
 								"\r\n· 缓存：命中缓存的输入 token。上下文很大但缓存命中率高时，实际计费输入远小于「输入」列。" +
 								"\r\n· 本表是 token 维度的成本归因，不能用于核对积分扣减（那看「日志」页的积分记录）。"},
@@ -419,7 +419,7 @@ func (a *app) buildUI() error {
 									{Title: "其中思考", Width: 100, Alignment: dcl.AlignFar},
 								},
 							},
-							dcl.Label{Text: "提示：双击「账号」页某行看该账号的积分变化；本表看 token 花在哪个账号/模型/日期。"},
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "提示：双击「账号」页某行看该账号的积分变化；本表看 token 花在哪个账号/模型/日期。"},
 						},
 					},
 
@@ -428,7 +428,7 @@ func (a *app) buildUI() error {
 						Title:  "代理",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "每个账号走一个独立的出口 IP（各绑一个 Clash 节点），避免「同 IP 下多账号」被批量风控。" +
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "每个账号走一个独立的出口 IP（各绑一个 Clash 节点），避免「同 IP 下多账号」被批量风控。" +
 								"\r\n用法：点下面那个开关即可 —— 会自动找到 Clash、读取节点、配置好并生效，" +
 								"不需要改配置文件、不需要重启任何东西。"},
 							dcl.Composite{
