@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -25,6 +26,7 @@ import (
 	"workbuddy2api/internal/appconfig"
 	"workbuddy2api/internal/oauthflow"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/proxy"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/upstream"
@@ -346,6 +348,51 @@ type checkinRow struct {
 	UID    string
 	Result string
 	Detail string
+}
+
+// proxyBindingRow 代理绑定表一行（账号 → 出口节点）。
+type proxyBindingRow struct {
+	Name    string // 昵称（无则 UID 短）
+	Node    string // 可读节点名（用户明确要求显示 Clash 里的名字）
+	Port    int
+	Region  string
+	Healthy bool
+}
+
+type proxyBindingModel struct {
+	walk.TableModelBase
+	items []proxyBindingRow
+}
+
+func (m *proxyBindingModel) RowCount() int { return len(m.items) }
+
+func (m *proxyBindingModel) Value(row, col int) interface{} {
+	if row < 0 || row >= len(m.items) {
+		return ""
+	}
+	r := m.items[row]
+	switch col {
+	case 0:
+		return r.Name
+	case 1:
+		return r.Node
+	case 2:
+		return itoa(int64(r.Port))
+	case 3:
+		return r.Region
+	case 4:
+		if r.Healthy {
+			return "正常"
+		}
+		return "不通"
+	default:
+		return ""
+	}
+}
+
+func (m *proxyBindingModel) Replace(items []proxyBindingRow) {
+	m.items = items
+	m.PublishRowsReset()
 }
 
 // usageRow 界面上的一行用量（账号级汇总或账号×模型明细）。
@@ -1058,6 +1105,16 @@ type app struct {
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
 
+	// 代理（账号级出口 IP）
+	proxyReg          *proxy.Registry
+	proxyCancel       context.CancelFunc
+	proxyBindingsPath string
+	proxyBindings     *proxyBindingModel
+	tvProxyBindings   *walk.TableView
+	lblProxyHint      *walk.Label
+	teProxyCfg        *walk.Label // 生成的 listeners 配置（可复制）
+	lastListenersYAML string
+
 	// selectedAcctUID 用户当前选中的账号 UID。
 	//
 	// 为什么应用层要自己记：walk 只在 SetCurrentIndex 路径维护内部的
@@ -1190,14 +1247,15 @@ func main() {
 	log.SetFlags(log.Ltime)
 
 	a := &app{
-		svc:        NewService(),
-		logs:       &logBuffer{},
-		accounts:   &accountModel{},
-		checkins:   &checkinModel{},
-		credits:    &creditModel{},
-		usage:      &usageModel{},
-		modelRates: &modelRateModel{},
-		oauth:      oauthflow.NewClient(),
+		svc:           NewService(),
+		logs:          &logBuffer{},
+		accounts:      &accountModel{},
+		checkins:      &checkinModel{},
+		credits:       &creditModel{},
+		usage:         &usageModel{},
+		proxyBindings: &proxyBindingModel{},
+		modelRates:    &modelRateModel{},
+		oauth:         oauthflow.NewClient(),
 	}
 	// 积分表的昵称解析：模型内只存原始 UID，渲染时才查昵称（改名不会影响过滤）。
 	a.credits.display = a.displayName
@@ -1215,6 +1273,12 @@ func main() {
 	}
 	// 签到记录持久化：与 state_file 同目录（data/），便于一起备份。
 	a.checkinLog = newCheckinStore(filepath.Join(filepath.Dir(a.cfg.StateFile), checkinLogFile))
+	// 账号级出口代理（每账号独立出口 IP）：读 Clash 节点 → 建分配表 → 恢复绑定。
+	// 未启用/拉取失败时回落直连（不影响既有行为）。
+	a.proxyReg, a.proxyCancel = a.setupProxy(a.cfg)
+	a.proxyBindingsPath = a.cfg.Proxy.BindingsFile
+	a.svc.SetProxyRegistry(a.proxyReg)
+
 	// 积分变动历史持久化：同目录，重启不丢。
 	a.creditLog = newCreditStore(filepath.Join(filepath.Dir(a.cfg.StateFile), creditLogFile))
 	// token 用量统计（账号×模型×日期）：同目录。仅观测，不参与任何决策。
@@ -1287,6 +1351,7 @@ func main() {
 	a.loadCreditHistory()
 	a.refreshUsage()
 	a.syncMatrixModels()
+	a.refreshProxyBindings()
 
 	go a.tickLoop()
 	// 启动补签：在服务起来后异步执行，不阻塞 UI。

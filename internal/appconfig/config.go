@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -62,6 +63,24 @@ type Config struct {
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 	} `json:"pool"`
 
+	// Proxy 账号级出口代理（每个账号走一个独立本地端口 = 独立出口 IP）。
+	// 用途：上游按 IP 处置账号时，避免"同 IP 多账号"被批量风控。
+	Proxy struct {
+		// Enabled 总开关。关闭时全部直连（既有行为）。
+		Enabled bool `json:"enabled"`
+		// ClashAPI 本地 Clash 外部控制地址（默认 127.0.0.1:9097）。
+		ClashAPI string `json:"clash_api"`
+		// ClashSecret Clash API 的 secret（Verge 里配置的那个）。
+		ClashSecret string `json:"clash_secret"`
+		// PortBase listeners 起始端口（默认 34567，连续分配）。
+		PortBase int `json:"port_base"`
+		// BindingsFile 绑定持久化路径（默认 data/proxy-bindings.json）。
+		// 必须持久化：同一账号的出口 IP 要稳定，重启后不能换。
+		BindingsFile string `json:"bindings_file"`
+		// HealthInterval 健康探测周期（duration 字符串，默认 5m）。
+		HealthInterval string `json:"health_interval"`
+	} `json:"proxy"`
+
 	SessionSticky struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
@@ -76,6 +95,9 @@ type Config struct {
 	SessionGCInterval   time.Duration `json:"-"`
 	// CreditRefreshDur 解析后的额度刷新间隔；0 表示关闭定时刷新。
 	CreditRefreshDur time.Duration `json:"-"`
+
+	// HealthIntervalDur 解析后的代理健康探测周期。
+	HealthIntervalDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -188,6 +210,27 @@ func (c *Config) normalize() error {
 	}
 	if c.CreditRefreshDur, err = time.ParseDuration(c.Schedule.CreditRefresh); err != nil {
 		return fmt.Errorf("schedule.credit_refresh: %w", err)
+	}
+	// 代理默认值（关闭时不校验其余字段，避免旧配置缺键报错）
+	if c.Proxy.Enabled {
+		if c.Proxy.ClashAPI == "" {
+			c.Proxy.ClashAPI = "http://127.0.0.1:9097"
+		}
+		if c.Proxy.PortBase <= 0 {
+			c.Proxy.PortBase = 34567
+		}
+		if c.Proxy.BindingsFile == "" {
+			c.Proxy.BindingsFile = filepath.Join(filepath.Dir(c.StateFile), "proxy-bindings.json")
+		}
+		if c.Proxy.HealthInterval == "" {
+			c.Proxy.HealthInterval = "5m"
+		}
+		if c.HealthIntervalDur, err = time.ParseDuration(c.Proxy.HealthInterval); err != nil {
+			return fmt.Errorf("proxy.health_interval: %w", err)
+		}
+		if c.HealthIntervalDur <= 0 {
+			c.HealthIntervalDur = 5 * time.Minute
+		}
 	}
 	if c.CreditRefreshDur < 0 {
 		c.CreditRefreshDur = 0

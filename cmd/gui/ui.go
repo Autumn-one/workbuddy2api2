@@ -418,6 +418,44 @@ func (a *app) buildUI() error {
 						},
 					},
 
+					// ══════════════ 代理 ══════════════
+					{
+						Title:  "代理",
+						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+						Children: []dcl.Widget{
+							dcl.Label{Text: "账号级出口 IP：每个账号走一个独立的本地 Clash 端口（= 独立出口节点）。" +
+								"\r\n用途：上游按 IP 处置账号时，避免「同一 IP 下多账号」被批量风控。" +
+								"\r\n工作方式：网关只读取 Clash 的节点列表并生成 listeners 配置；" +
+								"你把它粘到 Clash 的 Merge 覆写文件后重启 Clash 即可。" +
+								"\r\n（不自动改 Clash 配置；节点选择是全局状态，网关靠固定端口而非切节点来分流。）"},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.PushButton{Text: "生成 listeners 配置", MinSize: dcl.Size{Width: 140}, OnClicked: a.doGenListeners},
+									dcl.PushButton{Text: "复制配置", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCopyListeners},
+									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
+									dcl.PushButton{Text: "切换选中账号节点", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
+									dcl.HSpacer{},
+								},
+							},
+							dcl.Label{AssignTo: &a.lblProxyHint, Text: "代理未启用。"},
+							dcl.TableView{
+								AssignTo:         &a.tvProxyBindings,
+								Model:            a.proxyBindings,
+								AlternatingRowBG: true,
+								StretchFactor:    1,
+								Columns: []dcl.TableViewColumn{
+									{Title: "账号", Width: 150},
+									{Title: "出口节点", Width: 300},
+									{Title: "本地端口", Width: 90, Alignment: dcl.AlignFar},
+									{Title: "地区", Width: 70},
+									{Title: "连通", Width: 70},
+								},
+							},
+							dcl.Label{AssignTo: &a.teProxyCfg, Text: "（点「生成 listeners 配置」后显示，可复制到 Clash）"},
+						},
+					},
+
 					// ══════════════ 配置 ══════════════
 					{
 						Title:  "配置",
@@ -697,6 +735,13 @@ func (a *app) quit() {
 	// token 用量统计落盘（内部 Flush；失败仅忽略——属观测数据）。
 	if a.usageStore != nil {
 		a.usageStore.Close()
+	}
+	// 代理：保存账号→节点绑定（重启后走同一 IP）并停止健康探测。
+	if a.proxyReg != nil {
+		a.proxyReg.SaveBindings(a.proxyBindingsPath)
+	}
+	if a.proxyCancel != nil {
+		a.proxyCancel()
 	}
 	if a.mw != nil {
 		a.mw.Close()

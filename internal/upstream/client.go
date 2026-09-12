@@ -334,6 +334,11 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
+	// proxySel 账号级代理选择器（nil = 全部直连）。见 proxy.go。
+	proxySel ProxySelector
+	// proxyPool 按代理地址缓存 Transport（连接池隔离）。
+	proxyPool *proxyPool
+
 	ChatBaseCN    string
 	BillingBaseCN string
 }
@@ -350,6 +355,7 @@ func New() *Client {
 	return &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		proxyPool:            newProxyPool(120 * time.Second),
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
@@ -400,7 +406,12 @@ func (c *Client) billingBase(a *auth.Auth) string {
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+	return c.doJSONFor(nil, req)
+}
+
+// doJSONFor 与 doJSON 相同，但按账号选择出口代理（a 为 nil 表示直连）。
+func (c *Client) doJSONFor(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
+	resp, err := c.clientFor(a, false).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -438,7 +449,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 		return err
 	}
 	RefreshHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(a, req)
 	if err != nil {
 		return err
 	}
@@ -488,7 +499,7 @@ func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadClos
 	ChatHeaders(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
-	resp, err := c.chatHTTP().Do(req)
+	resp, err := c.clientFor(a, true).Do(req)
 	if err != nil {
 		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
@@ -634,7 +645,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
 	req.Header.Set("User-Agent", clientUA)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.clientFor(a, false).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -803,7 +814,7 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (*ResourceDetail, error) {
 		return nil, err
 	}
 	BillingHeaders(req, a)
-	data, err := c.doJSON(req)
+	data, err := c.doJSONFor(a, req)
 	if err != nil {
 		return nil, err
 	}
@@ -887,7 +898,7 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 		return err
 	}
 	BillingHeaders(req, a)
-	_, err = c.doJSON(req)
+	_, err = c.doJSONFor(a, req)
 	return err
 }
 
@@ -902,9 +913,35 @@ func truncate(s string, n int) string {
 // IsAlreadyCheckedIn 判断签到返回的错误是否表示"今天已签到"（属于正常业务提示，不算故障）。
 // 已签到走业务 code 非 0 而非 HTTP 错误，措辞可能是中文或英文（实测 code=10001 "今天已签到"）。
 func IsAlreadyCheckedIn(msg string) bool {
+	if strings.TrimSpace(msg) == "" {
+		return false
+	}
 	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
+	// 业务文案（上游重复签到的真实文案：中文「今天已签到，请明天再来」/ 英文 already checked in）。
+	for _, m := range alreadyCheckedMarkers {
+		if strings.Contains(s, strings.ToLower(m)) {
+			return true
+		}
+	}
+	// 业务码兜底：上游 10001 = 今天已签到。用带引号/等号的精确形式，
+	// 避免 requestId 等字段里偶然出现的数字造成误判。
+	for _, m := range []string{`"code":10001`, `"code": 10001`, "code=10001"} {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// alreadyCheckedMarkers 重复签到的文案特征（仅业务层文案）。
+//
+// 刻意【不】收录的判据（均为历史缺陷根因，2026-09-13 修正）：
+//   - "checkin"：URL 路径里就有（/v2/billing/meter/daily-checkin），
+//     导致任何签到请求的网络错误都被误判为「今天已签到」——真实失败被伪装成成功；
+//   - "code=400"：任何 HTTP 400 都会被误判（重复签到只是 400 的一种）；
+//   - 单独的 "already"：过于宽泛，可能命中无关文案。
+var alreadyCheckedMarkers = []string{
+	"已签到",
+	"already checked",
+	"already checkin",
 }

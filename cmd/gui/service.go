@@ -11,6 +11,7 @@ import (
 	"workbuddy2api/internal/appconfig"
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/proxy"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
@@ -42,6 +43,9 @@ type Service struct {
 	OnKeepalive       func(uid string, ok bool, detail string)
 	OnCreditRefresh   func(uid string, remain int64, err error)
 	OnAccountsChanged func()
+	// proxyReg 账号级出口代理分配表（nil = 未启用，全部直连）。
+	proxyReg *proxy.Registry
+
 	// usageStore token 用量统计（账号×模型×日期）。由 GUI 装配时创建并注入 handler；
 	// Service 持有引用供界面读取与退出时落盘。
 	usageStore *server.TokenUsageStore
@@ -155,6 +159,20 @@ func (s *Service) IsModelCooling(uid, model string) bool {
 	return p.IsModelCooling(uid, model)
 }
 
+// SetProxyRegistry 注入账号级代理分配表（Start 之前调用）；nil = 直连。
+func (s *Service) SetProxyRegistry(reg *proxy.Registry) {
+	s.mu.Lock()
+	s.proxyReg = reg
+	s.mu.Unlock()
+}
+
+// ProxyRegistry 返回代理分配表（未启用时为 nil）。
+func (s *Service) ProxyRegistry() *proxy.Registry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.proxyReg
+}
+
 // SetUsageStore 注入 token 用量统计（Start 之前调用）。
 func (s *Service) SetUsageStore(st *server.TokenUsageStore) {
 	s.mu.Lock()
@@ -211,6 +229,8 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 	p.SetCreditChangeHook(s.OnCreditsChanged)
 
 	up := upstream.New()
+	// 账号级出口代理：每个账号走自己的本地 Clash 端口（独立出口 IP）。
+	up.SetProxySelector(proxySelectorFor(s.proxyReg))
 	up.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	up.HeaderTimeout = time.Duration(cfg.Upstream.HeaderTimeoutSeconds) * time.Second
 	if tr, ok := up.ChatHTTP.Transport.(*http.Transport); ok {
