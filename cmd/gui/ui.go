@@ -24,6 +24,7 @@ func (a *app) buildUI() error {
 	var leSoftRate, leTimeout, leHeaderTO, leIdleTO *walk.LineEdit
 	var leCheckinHours, leKeepaliveHours, leCreditRefresh *walk.LineEdit
 	var leMaxInFlight, leBreakerTh, leBreakerCd, leBreakerCdMax *walk.LineEdit
+	var leMaxRotate *walk.LineEdit
 	var leSessionTTL, leSessionGC *walk.LineEdit
 
 	// ── 账号页/日志页 ──
@@ -129,6 +130,7 @@ func (a *app) buildUI() error {
 									dcl.LineEdit{AssignTo: &a.lePriority, CueBanner: "如 3 / 0.5", MinSize: dcl.Size{Width: 70}},
 									dcl.PushButton{Text: "设置", MinSize: dcl.Size{Width: 60}, OnClicked: a.doApplyPriority},
 									dcl.PushButton{Text: "取消", MinSize: dcl.Size{Width: 60}, OnClicked: func() { a.doSetPriority(0) }},
+									dcl.PushButton{Text: "解除疑似拉黑", MinSize: dcl.Size{Width: 110}, OnClicked: a.doClearSuspectBan},
 									dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
 									// 一键检测：先选模型，再横向扫全部账号的可用性。
 									// 模型下拉框必须在账号页——用户点击前要能看到并修改要测哪个模型。
@@ -167,6 +169,7 @@ func (a *app) buildUI() error {
 									{Title: "积分", Width: 80, Alignment: dcl.AlignFar},
 									{Title: "状态", Width: 190},
 									{Title: "优先级", Width: 70, Alignment: dcl.AlignFar},
+									{Title: "拒审", Width: 90, Alignment: dcl.AlignFar},
 									{Title: "在途", Width: 60, Alignment: dcl.AlignFar},
 									{Title: "成功/总", Width: 90, Alignment: dcl.AlignFar},
 								},
@@ -494,6 +497,10 @@ func (a *app) buildUI() error {
 									dcl.LineEdit{AssignTo: &leIdleTO, Text: getPath(raw, "upstream", "idle_timeout_seconds")},
 									dcl.Label{Text: "软冷却时长"},
 									dcl.LineEdit{AssignTo: &leSoftRate, Text: getPath(raw, "cooldown", "soft_rate")},
+									dcl.Label{Text: "轮转次数"},
+									dcl.LineEdit{AssignTo: &leMaxRotate, Text: getPath(raw, "upstream_rotate", "max_rotate")},
+									dcl.Label{Text: "（单请求最多尝试几个账号；1=不轮转，留空=默认 5）"},
+									dcl.Label{Text: ""},
 								},
 							},
 							dcl.GroupBox{
@@ -553,7 +560,7 @@ func (a *app) buildUI() error {
 		"checkin_hours": leCheckinHours, "keepalive_hours": leKeepaliveHours,
 		"credit_refresh": leCreditRefresh,
 		"timeout":        leTimeout, "header_timeout": leHeaderTO, "idle_timeout": leIdleTO,
-		"soft_rate": leSoftRate, "max_in_flight": leMaxInFlight,
+		"soft_rate": leSoftRate, "max_in_flight": leMaxInFlight, "max_rotate": leMaxRotate,
 		"breaker_threshold": leBreakerTh, "breaker_cooldown": leBreakerCd,
 		"breaker_cooldown_max": leBreakerCdMax,
 		"session_ttl":          leSessionTTL, "session_gc": leSessionGC,

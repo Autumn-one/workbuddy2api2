@@ -22,7 +22,7 @@ type Config struct {
 	Pool      *pool.Pool
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权
-	MaxRotate int    // 单请求最多换号次数，默认 3
+	MaxRotate int    // 单请求最多尝试账号次数，默认 5
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -45,7 +45,7 @@ type Handler struct {
 // NewHandler 构建 handler。
 func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRotate <= 0 {
-		cfg.MaxRotate = 3
+		cfg.MaxRotate = 5
 	}
 	if cfg.SoftCooldown <= 0 {
 		cfg.SoftCooldown = 60 * time.Second
@@ -404,10 +404,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
-			st.status = http.StatusBadGateway
-			return
+			// 上游流解析失败（畸形 SSE / 无有效数据帧）：
+			// 此时客户端还没看到任何输出，所以可以安全地换号重试。
+			// 不喂熔断器、不禁用账号（流格式问题不代表账号故障）。
+			lastErr = &parseFailure{err: err}
+			fail(acct.UID)
+			continue
 		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
@@ -415,6 +417,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.inTok = promptTokens(resp)
 		st.thinkTok = thinkingTokens(resp)
 		st.cachedTok = cachedTokens(resp)
+		return
+	}
+	// 轮转耗尽的出口分两类：
+	//   - 账号都不可用（冷却/禁用/模型限流）→ 503 no_healthy_account
+	//   - 账号健康但上游返回的流格式坏了（解析失败）→ 502 upstream_parse
+	// 区分的价值：客户端对两者处理不同（503 是等账号恢复，502 是上游数据问题）。
+	if isParseFailure(lastErr) {
+		writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", lastErr.Error())
+		st.status = http.StatusBadGateway
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
@@ -429,7 +440,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 连续撞墙翻倍、封顶 maxModelCooldown（60 分钟），见 pool.NoteModelRateLimit。
 const modelRateCooldownBase = 10 * time.Minute
 
-// contentRejectCooldown 内容安全拒绝（code=11140）的账号短期冷却时长。
+// contentRejectCooldown 内容安全拒绝（code=11140）的【基础】冷却时长。
+// 连续次数达 pool.suspectBanThreshold 后升级为疑似拉黑长冷却（1 小时）。
 //
 // 为什么是短期而非禁用：生产实证（2026-09-12）显示某账号 2 小时内 189 次
 // 全被 11140 拒绝、成功 0 次，但风控标记通常是临时的；禁用会让账号永久退场，
@@ -442,6 +454,23 @@ func truncateMsg(s string) string {
 		return s[:200] + "..."
 	}
 	return s
+}
+
+// parseFailure 流解析失败的包装类型。
+//
+// 为什么要专门包一层：传输层错误（连不上/超时）与解析失败都是"非 upstream.Error"，
+// 但语义完全不同——传输错误是网络问题（应 503 让客户端重试），解析失败是上游
+// 返回了坏数据（应 502 告知）。此前用"不是 upstream.Error"一条判据会把传输错误
+// 误报成 502（实测回归：TestChatTransportErrorDoesNotPenalize 失败）。
+type parseFailure struct{ err error }
+
+func (e *parseFailure) Error() string { return e.err.Error() }
+func (e *parseFailure) Unwrap() error { return e.err }
+
+// isParseFailure 报告 lastErr 是否为「上游流解析失败」。
+func isParseFailure(err error) bool {
+	var pf *parseFailure
+	return errors.As(err, &pf)
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。
@@ -512,11 +541,20 @@ func (h *Handler) applyErrorPolicy(acct *auth.Auth, model string, kind upstream.
 		//
 		// 不喂熔断、不禁用：账号本身健康（上游明确说是内容问题），
 		// 喂熔断会把好账号熔断掉；禁用则误伤过重（风控多为临时）。
-		// 用 CooldownSoftOnly 而非 Cooldown：账号是健康的（上游明确是内容审核问题），
+		// 用 NoteContentReject 而非 Cooldown：账号是健康的（上游明确是内容审核问题），
 		// 喂熔断会把它错误地熔断（指数退避最长数小时），误伤过重。
-		h.cfg.Pool.CooldownSoftOnly(uid, contentRejectCooldown, "11140 内容安全拒绝")
+		// 连续达阈值会升级为"疑似拉黑"长冷却（见 pool.suspectBanThreshold）——
+		// 实测某些账号被标记后持续 11140（189 次全拒），只给 10 分钟冷却会让它
+		// 反复被抽中白撞，足以把轮转次数耗光。
+		d, suspected := h.cfg.Pool.NoteContentReject(uid, contentRejectCooldown)
+		if suspected {
+			log.Printf("content_rejected acct=%s model=%s 冷却=%s status=%d（连续 %d 次被拒，判定疑似被上游拉黑；"+
+				"冷却到期会自动给一次重试机会，或在 GUI 手动解除）",
+				logAccountName(acct), model, d, status, h.cfg.Pool.ContentRejectCount(uid))
+			break
+		}
 		log.Printf("content_rejected acct=%s model=%s 冷却=%s status=%d（该账号被上游风控标记，换号重试）",
-			logAccountName(acct), model, contentRejectCooldown, status)
+			logAccountName(acct), model, d, status)
 	default:
 		// 其余（ErrClient/ErrNone）：只换号不罚（防雪崩），不喂熔断。
 	}

@@ -159,6 +159,18 @@ func (s *Service) IsModelCooling(uid, model string) bool {
 	return p.IsModelCooling(uid, model)
 }
 
+// ClearSuspectBan 手动解除账号的"疑似被上游拉黑"判定（清零计数并清冷却）。
+// 不消耗积分——不需要发请求复检，只改本地状态。
+func (s *Service) ClearSuspectBan(uid string) {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.ClearSuspectBan(uid)
+}
+
 // SetProxyRegistry 注入账号级代理分配表（Start 之前调用）；nil = 直连。
 func (s *Service) SetProxyRegistry(reg *proxy.Registry) {
 	s.mu.Lock()
@@ -266,6 +278,7 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 		Pool:         p,
 		Upstream:     up,
 		UsageStore:   s.usageStore,
+		MaxRotate:    cfg.UpstreamRotate.MaxRotate,
 		APIKey:       cfg.APIKey,
 		Session:      sessRouter,
 		StickyCount:  func() int { return 0 },

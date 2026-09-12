@@ -25,6 +25,15 @@ type Config struct {
 		SoftRate string `json:"soft_rate"` // "60s"
 	} `json:"cooldown"`
 
+	// UpstreamRotate 请求级轮转（换号重试）配置。
+	UpstreamRotate struct {
+		// MaxRotate 单请求最多尝试的账号数（含首次）。
+		// 0/缺省 = 默认 5；1 = 不轮转（把上游错误直接暴露给客户端）。
+		// 实测（2026-09-13）：21 账号池里原本硬编码的 3 次会被已死账号耗光，
+		// 返回 503 而 8 秒后就成功——说明可用账号一直存在，只是抽样次数不够。
+		MaxRotate int `json:"max_rotate"`
+	} `json:"upstream_rotate"`
+
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]

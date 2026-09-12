@@ -67,6 +67,10 @@ type Status struct {
 	// 运行态（不持久化）：在途请求数 + 熔断器状态。
 	// Priority 账号优先级（权重乘子）：0 = 未设置。供 GUI 显示标记状态。
 	Priority float64 `json:"priority,omitempty"`
+	// ContentRejects 连续内容安全拒绝（11140）次数；SuspectedBanned 表示已达阈值
+	// 并被判定疑似被上游拉黑（给长冷却）。供 GUI 显示与手动解除。
+	ContentRejects  int  `json:"content_rejects,omitempty"`
+	SuspectedBanned bool `json:"suspected_banned,omitempty"`
 
 	InFlight     int       `json:"in_flight"`
 	InFlightPeak int       `json:"in_flight_peak"` // 近 peakWindow 内的在途峰值（"忙过"痕迹）
@@ -133,6 +137,12 @@ type entry struct {
 	// 纯读路径（statusOf）按 now-peakAt > peakWindow 判定过期，不回写。
 	inFlightPeak atomic.Int64
 	peakAt       atomic.Int64 // UnixNano；0 = 从未忙过
+
+	// contentRejects 连续 11140（内容安全拒绝）次数。
+	// 达 suspectBanThreshold 判定为"疑似被上游拉黑"并给长冷却。
+	// 任一次成功（NoteSuccess）或冷却到期后自动清零——后者保证账号仍有机会自愈，
+	// 且【不额外发请求复检】（用户账号为一次性，积分不可再生，不能用探测换判断）。
+	contentRejects int
 
 	// priority 账号优先级（权重乘子，持久化）。0 = 未设置 → 视为 1.0（不加权）。
 	// 用途：用户手工标记"一次性登录"的账号（手机号一次性、失效后无法二次登录），
@@ -892,6 +902,21 @@ type modelCoolState struct {
 	probeFails int       // 半开是否已探测过（布尔语义 0/1；探测成功或普通成功时清零）
 }
 
+// 疑似被上游拉黑的判定与冷却。
+//
+// 背景：部分账号被风控标记后【持续】返回 11140（实测某账号 189 次全拒、成功 0），
+// 但它们只享受 10 分钟普通冷却——过期后又被抽中，每次白撞一次上游往返。
+// 21 账号池里这类"死号"有 5~6 个，足以把 MaxRotate=3 的轮转耗光（实测两次 503）。
+//
+// 取值依据：
+//   - 阈值 3：单次/双次拒绝可能是内容偶发触发，3 次连续才是"账号级"信号；
+//   - 冷却 1 小时：远长于普通 10 分钟（显著降低白撞频率），但不过长——
+//     风控可能是临时的，且到期会自动清计数给它一次公平重试（零额外请求）。
+const (
+	suspectBanThreshold = 3
+	suspectBanCooldown  = time.Hour
+)
+
 // 模型级限流冷却：起步 10 分钟，连续撞墙翻倍，封顶 15 分钟。
 //
 // 封顶从 60 分钟下调的依据：有半开探测兜底（见下），不需要靠长冷却挡子弹——
@@ -1072,6 +1097,17 @@ func (p *Pool) AdvanceModelCooldowns(_ time.Time) {
 	}
 }
 
+// AdvanceAccountCooldowns 测试专用：把所有账号的【账号级】冷却立即视为已到期。
+// 只动 until、不动 contentRejects——「到期后计数清零」正是被测语义。
+func (p *Pool) AdvanceAccountCooldowns() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	past := time.Now().Add(-time.Second)
+	for _, e := range p.byUID {
+		e.until = past
+	}
+}
+
 // modelCoolSweepInterval 模型级冷却条目的清扫周期。
 const modelCoolSweepInterval = 5 * time.Minute
 
@@ -1160,6 +1196,91 @@ func (p *Pool) recordBreakerFailureLocked(e *entry) {
 	e.fails = 0
 	e.retryCount++
 	e.breakerUntil = time.Now().Add(d)
+}
+
+// NoteContentReject 记录一次内容安全拒绝（11140），返回 (本次冷却, 是否判定疑似拉黑)。
+//
+// 逻辑：
+//   - 计数 +1；达 suspectBanThreshold → 判定疑似拉黑，给 suspectBanCooldown 长冷却；
+//   - 否则给普通 baseCooldown（10 分钟）；
+//   - 计数在 NoteSuccess（账号恢复的最强信号）或冷却到期后清零。
+//
+// 刻意【不】喂熔断、不 Disable：账号本身没故障（上游明确是内容问题），
+// 熔断会把好账号熔断掉；禁用则过重（风控多为临时，需保留自愈机会）。
+func (p *Pool) NoteContentReject(uid string, baseCooldown time.Duration) (time.Duration, bool) {
+	if uid == "" {
+		return 0, false
+	}
+	if baseCooldown <= 0 {
+		baseCooldown = 10 * time.Minute
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return 0, false
+	}
+	now := time.Now()
+	// 计数【不因时间流逝而清零】——这是关键（实测教训 2026-09-13）：
+	// 早期实现里"冷却到期即清零"，导致连续撞墙永远停在计数 1、阈值 3 永不达成，
+	// 疑似拉黑判定形同虚设（生产日志实证：某账号 14 次 11140、间隔恒为 10~20 分钟，
+	// 即每次都是"冷却到期→被抽中→又拒绝"，而计数每次都被重置）。
+	//
+	// 清零只由两件事触发：
+	//   · NoteSuccess：真的成功一次 → 账号确实恢复（最强信号）；
+	//   · ClearSuspectBan：用户手动解除。
+	// 冷却到期只是"给一次重试机会"，不代表恢复，因此不动计数。
+	e.contentRejects++
+	suspected := e.contentRejects >= suspectBanThreshold
+	d := baseCooldown
+	if suspected {
+		d = suspectBanCooldown
+	}
+	// 用 CooldownSoftOnly 语义（不喂熔断）；此处已在锁内，直接设字段。
+	e.until = now.Add(d)
+	e.coolKind = CoolSoft
+	if suspected {
+		e.reason = "疑似被上游拉黑（连续内容安全拒绝）"
+	} else {
+		e.reason = "内容安全拒绝"
+	}
+	p.dirty.Store(true)
+	return d, suspected
+}
+
+// IsSuspectedBanned 报告账号是否疑似被上游拉黑（连续 11140 达阈值且仍在冷却）。
+func (p *Pool) IsSuspectedBanned(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	return e.contentRejects >= suspectBanThreshold && time.Now().Before(e.until)
+}
+
+// ContentRejectCount 返回连续内容拒绝计数（供界面显示）。
+func (p *Pool) ContentRejectCount(uid string) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.contentRejects
+	}
+	return 0
+}
+
+// ClearSuspectBan 手动解除疑似拉黑：清零计数并清除冷却（立刻给一次机会，无需等到期）。
+// 供 GUI 在用户确认账号已恢复时使用（不消耗积分——不需要发请求复检）。
+func (p *Pool) ClearSuspectBan(uid string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.contentRejects = 0
+		e.until = time.Time{}
+		e.coolKind = 0
+		e.reason = ""
+		p.dirty.Store(true)
+	}
 }
 
 // CooldownSoftOnly 只设置冷却、【不喂熔断计数】。
@@ -1281,6 +1402,8 @@ func (p *Pool) NoteSuccess(uid string) {
 			st.backoffN = 0
 			st.probeFails = 0
 		}
+		// 成功是"账号可用"的最强信号：清零内容拒绝计数，解除疑似拉黑判定。
+		e.contentRejects = 0
 		p.dirty.Store(true)
 	}
 }
@@ -1428,6 +1551,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:        int(e.inFlight.Load()),
 		BreakerFails:    e.fails,
 		Priority:        e.priority,
+		ContentRejects:  e.contentRejects,
+		SuspectedBanned: e.contentRejects >= suspectBanThreshold && now.Before(e.until),
 		BreakerUntil:    e.breakerUntil,
 	}
 	if pk, ok := e.peakVisible(now); ok {

@@ -239,6 +239,15 @@ func (m *accountModel) Value(row, col int) interface{} {
 		}
 		return "—"
 	case 5:
+		// 拒审列：连续内容安全拒绝次数；达阈值标记"疑似拉黑"（长冷却）。
+		if s.SuspectedBanned {
+			return fmt.Sprintf("%d 疑似拉黑", s.ContentRejects)
+		}
+		if s.ContentRejects > 0 {
+			return fmt.Sprintf("%d", s.ContentRejects)
+		}
+		return "—"
+	case 6:
 		// 在途列展示"忙闲痕迹"：瞬时值优先（正在忙）；瞬时为 0 但峰值仍在可见窗口内时
 		// 显示 "0（峰值 N）"，让整体落在 GUI 采样间隔之间的短请求也能被看见。
 		if s.InFlight > 0 {
@@ -251,7 +260,7 @@ func (m *accountModel) Value(row, col int) interface{} {
 			return fmt.Sprintf("峰 %d", s.InFlightPeak)
 		}
 		return "-"
-	case 6:
+	case 7:
 		if s.ErrTotal == 0 && s.SuccessCount == 0 {
 			return "-"
 		}
@@ -309,7 +318,12 @@ func (m *accountModel) ID(index int) interface{} {
 func accountState(s pool.Status) string {
 	switch {
 	case s.Disabled:
+		// 禁用优先于一切：账号彻底不可用（需人工重登），此信号最强，
+		// 不应被"疑似拉黑"等其他标记掩盖。
 		return "已禁用（需重新登录）"
+	case s.SuspectedBanned:
+		// 其次才是风控标记（账号仍可能恢复，且可手动解除）。
+		return "疑似被上游拉黑（连续内容安全拒绝）"
 	case s.BreakerFails > 0 && !s.BreakerUntil.IsZero() && time.Now().Before(s.BreakerUntil):
 		return fmt.Sprintf("熔断中 %s", untilText(s.BreakerUntil))
 	case s.Cooling:
@@ -1464,8 +1478,9 @@ func (a *app) refreshAccounts() {
 func (a *app) tblSignature(items []pool.Status) string {
 	var b strings.Builder
 	for _, s := range items {
-		fmt.Fprintf(&b, "%s|%s|%d|%v|%v|%d|%g;",
-			s.UID, s.Nickname, s.Credits, s.Cooling, s.Disabled, s.BreakerFails, s.Priority)
+		fmt.Fprintf(&b, "%s|%s|%d|%v|%v|%d|%g|%d|%v;",
+			s.UID, s.Nickname, s.Credits, s.Cooling, s.Disabled, s.BreakerFails, s.Priority,
+			s.ContentRejects, s.SuspectedBanned)
 	}
 	return b.String()
 }
@@ -1640,6 +1655,7 @@ func (a *app) doSaveConfig(restart bool) {
 	setPath(raw, a.ed["auth_dir"].Text(), "auth_dir")
 	setPath(raw, a.ed["state_file"].Text(), "state_file")
 	setPath(raw, a.ed["soft_rate"].Text(), "cooldown", "soft_rate")
+	setPath(raw, a.ed["max_rotate"].Text(), "upstream_rotate", "max_rotate")
 	setPath(raw, a.ed["timeout"].Text(), "upstream", "timeout_seconds")
 	setPath(raw, a.ed["header_timeout"].Text(), "upstream", "header_timeout_seconds")
 	setPath(raw, a.ed["idle_timeout"].Text(), "upstream", "idle_timeout_seconds")
@@ -1856,6 +1872,25 @@ func (a *app) refreshTotalCredits(items []pool.Status) {
 		return
 	}
 	a.lblTotalCredits.SetText(totalCreditsText(items))
+}
+
+// doClearSuspectBan 手动解除选中账号的"疑似被上游拉黑"判定。
+//
+// 用途：用户确认该账号已恢复时立刻给它一次机会，不必等 1 小时冷却到期。
+// 不消耗积分——只改本地状态，不发任何复检请求。
+func (a *app) doClearSuspectBan() {
+	items := a.svc.Accounts()
+	a.takeSelection(func(idx int) {
+		if idx < 0 || idx >= len(items) {
+			a.lblAccts2.SetText("请先在表格里选中一个账号")
+			return
+		}
+		st := items[idx]
+		a.svc.ClearSuspectBan(st.UID)
+		a.refreshAccountsNow()
+		a.lblAccts2.SetText(fmt.Sprintf("%s：已解除疑似拉黑判定（计数与冷却已清零）", a.displayName(st.UID)))
+		log.Printf("手动解除疑似拉黑: %s（原连续拒审 %d 次）", a.displayName(st.UID), st.ContentRejects)
+	})
 }
 
 // doSetPriority 把选中账号设为目标优先级（0 = 取消）。
