@@ -1139,12 +1139,19 @@ type app struct {
 	usageDays []string
 
 	// 代理（账号级出口 IP）
-	proxyReg          *proxy.Registry
-	proxyCancel       context.CancelFunc
+	proxyReg    *proxy.Registry
+	proxyCancel context.CancelFunc
+	// proxyBindingsPath 账号→节点对应关系的落盘位置；同时用于读回上次的对应关系。
 	proxyBindingsPath string
-	proxyBindings     *proxyBindingModel
-	tvProxyBindings   *walk.TableView
-	lblProxyHint      *walk.Label
+	// proxyStatePath 接管等级（「网关写 listeners」/「沿用用户配置」）的落盘位置。
+	proxyStatePath string
+	// proxyLevel 本次运行实际采用的接管等级（LevelDisabled = 未启用）。
+	// 它决定两件事：关闭代理时要不要清理 Clash 配置（沿用状态下不能动用户的东西）；
+	// 以及下次开启时优先按哪个等级探测。
+	proxyLevel      proxy.TakeoverLevel
+	proxyBindings   *proxyBindingModel
+	tvProxyBindings *walk.TableView
+	lblProxyHint    *walk.Label
 	// btnProxyToggle 一键开关代理；lblProxyState 显示当前开关状态。
 	btnProxyToggle *walk.PushButton
 	lblProxyState  *walk.Label
@@ -1316,15 +1323,12 @@ func main() {
 	}
 	// 签到记录持久化：与 state_file 同目录（data/），便于一起备份。
 	a.checkinLog = newCheckinStore(filepath.Join(filepath.Dir(a.cfg.StateFile), checkinLogFile))
-	// 账号级出口代理（每账号独立出口 IP）：读 Clash 节点 → 建分配表 → 恢复绑定。
-	// 未启用/拉取失败时回落直连（不影响既有行为）。
-	// 代理：优先用「一键开关」入口（GUI「代理」页）。
-	// config.proxy.enabled=true 时在启动阶段自动开启（保持配置驱动的兼容性）；
-	// 否则完全由用户点开关决定，无需改配置文件。
+	// 账号级出口代理（每账号独立出口 IP）：默认【启动自动开启】（用户要求，避免忘记）。
+	// 实际启用走 enableProxyNow：先实测用户是否已自行配好 listeners——能用就完全
+	// 不改他的 Clash 配置；并默认沿用上次的账号→节点对应关系，只有节点失效才重分配。
+	// 要关掉自动开启：配置写 proxy.auto=false，或点界面上的「关闭代理」（仅本次运行）。
 	a.proxyBindingsPath = a.cfg.Proxy.BindingsFile
-	if a.cfg.Proxy.Enabled {
-		go a.autoEnableProxyAtStartup()
-	}
+	a.proxyStatePath = proxyStatePathFor(a.cfg)
 
 	// 积分变动历史持久化：同目录，重启不丢。
 	a.creditLog = newCreditStore(filepath.Join(filepath.Dir(a.cfg.StateFile), creditLogFile))
@@ -1400,6 +1404,20 @@ func main() {
 	a.syncMatrixModels()
 	a.refreshProxyBindings()
 	a.refreshProxyToggle()
+	// 代理：默认【启动自动开启】（用户要求，避免忘记）。
+	// 必须在服务起来之后调用：它要把选择器注入到 upstream 客户端。
+	//
+	// 内部会先实测"用户是否已自己配好 listeners"——能用就完全沿用、不改其 Clash 配置；
+	// 账号→节点的对应关系默认沿用上次落盘的记录，只有节点真的不在了才重分配。
+	// 想关掉自动开启：配置写 proxy.auto=false，或点界面上的「关闭代理」（仅本次运行）。
+	if a.cfg.ProxyAuto() {
+		go func() {
+			a.autoEnableProxyAtStartup()
+			a.mw.Synchronize(a.refreshProxyBindings)
+		}()
+	} else {
+		log.Printf("代理：配置为不自动开启（proxy.auto=false），保持直连；可在「代理」页手动开启")
+	}
 
 	go a.tickLoop()
 	// 启动补签：在服务起来后异步执行，不阻塞 UI。

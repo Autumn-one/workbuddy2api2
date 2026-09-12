@@ -664,6 +664,10 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, params EffectiveParams, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	prepared, params := c.prepareBodyWithParams(body, a)
+	// 记录本次【实际使用】的出口代理（供请求日志核实"走没走代理"）。
+	// 取值紧邻实际发请求的 client，保证"报告的就是用的那个"。
+	chatClient, effectiveProxy := c.clientForWithProxy(a, true)
+	params.Proxy = effectiveProxy
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, params, err
@@ -671,7 +675,7 @@ func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadClos
 	ChatHeaders(req, a)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
-	resp, err := c.clientFor(a, true).Do(req)
+	resp, err := chatClient.Do(req)
 	if err != nil {
 		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)

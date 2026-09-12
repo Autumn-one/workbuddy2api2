@@ -73,6 +73,14 @@ type EffectiveParams struct {
 	EffortReq string
 	// MaxTokens 客户端指定的输出上限（max_tokens / max_completion_tokens）；0 = 未指定。
 	MaxTokens int
+
+	// Proxy 本次请求【实际使用】的代理地址（如 http://127.0.0.1:34567）；
+	// 空串 = 直连（未配置代理、或代理不可达已回落）。
+	//
+	// 为什么放在 EffectiveParams 里：这个结构体的语义就是"实际生效的请求参数"，
+	// 而出口代理同样是"实际生效"的一部分。用户要求能核实"每个请求走没走代理"，
+	// 放这里最自然，也让日志展示与请求参数共享同一条数据通路。
+	Proxy string
 }
 
 // Downgraded 报告档位是否被改写（降级或 floor）。

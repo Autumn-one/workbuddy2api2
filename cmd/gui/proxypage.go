@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"workbuddy2api/internal/appconfig"
 	"workbuddy2api/internal/proxy"
 	"workbuddy2api/internal/upstream"
 )
@@ -54,17 +55,23 @@ func proxySelectorFor(reg *proxy.Registry) upstream.ProxySelector {
 	}
 }
 
-// autoEnableProxyAtStartup 启动阶段自动开启代理（仅当 config.proxy.enabled=true）。
+// autoEnableProxyAtStartup 启动阶段自动开启代理（默认行为，用户要求）。
+//
+// 为什么默认开启：代理是"防上游按 IP 批量风控"的基础设施，忘记开启会让
+// 所有账号以同一真实 IP 暴露（用户明确说过"容易忘"）。
+// 想关掉就把配置写成 proxy.auto=false（或点界面上的「关闭代理」）。
 //
 // 与「一键开关」走完全相同的代码路径（enableProxyNow），保证行为一致——
-// 避免"配置启用"与"手动开关"两套逻辑各写一遍而漂移。
+// 避免"启动启用"与"手动开关"两套逻辑各写一遍而漂移。
 func (a *app) autoEnableProxyAtStartup() {
 	if a.svc.Upstream() == nil {
 		return // 服务未启动，等用户点开关
 	}
 	msg, err := a.enableProxyNow()
 	if err != nil {
-		log.Printf("代理：启动自动启用失败（%v）；可在「代理」页点「一键开启代理」重试", err)
+		// 代理不可用不影响网关服务（全部直连），只是如实记录原因。
+		log.Printf("代理：启动自动开启失败（%v）；可在「代理」页点「开启代理」重试", err)
+		a.mw.Synchronize(func() { a.refreshProxyToggle() })
 		return
 	}
 	log.Printf("代理（启动自动启用）：%s", msg)
@@ -122,7 +129,7 @@ func (a *app) refreshProxyBindings() {
 // 点了会"凭空冒出一行"（给那个账号新分配节点）。现在只作用于代理列表自身的选中行。
 func (a *app) doSwitchAccountNode() {
 	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
 		return
 	}
 	if a.tvProxyBindings == nil {
@@ -205,7 +212,7 @@ func (a *app) clashEndpoint() proxy.ClashEndpoint {
 // doProbeProxiesNow 立即检测一轮（用户手动触发，低成本）。
 func (a *app) doProbeProxiesNow() {
 	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
 		return
 	}
 	a.lblProxyHint.SetText("正在检测节点连通性…")
@@ -225,7 +232,7 @@ func (a *app) doProbeProxiesNow() {
 // doSelectNodeForAccount 把选中账号手动指定到你挑选的节点。
 func (a *app) doSelectNodeForAccount() {
 	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
 		return
 	}
 	if a.tvProxyBindings == nil || a.cbNodePick == nil {
@@ -258,7 +265,7 @@ func (a *app) doSelectNodeForAccount() {
 // doAutoAssignSelected 把选中账号交还自动分配（按地区优先+可用挑节点）。
 func (a *app) doAutoAssignSelected() {
 	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
+		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
 		return
 	}
 	if a.tvProxyBindings == nil {
@@ -380,9 +387,15 @@ func (a *app) doApplyProxyAuto() {
 }
 
 // enableProxyNow 在【运行期】启用代理：自动发现 Clash → 拉节点 → 建分配表
-// → 自动应用 listeners 到 Clash → 注入选择器。全程无需改配置或重启。
+// → （仅在必要时）应用 listeners 到 Clash → 注入选择器。全程无需改配置或重启。
 //
-// 这是用户要求的"简单"入口：GPU 上一个开关，点了就用。
+// 这是用户要求的"简单"入口：界面上一个开关，点了就用；启动时也会自动走这条路。
+//
+// 两条关键行为（用户要求，2026-09-13）：
+//  1. **尽量不改用户的 Clash 配置**：先实测既有端口能不能用；能用就完全不动配置。
+//     用户可能已经自己把 listeners 配好了（例如写进 Verge 的 Merge 覆写文件，
+//     订阅更新也不会丢），那就不该再让工具去覆盖一次。
+//  2. **默认沿用上次的账号→节点对应关系**：只有节点真的不在了，才重分配那一部分。
 func (a *app) enableProxyNow() (string, error) {
 	dir := vergeDataDir()
 	if dir == "" {
@@ -400,32 +413,68 @@ func (a *app) enableProxyNow() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("读取 Clash 节点失败: %w", err)
 	}
-	ls := proxy.BuildListeners(nodes, proxy.DefaultPortBase)
-	if len(ls) == 0 {
+	base := proxy.DefaultPortBase
+	if a.cfg != nil && a.cfg.Proxy.PortBase > 0 {
+		base = a.cfg.Proxy.PortBase
+	}
+	genLS := proxy.BuildListeners(nodes, base)
+	if len(genLS) == 0 {
 		return "", fmt.Errorf("未取到任何节点")
 	}
 
-	// 建分配表并恢复历史绑定（IP 稳定）
-	reg := proxy.NewRegistry(ls)
 	bindPath := a.proxyBindingsPath
 	if bindPath == "" {
 		bindPath = filepath.Join(filepath.Dir(a.cfg.StateFile), "proxy-bindings.json")
 	}
-	reg.LoadBindings(bindPath)
+	statePath := a.proxyStatePath
+	if statePath == "" {
+		statePath = proxyStatePathFor(a.cfg)
+	}
+
+	// ─── 步骤 1：读现行 Clash 配置，找出【用户自己配的】listeners ───
+	//
+	// 用户的端口未必是 34567 起（自己粘进 Merge 覆写文件时常用别的号），
+	// 所以先按配置文本解析出"端口 → 节点"，再实测它们能不能用。
+	userLS, cfgReadNote := a.readUserListeners(dir)
+
+	prevLevel := a.proxyLevel
+	if prevLevel == proxy.LevelDisabled {
+		prevLevel = proxy.LoadLevel(statePath) // 上次确认过的等级（重启后仍记得）
+	}
+	// 只对"用户自己配的端口"做实测：它们是否真的在监听、以及能否转发出网。
+	// 没配的话就没得测（直接走注入），连多余的连接都省掉。
+	probes := a.probeExistingPorts(ep, userLS)
+	listening := len(userLS) > 0 && anyPortListening(userLS)
+
+	// ─── 步骤 2：决定等级，并按等级决定是否改写 Clash 配置 ───
+	dec := proxy.Decide(userLS, probes, listening, prevLevel)
+	level, applyNote := dec.Level, dec.Reason
+	ls := genLS
+	if dec.UseUserPorts {
+		ls = userLS // 用他自己的端口表（连端口号都不换，出口 IP 才稳定）
+		if missing := proxy.CoverAllNodes(ls, nodes); len(missing) > 0 {
+			applyNote += fmt.Sprintf("；%d 个节点没有对应端口，暂不参与分配", len(missing))
+		}
+	} else {
+		if _, err := proxy.ApplyListeners(ep.API, ep.Secret, dir, genLS); err != nil {
+			return "", fmt.Errorf("应用到 Clash 失败: %w", err)
+		}
+		time.Sleep(1200 * time.Millisecond) // 等 Clash 重载
+	}
+	applyNote += cfgReadNote
+
+	// ─── 步骤 3：建分配表并继承上次的账号→节点对应关系 ───
+	reg := proxy.NewRegistry(ls)
+	restored, lost := reg.LoadBindingsReport(bindPath)
 
 	// 【关键】为全部账号立刻建立绑定：让界面一开启就显示"每个账号走哪个节点"，
 	// 而不是等请求发生才懒分配（那样列表默认空白，用户以为没生效）。
+	// 已绑定的不会被改动 —— 这就是"默认沿用上次的对应关系"。
 	uids := make([]string, 0, len(a.svc.Accounts()))
 	for _, st := range a.svc.Accounts() {
 		uids = append(uids, st.UID)
 	}
 	reg.EnsureAllAssigned(uids)
-
-	// 自动应用 listeners 到 Clash（运行期重载，无需重启 Clash）
-	if _, err := proxy.ApplyListeners(ep.API, ep.Secret, dir, ls); err != nil {
-		return "", fmt.Errorf("应用到 Clash 失败: %w", err)
-	}
-	time.Sleep(1200 * time.Millisecond) // 等 Clash 重载
 
 	// 检测真实连通性（延迟接口）。失败时回落 TCP 探测（至少确认端口在监听）。
 	delayNote := ""
@@ -456,6 +505,8 @@ func (a *app) enableProxyNow() (string, error) {
 	// 保存状态供界面显示与退出时落盘
 	a.proxyReg = reg
 	a.proxyBindingsPath = bindPath
+	a.proxyStatePath = statePath
+	a.proxyLevel = level
 	if a.proxyCancel != nil {
 		a.proxyCancel() // 停掉旧的健康探测循环
 	}
@@ -463,13 +514,114 @@ func (a *app) enableProxyNow() (string, error) {
 	a.proxyCancel = cancel
 	go reg.HealthLoop(ctx, proxy.DefaultHealthInterval)
 
-	reg.SaveBindings(bindPath)
-	return fmt.Sprintf("已启用：%d 个节点（%s），%d/%d 个真实可用%s",
-		len(ls), regionSummary(ls), ok, len(ls), delayNote), nil
+	// 落盘：既要绑定，也要"这些端口是谁配的"——否则下次无法判断能不能动它们。
+	reg.SaveBindingsWithOwner(bindPath, ownerFor(ls, level))
+	proxy.SaveLevel(statePath, level, applyNote)
+
+	// 如实汇报：沿用了多少、有多少因失效被重分配
+	inherit := ""
+	if restored > 0 {
+		inherit = fmt.Sprintf("，沿用上次对应关系 %d 个", restored)
+	}
+	if lost > 0 {
+		inherit += fmt.Sprintf("；%d 个账号的节点已不存在，已重新分配", lost)
+	}
+	return fmt.Sprintf("已启用：%d 个节点（%s），%d/%d 个真实可用；%s%s%s",
+		len(ls), regionSummary(ls), ok, len(ls), applyNote, inherit, delayNote), nil
+}
+
+// readUserListeners 读现行 Clash 配置，解析出用户自己配置的 listeners。
+//
+// 读不到配置不算失败（返回空 + 说明），此时按"没有用户配置"处理，
+// 走注入路径——保证功能不会因为读不到文件而整体不可用。
+func (a *app) readUserListeners(dataDir string) ([]proxy.Listener, string) {
+	cfgPath, err := proxy.FindRenderedConfig(dataDir)
+	if err != nil {
+		return nil, ""
+	}
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return nil, ""
+	}
+	us := proxy.ParseUserListeners(string(raw))
+	if len(us) == 0 {
+		return nil, ""
+	}
+	return proxy.UserListenersToListeners(us), ""
+}
+
+// probeExistingPorts 实测"用户自己配置的端口"是否真能用。
+//
+// 这是整个"不改用户配置"判断的基础：只有真的拿这些端口发出去请求、
+// 拿到了响应，才敢说"用户的配置是好的，不需要动它"。
+//
+// 目标是本机 Clash 的只读接口 /version —— 不涉及上游、不消耗额度、不碰账号。
+// 没有用户端口（或还没有探测目标）时返回 nil。
+func (a *app) probeExistingPorts(ep proxy.ClashEndpoint, userLS []proxy.Listener) []proxy.ProbeResult {
+	if len(userLS) == 0 {
+		return nil
+	}
+	host := proxy.APIHostPort(ep.API)
+	if host == "" {
+		return nil
+	}
+	cands := make([]int, 0, len(userLS))
+	for _, l := range userLS {
+		cands = append(cands, l.Port)
+	}
+	return proxy.ProbePorters(cands, host, 3*time.Second)
+}
+
+// anyPortListening 是否有任一候选端口在监听（TCP 层）。
+// 与"能转发出网"分开：用来区分"配置被删了"与"配了但节点暂时不通"——
+// 只有前者才回退到改写配置，后者应当尊重用户配置。
+func anyPortListening(ls []proxy.Listener) bool {
+	for _, l := range ls {
+		if proxy.ProbePort(l.Port) {
+			return true
+		}
+	}
+	return false
+}
+
+// ownerFor 生成端口归属表：沿用状态下这些端口是用户配的，注入状态下是网关配的。
+func ownerFor(ls []proxy.Listener, level proxy.TakeoverLevel) map[int]string {
+	out := make(map[int]string, len(ls))
+	who := proxy.OwnerGateway
+	if level == proxy.LevelRespect {
+		who = "user"
+	}
+	for _, l := range ls {
+		out[l.Port] = who
+	}
+	return out
+}
+
+// proxyStatePathFor 接管等级状态文件路径（默认与绑定文件同目录）。
+func proxyStatePathFor(cfg *appconfig.Config) string {
+	if cfg == nil {
+		return ""
+	}
+	if cfg.Proxy.StateFile != "" {
+		return cfg.Proxy.StateFile
+	}
+	if cfg.Proxy.BindingsFile != "" {
+		return filepath.Join(filepath.Dir(cfg.Proxy.BindingsFile), "proxy-state.json")
+	}
+	if cfg.StateFile != "" {
+		return filepath.Join(filepath.Dir(cfg.StateFile), "proxy-state.json")
+	}
+	return ""
 }
 
 // disableProxyNow 在【运行期】关闭代理：立刻回落直连，不重启。
-// 同时把 Clash 里的自动注入块清掉（不留垃圾配置）。
+//
+// 关于 Clash 配置：只清理【本程序自己写入的】自动注入块。
+// 如果当前是「沿用用户既有 listeners」状态（LevelRespect），就一个字都不动——
+// 那是用户自己的配置，我们没有资格删。
+//
+// 注意：关闭只在【本次运行】生效，重启后仍会按默认行为自动开启
+// （用户要求"不用每次记得开"；要长期关闭请设 proxy.auto=false）。
 func (a *app) disableProxyNow() (string, error) {
 	up := a.svc.Upstream()
 	if up == nil {
@@ -481,18 +633,23 @@ func (a *app) disableProxyNow() (string, error) {
 		a.proxyCancel()
 		a.proxyCancel = nil
 	}
-	// 清理 Clash 里的自动注入块（传空列表 = 只清理）
-	if dir := vergeDataDir(); dir != "" {
+	cleaned := "（Clash 里的自动配置已清理）"
+	if a.proxyLevel == proxy.LevelRespect {
+		cleaned = "（你的 listeners 配置保持不动）"
+	} else if dir := vergeDataDir(); dir != "" {
+		// 清理 Clash 里的自动注入块（传空列表 = 只清理）
 		ep, err := proxy.DiscoverClashEndpoint(dir, "")
 		if err == nil {
 			if _, aerr := proxy.ApplyListeners(ep.API, ep.Secret, dir, nil); aerr != nil {
 				log.Printf("代理：清理 Clash 配置失败（%v），已关闭代理但配置里可能留有自动块", aerr)
+				cleaned = "（清理 Clash 配置失败，配置里可能留有自动块）"
 			}
 		}
 	}
 	a.proxyReg = nil
+	a.proxyLevel = proxy.LevelDisabled
 	a.refreshProxyBindings() // 清空列表（否则旧行残留，看起来还开着）
-	return "已关闭：立即回落直连（Clash 里的自动配置已清理）", nil
+	return "已关闭：立即回落直连" + cleaned, nil
 }
 
 // doToggleProxy 一键开关（GUI 按钮入口）。
@@ -534,13 +691,17 @@ func (a *app) refreshProxyToggle() {
 		if on {
 			a.btnProxyToggle.SetText("关闭代理")
 		} else {
-			a.btnProxyToggle.SetText("一键开启代理")
+			a.btnProxyToggle.SetText("开启代理")
 		}
 	}
 	if a.lblProxyState != nil {
-		if on {
+		switch {
+		case on && a.proxyLevel == proxy.LevelRespect:
+			// 如实告知：这次没有改用户的 Clash 配置
+			a.lblProxyState.SetText("● 已开启（每个账号走独立出口 IP · 沿用你已配置的 listeners）")
+		case on:
 			a.lblProxyState.SetText("● 已开启（每个账号走独立出口 IP）")
-		} else {
+		default:
 			a.lblProxyState.SetText("○ 未开启（全部直连）")
 		}
 	}

@@ -389,13 +389,14 @@ func logChatRow(ttfb, total time.Duration, model, mode string, acct *auth.Auth, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | acct=%s | %s | ctx=%s | cache=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatOut(), "| #%03d | %s | %s | %s | %d | acct=%s | proxy=%s | %s | ctx=%s | cache=%s | TTFB=%s | tok=%s | think=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
 		logAccountName(acct),
+		upstream.ProxyLabelForLog(params.Proxy),
 		paramsText(params),
 		intOrDash(inTok),
 		intOrDash(cachedTok),

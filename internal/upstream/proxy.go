@@ -190,23 +190,45 @@ func (c *Client) ProxySelectorEnabled() bool {
 //
 // 代理不可达时回落共享的直连 client（既有行为），保证代理故障不影响服务可用性。
 func (c *Client) clientFor(a *auth.Auth, chat bool) *http.Client {
+	cl, _ := c.clientForWithProxy(a, chat)
+	return cl
+}
+
+// clientForWithProxy 与 clientFor 相同，但额外返回【实际使用】的代理地址
+// （空串 = 直连），供调用方写入日志/参数快照。
+//
+// 注意"实际使用"的语义：代理不可达而回落直连时返回空串——不能谎报走了代理。
+func (c *Client) clientForWithProxy(a *auth.Auth, chat bool) (*http.Client, string) {
 	base := c.HTTP
 	if chat {
 		base = c.chatHTTP()
 	}
 	sel := c.proxySel.Load()
 	if sel == nil || a == nil {
-		return base
+		return base, ""
 	}
 	if c.proxyPool == nil {
-		return base
+		return base, ""
 	}
-	tr := c.proxyPool.transportFor(sel(a.UID))
+	proxyURL := sel(a.UID)
+	tr := c.proxyPool.transportFor(proxyURL)
 	if tr == nil {
-		return base // 未绑定或代理不可达 → 直连
+		return base, "" // 未绑定或代理不可达 → 直连（如实报告）
 	}
 	if chat {
-		return &http.Client{Timeout: 0, Transport: tr} // 与 ChatHTTP 同口径
+		return &http.Client{Timeout: 0, Transport: tr}, proxyURL // 与 ChatHTTP 同口径
 	}
-	return &http.Client{Timeout: base.Timeout, Transport: tr}
+	return &http.Client{Timeout: base.Timeout, Transport: tr}, proxyURL
+}
+
+// ProxyLabelForLog 日志展示用的代理标识：去掉 scheme 保留 host:port（更短更好读）。
+// 空串显示 "-"（表示直连）。
+func ProxyLabelForLog(proxyURL string) string {
+	if proxyURL == "" {
+		return "-"
+	}
+	if u, err := url.Parse(proxyURL); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return proxyURL
 }

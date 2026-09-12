@@ -239,6 +239,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
+| `proxy.auto` | `true` | 启动时自动开启账号级出口代理（用户不需要改配置）；`false` = 不自动开启 |
+| `proxy.port_base` | `34567` | 需要写入 listeners 时的起始端口（沿用你已有配置时不用它） |
+| `proxy.health_interval` | `5m` | 代理端口健康探测周期（仅 TCP 连通，不打上游） |
 
 ### 上游超时语义（三段各归其位）
 
@@ -342,6 +345,36 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 会话键提取顺序：`metadata.conversation_id` → `metadata.user_id` → 顶层 `conversation_id`
 - TTL 滚动续期（默认 30m），GC 周期 5m；绑定可镜像到 Redis（7 天）防重启丢失
 - 请求失败自动解绑；成功后绑定跟随最终成功账号
+
+### 账号级出口代理（默认自动开启）
+
+上游按 IP 处置账号，同一出口 IP 下多账号共用会被批量风控。因此每个账号可以走一个
+**独立的本地 Clash 端口**（各绑一个节点 = 独立出口 IP）。
+
+**默认行为**：启动时自动开启，不需要点开关、不需要改配置（代理是基础设施，
+忘记开会让所有账号以同一真实 IP 暴露）。
+
+| 场景 | 程序的做法 |
+|---|---|
+| 你已经在 Clash 里自己配好了 listeners | **完全沿用，一个字节都不改你的配置**（端口号也用你的） |
+| 你没配（或配的端口已失效） | 自动写入 listeners 并让 Clash 热重载，无需重启 Clash |
+| 账号→节点对应关系 | 记住并默认沿用（出口 IP 必须稳定）；只有节点真的不在了才重分配那个账号 |
+| Clash 没运行 / 连不上 | 不启用代理，全部直连 —— 不影响网关服务本身 |
+
+想关掉自动开启：配置写 `proxy.auto: false`，或点界面上的「关闭代理」
+（后者只在本次运行生效，重启后仍会按默认自动开启）。
+
+日志里可以看到全过程，请求日志的 `proxy=` 列则逐条证明"这个请求走了哪个端口"：
+
+```
+07:17:37 代理（启动自动启用）：已启用：46 个节点（香港 11 · 台湾 1 · 日本 18 · 其他 16），
+         41/46 个真实可用；由本程序写入 listeners（未发现你自己配置的 listeners），沿用上次对应关系 21 个
+| #074 | 07:01:12 | deepseek-v4.1-flash | stream | 200 | acct=6797866 | proxy=127.0.0.1:34570 | ...
+```
+
+判定"用户已配好的 listeners 是否可用"用的是**实测**：拿那些端口真发一次请求
+（目标是本机 Clash 的只读接口 `/version`），能拿到响应才算数 —— 不涉及上游、
+不消耗任何额度。相关状态落在 `data/proxy-state.json` 与 `data/proxy-bindings.json`。
 
 ### 定时任务
 

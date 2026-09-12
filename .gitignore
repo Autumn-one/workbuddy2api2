@@ -32,6 +32,11 @@ data/
 
 # 独立试运行目录（隔离端口与 state，便于与生产实例并存验证）
 /run-v2/
+/run-v3/
+/run-contextfix/
+/run-fix2/
+# 隔离实例的验证证据（保留在磁盘上供核对，但不进版本库）
+/run-v4-verification.log
 # 积分功能演示实例（内含真实凭证，绝不能提交）
 /credit-demo/
 

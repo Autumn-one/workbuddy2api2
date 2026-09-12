@@ -73,9 +73,20 @@ type Config struct {
 	} `json:"pool"`
 
 	// Proxy 账号级出口代理（每个账号走一个独立本地端口 = 独立出口 IP）。
-	// 用途：上游按 IP 处置账号时，避免"同 IP 多账号"被批量风控。
+	//
+	// 默认行为（用户要求，2026-09-13）：启动时【自动开启】，不需要点开关、
+	// 也不需要在这里写任何配置。因此 Auto 的默认值必须为 true ——
+	// 零值（缺键）与显式 false 无法区分，用指针表达三态：
+	//
+	//	缺键   → Auto=true（自动开启，默认）
+	//	false  → 不自动开启（用户明确要求改配置才行）
+	//	true   → 自动开启（等同缺键）
+	//
+	// 运行期间点「关闭代理」只在内存生效：本次运行保持直连，重启后又恢复自动开启。
 	Proxy struct {
-		// Enabled 总开关。关闭时全部直连（既有行为）。
+		// Auto 启动时自动开启代理（默认 true）。
+		Auto *bool `json:"auto"`
+		// Enabled 旧键（config 驱动启用）。保留兼容：true 等价于 auto=true。
 		Enabled bool `json:"enabled"`
 		// ClashAPI 本地 Clash 外部控制地址（默认 127.0.0.1:9097）。
 		ClashAPI string `json:"clash_api"`
@@ -84,8 +95,12 @@ type Config struct {
 		// PortBase listeners 起始端口（默认 34567，连续分配）。
 		PortBase int `json:"port_base"`
 		// BindingsFile 绑定持久化路径（默认 data/proxy-bindings.json）。
-		// 必须持久化：同一账号的出口 IP 要稳定，重启后不能换。
+		// 必须持久化：同一账号的出口 IP 要稳定，重启后不能换；
+		// 同时它也是"上次对应关系"的来源，失效时才重新分配。
 		BindingsFile string `json:"bindings_file"`
+		// StateFile 接管等级持久化路径（默认 data/proxy-state.json）。
+		// 记录上次是"网关写 listeners"还是"沿用用户已配置的 listeners"。
+		StateFile string `json:"state_file"`
 		// HealthInterval 健康探测周期（duration 字符串，默认 5m）。
 		HealthInterval string `json:"health_interval"`
 	} `json:"proxy"`
@@ -220,26 +235,33 @@ func (c *Config) normalize() error {
 	if c.CreditRefreshDur, err = time.ParseDuration(c.Schedule.CreditRefresh); err != nil {
 		return fmt.Errorf("schedule.credit_refresh: %w", err)
 	}
-	// 代理默认值（关闭时不校验其余字段，避免旧配置缺键报错）
-	if c.Proxy.Enabled {
-		if c.Proxy.ClashAPI == "" {
-			c.Proxy.ClashAPI = "http://127.0.0.1:9097"
-		}
-		if c.Proxy.PortBase <= 0 {
-			c.Proxy.PortBase = 34567
-		}
-		if c.Proxy.BindingsFile == "" {
-			c.Proxy.BindingsFile = filepath.Join(filepath.Dir(c.StateFile), "proxy-bindings.json")
-		}
-		if c.Proxy.HealthInterval == "" {
-			c.Proxy.HealthInterval = "5m"
-		}
-		if c.HealthIntervalDur, err = time.ParseDuration(c.Proxy.HealthInterval); err != nil {
-			return fmt.Errorf("proxy.health_interval: %w", err)
-		}
-		if c.HealthIntervalDur <= 0 {
-			c.HealthIntervalDur = 5 * time.Minute
-		}
+	// 代理默认值：无论是否启用都要填好——启动自动开启是本项目的默认行为，
+	// 用户不该为了"能用"而先写配置（这正是本功能被要求的初衷）。
+	if c.Proxy.ClashAPI == "" {
+		c.Proxy.ClashAPI = "http://127.0.0.1:9097"
+	}
+	if c.Proxy.PortBase <= 0 {
+		c.Proxy.PortBase = 34567
+	}
+	if c.Proxy.BindingsFile == "" {
+		c.Proxy.BindingsFile = filepath.Join(filepath.Dir(c.StateFile), "proxy-bindings.json")
+	}
+	if c.Proxy.StateFile == "" {
+		c.Proxy.StateFile = filepath.Join(filepath.Dir(c.StateFile), "proxy-state.json")
+	}
+	if c.Proxy.HealthInterval == "" {
+		c.Proxy.HealthInterval = "5m"
+	}
+	if c.HealthIntervalDur, err = time.ParseDuration(c.Proxy.HealthInterval); err != nil {
+		return fmt.Errorf("proxy.health_interval: %w", err)
+	}
+	if c.HealthIntervalDur <= 0 {
+		c.HealthIntervalDur = 5 * time.Minute
+	}
+	// 旧键 proxy.enabled=true 等价于自动开启（保持既有配置的兼容行为）。
+	if c.Proxy.Enabled && c.Proxy.Auto == nil {
+		on := true
+		c.Proxy.Auto = &on
 	}
 	if c.CreditRefreshDur < 0 {
 		c.CreditRefreshDur = 0
@@ -268,4 +290,22 @@ func (c *Config) normalize() error {
 		c.Listen = ":" + c.Listen
 	}
 	return nil
+}
+
+// ProxyAuto 报告"启动时是否应自动开启代理"。
+//
+// 三态语义（见 Config.Proxy.Auto 的注释）：
+//   - 缺键（nil）→ true：默认自动开启，用户不需要改配置；
+//   - 显式 false → false：不自动开启；
+//   - 显式 true → true。
+//
+// 旧键 proxy.enabled=true 也归一化为 true（已在上面的 normalize 里处理）。
+func (c *Config) ProxyAuto() bool {
+	if c == nil {
+		return false
+	}
+	if c.Proxy.Auto != nil {
+		return *c.Proxy.Auto
+	}
+	return true
 }

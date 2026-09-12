@@ -92,8 +92,11 @@ type Binding struct {
 // Registry 账号到代理端口的分配表（线程安全）。
 type Registry struct {
 	mu        sync.RWMutex
-	listeners []Listener        // 按地区优先级排好序
-	byUID     map[string]int    // uid → listeners 下标
+	listeners []Listener     // 按地区优先级排好序
+	byUID     map[string]int // uid → listeners 下标
+	// removed 被显式解绑（账号删除）的 uid：落盘时不再写回它们的对应关系，
+	// 否则"删掉的账号"会从磁盘上的历史记录里复活。
+	removed   map[string]bool
 	unhealthy map[int]time.Time // 端口 → 标记不健康的时间
 	// delays 最近一次延迟探测结果（节点名 → 毫秒；0/缺失 = 不可用）。
 	// 仅用于"按延迟自动选节点"与界面展示，不参与健康判定（健康看 unhealthy）。
@@ -114,6 +117,7 @@ func NewRegistry(ls []Listener) *Registry {
 	return &Registry{
 		listeners: sorted,
 		byUID:     map[string]int{},
+		removed:   map[string]bool{},
 		unhealthy: map[int]time.Time{},
 		delays:    map[string]int{},
 	}
@@ -150,6 +154,37 @@ func (r *Registry) MarkUnhealthy(port int) {
 	if _, ok := r.unhealthy[port]; !ok {
 		r.unhealthy[port] = time.Now()
 	}
+}
+
+// ListenerIndex 返回指定节点名对应的 listener 下标（不存在 → -1）。
+func (r *Registry) ListenerIndex(node string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for i, l := range r.listeners {
+		if l.Node == node {
+			return i
+		}
+	}
+	return -1
+}
+
+// Adopt 采纳一条已有绑定（uid → 节点名），成功返回 true。
+//
+// 用途：启动时把上次落盘的对应关系原样搬进注册表，保证出口 IP 稳定。
+// 与 SetNodeForAccount 行为一致（校验节点存在后写入），分开命名只为让调用点自解释：
+// 那里是"用户手动指定"，这里是"继承上次的对应关系"。
+func (r *Registry) Adopt(uid, node string) bool {
+	if uid == "" || node == "" {
+		return false
+	}
+	idx := r.ListenerIndex(node)
+	if idx < 0 {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byUID[uid] = idx
+	return true
 }
 
 // Assign 返回账号应使用的 listener（稳定绑定）。
@@ -240,6 +275,7 @@ func (r *Registry) Unassign(uid string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.byUID, uid)
+	r.removed[uid] = true
 }
 
 // EnsureAllAssigned 一次性为给定账号建立绑定（已绑定的保持不变）。

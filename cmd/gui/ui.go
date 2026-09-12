@@ -435,7 +435,7 @@ func (a *app) buildUI() error {
 								Layout: dcl.HBox{Spacing: 10},
 								Children: []dcl.Widget{
 									// 一键开关：自动发现 Clash + 自动配置 + 运行期生效（无需改配置/重启）。
-									dcl.PushButton{AssignTo: &a.btnProxyToggle, Text: "一键开启代理", MinSize: dcl.Size{Width: 130}, OnClicked: a.doToggleProxy},
+									dcl.PushButton{AssignTo: &a.btnProxyToggle, Text: "开启代理", MinSize: dcl.Size{Width: 130}, OnClicked: a.doToggleProxy},
 									dcl.Label{AssignTo: &a.lblProxyState, Text: "○ 未开启（全部直连）", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
 									dcl.HSpacer{},
 									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
@@ -454,7 +454,7 @@ func (a *app) buildUI() error {
 									},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblProxyHint, Text: "点「一键开启代理」即可使用。"},
+							dcl.Label{AssignTo: &a.lblProxyHint, Text: "启动时会自动开启；也可以点「开启代理」立即开启。"},
 							dcl.TableView{
 								AssignTo:         &a.tvProxyBindings,
 								Model:            a.proxyBindings,
