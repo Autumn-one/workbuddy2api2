@@ -372,6 +372,9 @@ type proxyBindingRow struct {
 	Port    int
 	Region  string
 	Healthy bool
+	// Delay 该节点的真实延迟（毫秒）；0 = 未探测或不可用。
+	// 用户明确要看到延迟——探测结果必须落到表格里，不能只存内部状态。
+	Delay int
 }
 
 type proxyBindingModel struct {
@@ -392,14 +395,21 @@ func (m *proxyBindingModel) Value(row, col int) interface{} {
 	case 1:
 		return r.Node
 	case 2:
-		return itoa(int64(r.Port))
+		// 延迟列：用户最关心的指标（哪个节点快）。未探测/不可用显示 "—"。
+		if r.Delay > 0 {
+			return fmt.Sprintf("%dms", r.Delay)
+		}
+		return "—"
 	case 3:
 		return r.Region
 	case 4:
 		if r.Healthy {
-			return "正常"
+			return "可用"
 		}
-		return "不通"
+		return "不可用"
+	case 5:
+		// 本地端口放最后：排查用，日常不需要看。
+		return itoa(int64(r.Port))
 	default:
 		return ""
 	}

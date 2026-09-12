@@ -35,12 +35,11 @@ func (a *app) buildUI() error {
 	mw := dcl.MainWindow{
 		AssignTo: &a.mw,
 		Title:    appName + " · 控制台",
-		Icon:     ic,
-		MinSize:  dcl.Size{Width: 860, Height: 580},
-		// 默认宽度收窄：此前 1080 是为"模型"页的 12 列表格留的空间，
-		// 但多数页面用不到那么宽，默认开着偏空。表格本身可横向滚动，
-		// 需要更多空间时用户拖窗口即可。
-		Size:   dcl.Size{Width: 980, Height: 680},
+		Icon:    ic,
+		MinSize: dcl.Size{Width: 800, Height: 540},
+		// 尺寸：多数页面用不到宽窗口（表格可横向滚动，需要时用户拖大即可）。
+		// 从 1080 逐步收窄到 880。
+		Size:   dcl.Size{Width: 880, Height: 620},
 		Font:   dcl.Font{Family: "Segoe UI", PointSize: 9},
 		Layout: dcl.VBox{MarginsZero: false},
 		Children: []dcl.Widget{

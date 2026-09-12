@@ -108,6 +108,13 @@ func (r *Registry) ApplyDelays(delays map[string]int) {
 	}
 }
 
+// DelayOf 返回某节点最近一次探测到的延迟（毫秒）；0 = 未探测或不可用。
+func (r *Registry) DelayOf(node string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.delays[node]
+}
+
 // NodeOption 界面用的"可选节点"（含健康状态与延迟）。
 type NodeOption struct {
 	Node    string

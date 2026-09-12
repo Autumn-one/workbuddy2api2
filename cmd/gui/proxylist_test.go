@@ -16,25 +16,33 @@ import (
 //
 // 本文件锁定"列表该显示什么"的行为。
 
-// TestProxyBindingModelRows 表格列映射（账号/节点名/端口/地区/连通）。
+// TestProxyBindingModelRows 表格列映射（账号/节点名/延迟/地区/状态/端口）。
+//
+// 缺陷背景（用户反馈"点击探测后看不到延迟"）：延迟取到了但只存在内部状态，
+// 既没填进 proxyBindingRow、也没有对应列 —— 用户看不到。
+// 现在延迟是独立一列（第 2 列），端口挪到最后。
 func TestProxyBindingModelRows(t *testing.T) {
 	m := &proxyBindingModel{}
 	m.Replace([]proxyBindingRow{
-		{UID: "u1", Name: "木瓜", Node: "🇭🇰 香港Y01", Port: 34567, Region: "香港", Healthy: true},
+		{UID: "u1", Name: "木瓜", Node: "🇭🇰 香港Y01", Port: 34567, Region: "香港", Healthy: true, Delay: 34},
 		{UID: "u2", Name: "138", Node: "🇯🇵 日本Y01", Port: 34568, Region: "日本", Healthy: false},
 	})
 	if m.RowCount() != 2 {
 		t.Fatalf("行数=%d want 2", m.RowCount())
 	}
-	// 列序：0 账号 | 1 出口节点 | 2 本地端口 | 3 地区 | 4 连通
-	want := []string{"木瓜", "🇭🇰 香港Y01", "34567", "香港", "正常"}
+	// 列序：0 账号 | 1 出口节点 | 2 延迟 | 3 地区 | 4 状态 | 5 端口
+	want := []string{"木瓜", "🇭🇰 香港Y01", "34ms", "香港", "可用", "34567"}
 	for col, w := range want {
 		if got := m.Value(0, col); got != w {
 			t.Errorf("列 %d=%v want %q", col, got, w)
 		}
 	}
-	if got := m.Value(1, 4); got != "不通" {
-		t.Errorf("不健康应显示'不通', got %v", got)
+	// 未探测到延迟（0）显示 "—"（区分"慢"与"没数据"）
+	if got := m.Value(1, 2); got != "—" {
+		t.Errorf("无延迟数据应显示 '—', got %v", got)
+	}
+	if got := m.Value(1, 4); got != "不可用" {
+		t.Errorf("不健康应显示'不可用', got %v", got)
 	}
 }
 

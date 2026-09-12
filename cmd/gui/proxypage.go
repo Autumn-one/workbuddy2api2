@@ -104,6 +104,7 @@ func (a *app) refreshProxyBindings() {
 			Port:    b.Port,
 			Region:  b.Region.String(),
 			Healthy: a.proxyReg.Healthy(b.Port),
+			Delay:   a.proxyReg.DelayOf(b.Node),
 		})
 	}
 	a.proxyBindings.Replace(rows)
