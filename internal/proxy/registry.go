@@ -238,6 +238,25 @@ func (r *Registry) Unassign(uid string) {
 	delete(r.byUID, uid)
 }
 
+// EnsureAllAssigned 一次性为给定账号建立绑定（已绑定的保持不变）。
+//
+// 用途（修设计缺陷）：界面开启代理后需要【立刻】看到全部账号各自绑到哪个节点。
+// 此前绑定是懒执行的（要等请求打到该账号才 Assign），导致列表默认空白——
+// 用户以为功能没生效。现在开启时调用本方法一次填满，且不改动已有绑定（IP 稳定）。
+func (r *Registry) EnsureAllAssigned(uids []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, uid := range uids {
+		if uid == "" {
+			continue
+		}
+		if _, ok := r.byUID[uid]; ok {
+			continue // 已有绑定：保持不动（IP 必须稳定）
+		}
+		r.assignLocked(uid)
+	}
+}
+
 // Snapshot 返回当前所有绑定（界面展示"哪个账号在用哪个节点"）。
 func (r *Registry) Snapshot() []Binding {
 	r.mu.RLock()

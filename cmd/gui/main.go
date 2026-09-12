@@ -366,6 +366,7 @@ type checkinRow struct {
 
 // proxyBindingRow 代理绑定表一行（账号 → 出口节点）。
 type proxyBindingRow struct {
+	UID     string // 账号 UID（切换节点时定位用；界面不显示）
 	Name    string // 昵称（无则 UID 短）
 	Node    string // 可读节点名（用户明确要求显示 Clash 里的名字）
 	Port    int
@@ -402,6 +403,14 @@ func (m *proxyBindingModel) Value(row, col int) interface{} {
 	default:
 		return ""
 	}
+}
+
+// At 返回第 i 行（供切换/选中使用）。
+func (m *proxyBindingModel) At(i int) (proxyBindingRow, bool) {
+	if i < 0 || i >= len(m.items) {
+		return proxyBindingRow{}, false
+	}
+	return m.items[i], true
 }
 
 func (m *proxyBindingModel) Replace(items []proxyBindingRow) {

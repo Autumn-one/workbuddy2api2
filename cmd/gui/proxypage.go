@@ -76,13 +76,29 @@ func (a *app) autoEnableProxyAtStartup() {
 
 // refreshProxyBindings 刷新账号页的代理绑定显示（哪个账号在用哪个节点）。
 func (a *app) refreshProxyBindings() {
-	if a.tvProxyBindings == nil || a.proxyReg == nil {
+	// 只依赖 model（表格控件由 declarative 绑定，model 才是数据源）。
+	// 这样在无 GUI 的测试环境里也能验证列表行为，不必构造控件。
+	if a.proxyBindings == nil {
 		return
 	}
+	// 代理已关闭：必须清空列表（否则旧行会残留在界面上，看起来"还开着"）。
+	if a.proxyReg == nil {
+		a.proxyBindings.Replace(nil)
+		return
+	}
+	// 代理运行期新增的账号可能还没有绑定（分配是懒执行的）→ 先补齐，
+	// 保证列表始终显示"全部账号各自走哪个节点"，不漏行。
+	uids := make([]string, 0, len(a.svc.Accounts()))
+	for _, st := range a.svc.Accounts() {
+		uids = append(uids, st.UID)
+	}
+	a.proxyReg.EnsureAllAssigned(uids)
+
 	snap := a.proxyReg.Snapshot()
 	rows := make([]proxyBindingRow, 0, len(snap))
 	for _, b := range snap {
 		rows = append(rows, proxyBindingRow{
+			UID:     b.UID,
 			Name:    a.displayName(b.UID),
 			Node:    b.Node, // 可读节点名（不是 URL）——用户明确要求
 			Port:    b.Port,
@@ -98,32 +114,56 @@ func (a *app) refreshProxyBindings() {
 	}
 }
 
-// doSwitchAccountNode 把选中账号换到下一个健康节点（用户要求可手动切换）。
+// doSwitchAccountNode 把【代理列表里选中的那一行】换到另一个健康节点。
+//
+// 设计修正（用户反馈）：此前读的是【账号页】的选中行，却放在代理页——
+// 点了会"凭空冒出一行"（给那个账号新分配节点）。现在只作用于代理列表自身的选中行。
 func (a *app) doSwitchAccountNode() {
 	if a.proxyReg == nil {
-		a.lblAccts2.SetText("代理未启用（在「配置」页打开 proxy.enabled 后重启）")
+		a.lblProxyHint.SetText("代理未启用：请先点「一键开启代理」")
 		return
 	}
-	items := a.svc.Accounts()
-	a.takeSelection(func(idx int) {
-		if idx < 0 || idx >= len(items) {
-			a.lblAccts2.SetText("请先在表格里选中一个账号")
+	if a.tvProxyBindings == nil {
+		return
+	}
+	idx := a.tvProxyBindings.CurrentIndex()
+	row, ok := a.proxyBindings.At(idx)
+	if !ok {
+		a.lblProxyHint.SetText("请先在上面的列表里选中一个账号")
+		return
+	}
+	uid := row.UID
+	if uid == "" {
+		a.lblProxyHint.SetText("请先在上面的列表里选中一个账号")
+		return
+	}
+	before := a.proxyReg.NodeFor(uid)
+	l, ok := a.proxyReg.Rebind(uid)
+	if !ok {
+		a.lblProxyHint.SetText("没有其他健康节点可切换")
+		return
+	}
+	a.proxyReg.SaveBindings(a.proxyBindingsPath)
+	a.refreshProxyBindings()
+	// 保持选中行（refreshProxyBindings 会重建表格）
+	a.selectProxyBinding(uid)
+	a.lblProxyHint.SetText(fmt.Sprintf("%s：%s → %s（端口 %d）",
+		a.displayName(uid), orDash(before), l.Node, l.Port))
+	log.Printf("代理：账号 %s 切换节点 %s → %s（端口 %d）",
+		a.displayName(uid), orDash(before), l.Node, l.Port)
+}
+
+// selectProxyBinding 在代理绑定表里选中指定账号那一行（找不到则不动）。
+func (a *app) selectProxyBinding(uid string) {
+	if a.tvProxyBindings == nil {
+		return
+	}
+	for i := 0; i < a.proxyBindings.RowCount(); i++ {
+		if r, ok := a.proxyBindings.At(i); ok && r.UID == uid {
+			_ = a.tvProxyBindings.SetCurrentIndex(i)
 			return
 		}
-		uid := items[idx].UID
-		before := a.proxyReg.NodeFor(uid)
-		l, ok := a.proxyReg.Rebind(uid)
-		if !ok {
-			a.lblAccts2.SetText("没有其他健康节点可切换")
-			return
-		}
-		a.proxyReg.SaveBindings(a.proxyBindingsPath)
-		a.refreshProxyBindings()
-		a.lblAccts2.SetText(fmt.Sprintf("%s 的出口节点：%s → %s",
-			a.displayName(uid), orDash(before), l.Node))
-		log.Printf("代理：账号 %s 切换节点 %s → %s（端口 %d）",
-			a.displayName(uid), orDash(before), l.Node, l.Port)
-	})
+	}
 }
 
 // doProbeProxiesNow 立即探测一轮代理健康（用户手动触发，低成本：只连本地端口）。
@@ -246,6 +286,14 @@ func (a *app) enableProxyNow() (string, error) {
 	}
 	reg.LoadBindings(bindPath)
 
+	// 【关键】为全部账号立刻建立绑定：让界面一开启就显示"每个账号走哪个节点"，
+	// 而不是等请求发生才懒分配（那样列表默认空白，用户以为没生效）。
+	uids := make([]string, 0, len(a.svc.Accounts()))
+	for _, st := range a.svc.Accounts() {
+		uids = append(uids, st.UID)
+	}
+	reg.EnsureAllAssigned(uids)
+
 	// 自动应用 listeners 到 Clash（运行期重载，无需重启 Clash）
 	if _, err := proxy.ApplyListeners(ep.API, ep.Secret, dir, ls); err != nil {
 		return "", fmt.Errorf("应用到 Clash 失败: %w", err)
@@ -306,6 +354,7 @@ func (a *app) disableProxyNow() (string, error) {
 		}
 	}
 	a.proxyReg = nil
+	a.refreshProxyBindings() // 清空列表（否则旧行残留，看起来还开着）
 	return "已关闭：立即回落直连（Clash 里的自动配置已清理）", nil
 }
 
