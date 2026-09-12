@@ -54,6 +54,7 @@ func TestClassifyProbeFailure(t *testing.T) {
 		{upstream.ErrNotFound, "接口 404"},
 		{upstream.ErrServer, "上游 5xx"},
 		{upstream.ErrClient, "请求被上游拒绝"},
+		{upstream.ErrContextOverflow, "输入超出模型上下文上限"},
 	}
 	for _, c := range cases {
 		if got := probeFailureText(c.kind, "raw"); !strings.Contains(got, c.want) {

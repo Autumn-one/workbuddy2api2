@@ -378,6 +378,23 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
+			// 上下文超限（11115）：确定性失败，与账号无关——不再轮转，立即原样上报。
+			//
+			// 为什么不换号：请求体自身超出模型上限，换任何账号都是同一个 body、
+			// 同一样被拒（生产实测：11 个请求各连撞 5 次全败，每次白耗 ~30 秒）。
+			// 为什么不做账号处置：这不是账号故障，冷却/熔断会误伤好账号。
+			//
+			// 上报方式：原样透传上游 body（含 displayMsg 多语言文案），并保留上游
+			// 状态码。客户端（如 pi）靠 extError.code=context_length_exceeded 或
+			// 文案特征识别溢出，才能触发"压缩上下文后重试"的自动恢复。
+			//
+			// 注意：此处【不调用】fail(acct.UID)，仅释放在途租约（否则该账号名额
+			// 会被本请求一直占着到 next 轮转）。
+			if kind == upstream.ErrContextOverflow {
+				releaseHeld()
+				h.writeUpstreamBody(w, status, respBody)
+				return
+			}
 			h.applyErrorPolicy(acct, st.model, kind, status, string(respBody))
 			fail(acct.UID)
 			continue
@@ -487,6 +504,8 @@ func isParseFailure(err error) bool {
 //     达到 breakerThreshold 触发熔断（指数退避）。
 //   - ErrModelRateLimit → 按【账号×模型】短冷却（10 分钟起、翻倍、封顶 60 分钟）：
 //     不做账号级处置、不喂熔断；不采信报文里的重置时刻。
+//   - ErrContextOverflow → 【不会走到这里】：caller 在调用前已 return（不换号、
+//     不罚账号、原样上报上游 body）。保留在 switch 外是为了让"不做处置"显式可见。
 //   - 其他（default：ErrClient/ErrNone）→ 只换号不罚（防雪崩），不喂熔断。
 //
 // 恢复出口：CoolSoft/CoolHard 各自到期自动恢复；熔断按其指数退避截止到期；
@@ -579,4 +598,20 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// writeUpstreamBody 把上游错误响应体【原样】透传给客户端，并保留上游状态码。
+//
+// 为什么不包一层 OpenAI 错误格式：上游 body 里带"客户端可识别"的信息（实测
+// displayMsg 中/英/繁三语文案 + extError.code=context_length_exceeded），
+// 而 pi 这类客户端正是靠 extError.code（或文案特征）识别"上下文超限"，
+// 进而自动压缩上下文并重试的。包成 {error:{message:...}} 虽更符合 OpenAI 形状，
+// 但会让客户端把它当普通错误、白白丢掉这条可恢复信号。
+//
+// 内容类型：上游错误体一律是 JSON；此处不强改 header 为 text/event-stream
+// （非流式错误响应，客户端按 JSON 解析）。写失败（客户端断开）无补救，忽略。
+func (h *Handler) writeUpstreamBody(w http.ResponseWriter, status int, body []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
 }

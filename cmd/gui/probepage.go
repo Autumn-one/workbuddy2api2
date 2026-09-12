@@ -84,6 +84,8 @@ func probeFailureText(kind upstream.ErrKind, detail string) string {
 		why = "上游 5xx"
 	case upstream.ErrClient:
 		why = "请求被上游拒绝"
+	case upstream.ErrContextOverflow:
+		why = "输入超出模型上下文上限"
 	default:
 		why = "未知错误"
 	}

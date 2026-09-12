@@ -62,6 +62,25 @@ const (
 	// 也应被拒。按"客户端错误只换号不罚"处理会让被标记的账号反复被选中、
 	// 每次白撞一次上游往返（并让请求多一跳延迟），故需要独立的短期冷却。
 	ErrContentRejected
+
+	// ErrContextOverflow 输入超出模型上下文上限（code=11115 / context_length_exceeded）。
+	//
+	// 实测报文（WorkBuddy 上游，2026-09-13）：
+	//   {"code":11115,"msg":"input length too long",
+	//    "extError":{"code":"context_length_exceeded","message":"input length too long"},
+	//    "displayMsg":{"zh-hans":"对话内容超出模型长度上限，请精简对话或减少附件后重试。",...}}
+	//
+	// 生产实证（决定处置策略的关键）：
+	//   2026-09-13 04:04-04:10，11 个请求各连撞 5 次本错误（共 50 次），
+	//   每次白耗 19.5~37.2 秒（5 次轮转 × 约 6 秒），最终必然以 503 收尾。
+	//   同一时刻、同一批账号的普通请求 ctx 高达 984,790 却返回 200——
+	//   可见【同账号既接受 98 万 token 的普通请求，又拒绝压缩请求】。
+	//
+	// 因此这不是账号故障，而是【请求体自身尺寸】决定的确定性失败：
+	// 换任何一个账号，同一个超长 body 都一样会被拒。故必须【不换号、不罚账号、
+	// 立即原样上报】，否则既浪费上游往返与用户等待，又把真实原因（上下文超限）
+	// 淹没成"所有账号不可用"，让客户端无法据此触发压缩恢复。
+	ErrContextOverflow
 )
 
 func (k ErrKind) String() string {
@@ -82,6 +101,8 @@ func (k ErrKind) String() string {
 		return "model_rate_limit"
 	case ErrContentRejected:
 		return "content_rejected"
+	case ErrContextOverflow:
+		return "context_overflow"
 	default:
 		return "none"
 	}
@@ -120,6 +141,18 @@ var modelRateLimitMarkers = []string{
 	"frequency limit", "model usage limit", "rate limit exceeded",
 }
 
+// contextOverflowMarkers 上下文超限关键词（code=11115 / context_length_exceeded）。
+//
+// 判据刻意取【结构化字段名】而非泛化文案（如 "too long"/"too many tokens"）：
+// 后者会误吸 429 限流、413 体积超限等本质不同的错误，把它们错判成"别换号了"。
+// 实测上游同时给出 code=11115 与 extError.code=context_length_exceeded。
+var contextOverflowMarkers = []string{
+	"context_length_exceeded",
+	"input length too long",
+	`"code":11115`,
+	`"code": 11115`,
+}
+
 // modelContextMarkers 模型语境关键词（与频率限制类关键词合取判定）。
 var modelContextMarkers = []string{
 	"切换其他模型", "其他模型", "模型的使用量", "该模型", "模型已",
@@ -134,6 +167,86 @@ type ModelRateLimitEvidence struct {
 	Status int    // HTTP 状态码
 	Model  string // 报文里点名的模型（可能为空：上游没点名就不猜）
 	Msg    string // 原始报文片段（截断）
+}
+
+// contextOverflowDetail 从超限报文里抽出可读线索，供日志使用。
+//
+// 上游报文实测形如：
+//
+//	{"code":11115,"msg":"input length too long","requestId":"...",
+//	 "extError":{"code":"context_length_exceeded","message":"input length too long","type":"invalid_request_error"},
+//	 "displayMsg":{"zh-hans":"...","zh-hant":"...","en":"..."}}
+//
+// 截断到 200 字符时，真正有用的 extError 与 displayMsg 恰好都在后面被切掉，
+// 所以这里按字段抽取（而不是继续截断正文）。
+//
+// 日志安全：
+//   - 不输出 requestId（无诊断价值，且属可关联的单次请求标识）；
+//   - displayMsg 只取 zh-hans/en 两条（繁中与简中信息等价）；
+//   - 各字段分别限长，避免一条日志刷屏；
+//   - 不输出 messages 正文，因此绝不会打印用户对话内容或凭证。
+func contextOverflowDetail(raw string) string {
+	var env struct {
+		Msg      string `json:"msg"`
+		ExtError struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"extError"`
+		DisplayMsg struct {
+			ZhHans string `json:"zh-hans"`
+			En     string `json:"en"`
+		} `json:"displayMsg"`
+	}
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		// 非 JSON / 截断：退回通用的短截断，至少留下原文片段。
+		return "body=" + truncate(raw, 200)
+	}
+	var b strings.Builder
+	if env.Msg != "" {
+		b.WriteString("msg=" + truncate(env.Msg, 80))
+	}
+	if env.ExtError.Code != "" {
+		b.WriteString(" extError.code=" + truncate(env.ExtError.Code, 60))
+	}
+	if env.ExtError.Type != "" {
+		b.WriteString(" extError.type=" + truncate(env.ExtError.Type, 40))
+	}
+	if env.DisplayMsg.ZhHans != "" {
+		b.WriteString(" zh=" + truncate(env.DisplayMsg.ZhHans, 120))
+	}
+	if env.DisplayMsg.En != "" {
+		b.WriteString(" en=" + truncate(env.DisplayMsg.En, 120))
+	}
+	return b.String()
+}
+
+// isContextOverflow 判定报文是否描述"输入超出模型上下文上限"。
+//
+// 与 isContentRejection 同构：能解析出业务 code 时以 code 为准（11115），
+// 解析不到（非 JSON / 截断）再回落文案特征串。这样即使报文被截断成 200 字符
+// 片段（日志正是如此），也仍能正确分类。
+func isContextOverflow(body string) bool {
+	if body == "" {
+		return false
+	}
+	var env struct {
+		Code *int `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &env) == nil && env.Code != nil {
+		if *env.Code == 11115 {
+			return true
+		}
+		// code 存在且不是 11115：不做文案兜底，避免误判。
+		return false
+	}
+	lower := strings.ToLower(body)
+	for _, m := range contextOverflowMarkers {
+		if strings.Contains(lower, strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 // isModelRateLimit 判定报文是否描述"模型级频率限制"。
@@ -289,6 +402,12 @@ func Classify(status int, body string) ErrKind {
 	// 放在余额/session/6004 之后：那些类别优先级更高（同报文可能叠加多种特征）。
 	if isContentRejection(body) {
 		return ErrContentRejected
+	}
+	// 上下文超限（11115）：先于通用 4xx。
+	// 位置说明：放在余额/6004/11140 之后——那几类是"账号或额度"语义，优先级更高；
+	// 本类只描述"这个请求体太大"，与账号无关，需先于 ErrClient 才能阻止无谓轮转。
+	if isContextOverflow(body) {
+		return ErrContextOverflow
 	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
@@ -512,8 +631,19 @@ func (c *Client) ChatStreamWithParams(a *auth.Auth, body []byte) (rc io.ReadClos
 		resp.Body.Close()
 		cancel()
 		kind := Classify(resp.StatusCode, string(raw))
-		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		// 上下文超限：额外记录出站体积与上游给的全部可读线索。
+		//
+		// 为什么必须单列：正文只有 "input length too long"，不含任何 token 数，
+		// 而 200 字符截断又把 displayMsg 切掉了——2026-09-13 排查时，
+		// 只能靠"反推 pi 的压缩阈值"才能确定超限，非常费力。有了 reqBytes
+		// （近似 token = reqBytes/4）与 extError/displayMsg 原文，下次可直接定位。
+		if kind == ErrContextOverflow {
+			log.Printf("chat_stream uid=%s: upstream %d %s reqBytes=%d ~tok=%d %s",
+				a.UID, resp.StatusCode, kind, len(prepared), len(prepared)/4, contextOverflowDetail(string(raw)))
+		} else {
+			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
+				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		}
 		return nil, resp.StatusCode, raw, params, nil
 	}
 	// 成功分支：cancel 所有权交给 monitorBody（其 Close 会 cancel）；
