@@ -392,7 +392,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 会被本请求一直占着到 next 轮转）。
 			if kind == upstream.ErrContextOverflow {
 				releaseHeld()
-				h.writeUpstreamBody(w, status, respBody)
+				h.writeUpstreamError(w, status, respBody)
 				return
 			}
 			h.applyErrorPolicy(acct, st.model, kind, status, string(respBody))
@@ -600,18 +600,51 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	})
 }
 
-// writeUpstreamBody 把上游错误响应体【原样】透传给客户端，并保留上游状态码。
+// writeUpstreamError 以【OpenAI 错误信封】返回上游错误，同时保留上游原始字段。
 //
-// 为什么不包一层 OpenAI 错误格式：上游 body 里带"客户端可识别"的信息（实测
-// displayMsg 中/英/繁三语文案 + extError.code=context_length_exceeded），
-// 而 pi 这类客户端正是靠 extError.code（或文案特征）识别"上下文超限"，
-// 进而自动压缩上下文并重试的。包成 {error:{message:...}} 虽更符合 OpenAI 形状，
-// 但会让客户端把它当普通错误、白白丢掉这条可恢复信号。
+// 为什么不能直接原样透传上游 body（实测教训 2026-09-13 05:44）：
+// openai SDK 在非 2xx 时只读 body 的 `error` 键（core/error.mjs 的
+// `errorResponse?.['error']`），取不到就丢掉整个 body，报
+// "400 status code (no body)"。上游 body 用的是自有形状
+// {code,msg,extError,displayMsg}，没有 `error` 键——所以原样透传反而让
+// 客户端拿不到任何信息，pi 连 "context_length_exceeded" 都看不到。
 //
-// 内容类型：上游错误体一律是 JSON；此处不强改 header 为 text/event-stream
-// （非流式错误响应，客户端按 JSON 解析）。写失败（客户端断开）无补救，忽略。
-func (h *Handler) writeUpstreamBody(w http.ResponseWriter, status int, body []byte) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_, _ = w.Write(body)
+// 因此这里同时输出两套字段：
+//   - error.{message,type,code}：OpenAI 标准信封，供 SDK 解析；
+//   - code/msg/extError/displayMsg：上游原始字段，保留给能识别它们的客户端。
+//
+// message 开头【必须】带上游 extError.code（"context_length_exceeded"）：
+// pi 的溢出识别读的是 errorMessage（实现在 pi-ai/utils/overflow.js），
+// 只认模式串。把该码放在行首，"上下文超限" 才能被识别并触发压缩恢复。
+func (h *Handler) writeUpstreamError(w http.ResponseWriter, status int, body []byte) {
+	out := map[string]any{}
+	// 保留上游原始字段（无损：解析失败就退化为空信封，不报错）。
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err == nil && raw != nil {
+		for k, v := range raw {
+			out[k] = v
+		}
+	}
+	// 组装 OpenAI 信封；message 以可识别的溢出码开头。
+	msg := "upstream error"
+	if ev, ok := upstream.ParseContextOverflowMsg(status, string(body)); ok && ev.Code != "" {
+		msg = ev.Code
+		if ev.Text != "" {
+			msg += ": " + ev.Text
+		}
+	} else if s, ok := raw["msg"].(string); ok && s != "" {
+		msg = s
+	}
+	typ := "api_error"
+	if ext, ok := raw["extError"].(map[string]any); ok {
+		if t, ok := ext["type"].(string); ok && t != "" {
+			typ = t
+		}
+	}
+	out["error"] = map[string]any{
+		"message": msg,
+		"type":    typ,
+		"code":    "context_length_exceeded",
+	}
+	writeJSON(w, status, out)
 }

@@ -51,9 +51,23 @@ func TestChatContextOverflowDoesNotRotate(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status=%d body=%s want 400", rec.Code, rec.Body)
 	}
-	// 3) 原样透传：字节级一致，extError.code 与 displayMsg 都必须在。
-	if got := rec.Body.String(); got != upstreamBody {
-		t.Errorf("body 未原样透传:\n got=%.200s\nwant=%.200s", got, upstreamBody)
+	// 3) 响应必须同时满足两件事：带 OpenAI 信封（SDK 才读得到，见
+	//    core/error.mjs）且保留上游原始字段（诊断与其它客户端用）。
+	//
+	// 实测教训：只原样透传上游 body 时，openai SDK 因找不到 `error` 键而把
+	// 整个 body 丢掉，pi 只看到 "400 status code (no body)" —— 连
+	// context_length_exceeded 都看不到，自动压缩永远不会触发。
+	got := rec.Body.String()
+	for _, want := range []string{
+		`"error"`,                 // SDK 读取入口
+		"context_length_exceeded", // pi 的溢出识别模式串
+		`"code":11115`,            // 上游原始字段
+		"displayMsg",              // 上游多语言文案
+		"对话内容超出模型长度上限",            // 面向人的中文说明
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("响应缺少 %q:\n%s", want, got)
+		}
 	}
 	var env map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
@@ -180,5 +194,22 @@ func TestContextOverflowEndToEndOverSocket(t *testing.T) {
 	// 旧行为：5 次轮转 × 每次约 6 秒。此处应远低于此（真实网络 + 本地 fake 应 < 1s）。
 	if elapsed > 3*time.Second {
 		t.Errorf("耗时 %v 过长——疑似仍在轮转", elapsed)
+	}
+}
+
+// TestNonOverflowErrorKeepsOldEnvelope 回归：非超限错误（换号耗尽 → 503）仍走
+// 原有 OpenAI 错误格式，未被本次"超限单独处理"的改动影响。
+func TestNonOverflowErrorKeepsOldEnvelope(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 402, `{"code":1,"msg":"余额不足"}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	rec := httptestPost(h, `{"model":"glm-5.2","messages":[]}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
+		t.Errorf("非超限错误仍应是 no_healthy_account 信封:\n%s", rec.Body)
 	}
 }

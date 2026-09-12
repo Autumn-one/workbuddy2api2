@@ -314,6 +314,57 @@ func ParseModelRateLimitFromMsg(status int, msg string) (ModelRateLimitEvidence,
 // parseModelRateLimitModel 从 6004 报文里提取上游点名的模型名。
 // 实测文案形如："您对模型的使用量已超出频率限制" / "模型 [xxx] 的使用量已超出频率限制"。
 // 提取策略（保守）：优先取「模型 [X]」/「模型 X 的」中的 X；取不到返回空串，绝不猜测。
+// ContextOverflowEvidence 上下文超限（11115）的可上报信息。
+//
+// Code 是上游 extError.code（实测 "context_length_exceeded"）——它必须出现在
+// 客户端看到的错误 message 里，因为 pi 的溢出识别只做模式匹配
+// （pi-ai/utils/overflow.js），靠它才能触发"压缩上下文后重试"的自动恢复。
+// Text 是面向人的说明（优先中/英文 displayMsg）。
+type ContextOverflowEvidence struct {
+	Code string
+	Text string
+}
+
+// ParseContextOverflowMsg 从超限报文里提取可上报的信息；非该类报文返回 false。
+func ParseContextOverflowMsg(status int, body string) (ContextOverflowEvidence, bool) {
+	if !isContextOverflow(body) {
+		return ContextOverflowEvidence{}, false
+	}
+	var env struct {
+		Msg      string `json:"msg"`
+		ExtError struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"extError"`
+		DisplayMsg struct {
+			ZhHans string `json:"zh-hans"`
+			En     string `json:"en"`
+		} `json:"displayMsg"`
+	}
+	ev := ContextOverflowEvidence{}
+	if json.Unmarshal([]byte(body), &env) == nil {
+		ev.Code = env.ExtError.Code
+		// 面向人的文案：中文优先（本服务使用者为中文），其次英文，再回落 msg。
+		switch {
+		case env.DisplayMsg.ZhHans != "":
+			ev.Text = env.DisplayMsg.ZhHans
+		case env.DisplayMsg.En != "":
+			ev.Text = env.DisplayMsg.En
+		case env.ExtError.Message != "":
+			ev.Text = env.ExtError.Message
+		default:
+			ev.Text = env.Msg
+		}
+	}
+	// 结构化字段缺失（非 JSON/截断）时，仍要给出可识别的码，否则客户端
+	// 无法识别为溢出，自动压缩就不会发生。
+	if ev.Code == "" {
+		ev.Code = "context_length_exceeded"
+	}
+	return ev, true
+}
+
+// ContextOverflowEvidence 之外：模型级限流证据见上方。
 func parseModelRateLimitModel(msg string) string {
 	// 形式一：模型 [X]
 	if i := strings.Index(msg, "模型 ["); i >= 0 {
