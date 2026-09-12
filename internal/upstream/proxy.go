@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -148,10 +149,38 @@ func (p *proxyPool) transportFor(proxyURL string) *http.Transport {
 	return tr
 }
 
-// SetProxySelector 注入账号级代理选择器；nil = 全部直连（默认）。
-// 非并发安全（装配阶段调用一次）。
+// atomicProxySel 并发安全的代理选择器容器。
+// 用 atomic.Pointer 包装函数值（函数值不能直接原子存取，用指针间接）。
+type atomicProxySel struct {
+	p atomic.Pointer[ProxySelector]
+}
+
+func (a *atomicProxySel) Load() ProxySelector {
+	if fp := a.p.Load(); fp != nil {
+		return *fp
+	}
+	return nil
+}
+
+func (a *atomicProxySel) Store(sel ProxySelector) {
+	if sel == nil {
+		a.p.Store(nil)
+		return
+	}
+	a.p.Store(&sel)
+}
+
+// SetProxySelector 注入/更换账号级代理选择器；nil = 全部直连。
+//
+// 【运行期可调用】：GUI 的代理开关直接调它即可立刻生效，无需改配置或重启。
+// 并发安全（请求可能在其它 goroutine 中取值）。
 func (c *Client) SetProxySelector(sel ProxySelector) {
-	c.proxySel = sel
+	c.proxySel.Store(sel)
+}
+
+// ProxySelectorEnabled 报告当前是否启用了代理（供界面显示开关状态）。
+func (c *Client) ProxySelectorEnabled() bool {
+	return c.proxySel.Load() != nil
 }
 
 // clientFor 返回该账号应使用的 *http.Client（含其专属 Transport）。
@@ -165,13 +194,14 @@ func (c *Client) clientFor(a *auth.Auth, chat bool) *http.Client {
 	if chat {
 		base = c.chatHTTP()
 	}
-	if c.proxySel == nil || a == nil {
+	sel := c.proxySel.Load()
+	if sel == nil || a == nil {
 		return base
 	}
 	if c.proxyPool == nil {
 		return base
 	}
-	tr := c.proxyPool.transportFor(c.proxySel(a.UID))
+	tr := c.proxyPool.transportFor(sel(a.UID))
 	if tr == nil {
 		return base // 未绑定或代理不可达 → 直连
 	}

@@ -139,6 +139,25 @@ func RenderListenersYAML(ls []Listener) string {
 	return b.String()
 }
 
+// rawGET 向 Clash API 发 GET 并返回 (状态码, 响应体片段)。仅用于诊断/验证。
+func rawGET(apiBase, secret, path string) (int, string) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(apiBase, "/")+path, nil)
+	if err != nil {
+		return 0, err.Error()
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	cli := &http.Client{Timeout: 5 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, strings.TrimSpace(string(b))
+}
+
 // RawConfigsPut 向 Clash 的 PUT /configs 发送原始 payload（用于探测与重载）。
 // 返回 (状态码, 响应体片段)。仅用于诊断与自动化重载。
 func RawConfigsPut(apiBase, secret string, payload map[string]any) (int, string) {

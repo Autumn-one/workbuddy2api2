@@ -1126,6 +1126,10 @@ type app struct {
 	proxyBindings     *proxyBindingModel
 	tvProxyBindings   *walk.TableView
 	lblProxyHint      *walk.Label
+	// btnProxyToggle 一键开关代理；lblProxyState 显示当前开关状态。
+	btnProxyToggle    *walk.PushButton
+	lblProxyState     *walk.Label
+	proxyBusy         bool
 	teProxyCfg        *walk.Label // 生成的 listeners 配置（可复制）
 	lastListenersYAML string
 
@@ -1289,11 +1293,13 @@ func main() {
 	a.checkinLog = newCheckinStore(filepath.Join(filepath.Dir(a.cfg.StateFile), checkinLogFile))
 	// 账号级出口代理（每账号独立出口 IP）：读 Clash 节点 → 建分配表 → 恢复绑定。
 	// 未启用/拉取失败时回落直连（不影响既有行为）。
-	a.proxyReg, a.proxyCancel = a.setupProxy(a.cfg)
+	// 代理：优先用「一键开关」入口（GUI「代理」页）。
+	// config.proxy.enabled=true 时在启动阶段自动开启（保持配置驱动的兼容性）；
+	// 否则完全由用户点开关决定，无需改配置文件。
 	a.proxyBindingsPath = a.cfg.Proxy.BindingsFile
-	a.svc.SetProxyRegistry(a.proxyReg)
-	// 自动把 listeners 应用到 Clash（用户要求：不要手工粘贴）。异步执行避免拖慢启动。
-	go a.autoApplyProxyAtStartup()
+	if a.cfg.Proxy.Enabled {
+		go a.autoEnableProxyAtStartup()
+	}
 
 	// 积分变动历史持久化：同目录，重启不丢。
 	a.creditLog = newCreditStore(filepath.Join(filepath.Dir(a.cfg.StateFile), creditLogFile))
@@ -1368,6 +1374,7 @@ func main() {
 	a.refreshUsage()
 	a.syncMatrixModels()
 	a.refreshProxyBindings()
+	a.refreshProxyToggle()
 
 	go a.tickLoop()
 	// 启动补签：在服务起来后异步执行，不阻塞 UI。

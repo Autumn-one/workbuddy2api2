@@ -426,23 +426,21 @@ func (a *app) buildUI() error {
 						Title:  "代理",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
-							dcl.Label{Text: "账号级出口 IP：每个账号走一个独立的本地 Clash 端口（= 独立出口节点）。" +
-								"\r\n用途：上游按 IP 处置账号时，避免「同一 IP 下多账号」被批量风控。" +
-								"\r\n工作方式：网关只读取 Clash 的节点列表并生成 listeners 配置；" +
-								"你把它粘到 Clash 的 Merge 覆写文件后重启 Clash 即可。" +
-								"\r\n（不自动改 Clash 配置；节点选择是全局状态，网关靠固定端口而非切节点来分流。）"},
+							dcl.Label{Text: "每个账号走一个独立的出口 IP（各绑一个 Clash 节点），避免「同 IP 下多账号」被批量风控。" +
+								"\r\n用法：点下面那个开关即可 —— 会自动找到 Clash、读取节点、配置好并生效，" +
+								"不需要改配置文件、不需要重启任何东西。"},
 							dcl.Composite{
-								Layout: dcl.HBox{Spacing: 8},
+								Layout: dcl.HBox{Spacing: 10},
 								Children: []dcl.Widget{
-									// 一键应用：自动把 listeners 注入 Clash 配置并重载生效（无需手工粘贴/重启）。
-									dcl.PushButton{Text: "一键应用到 Clash", MinSize: dcl.Size{Width: 140}, OnClicked: a.doApplyProxyAuto},
-									dcl.PushButton{Text: "复制配置（兜底）", MinSize: dcl.Size{Width: 120}, OnClicked: a.doCopyListeners},
+									// 一键开关：自动发现 Clash + 自动配置 + 运行期生效（无需改配置/重启）。
+									dcl.PushButton{AssignTo: &a.btnProxyToggle, Text: "一键开启代理", MinSize: dcl.Size{Width: 130}, OnClicked: a.doToggleProxy},
+									dcl.Label{AssignTo: &a.lblProxyState, Text: "○ 未开启（全部直连）", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
+									dcl.HSpacer{},
 									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
 									dcl.PushButton{Text: "切换选中账号节点", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
-									dcl.HSpacer{},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblProxyHint, Text: "代理未启用。"},
+							dcl.Label{AssignTo: &a.lblProxyHint, Text: "点「一键开启代理」即可使用。"},
 							dcl.TableView{
 								AssignTo:         &a.tvProxyBindings,
 								Model:            a.proxyBindings,

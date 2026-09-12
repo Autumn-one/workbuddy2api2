@@ -335,7 +335,9 @@ type Client struct {
 	SanitizeFingerprints bool
 
 	// proxySel 账号级代理选择器（nil = 全部直连）。见 proxy.go。
-	proxySel ProxySelector
+	// 用 atomic.Pointer 而非裸字段：GUI 可在运行期切换（用户点开关立刻生效），
+	// 而请求可能正在其他 goroutine 里取值 —— 必须并发安全。
+	proxySel atomicProxySel
 	// proxyPool 按代理地址缓存 Transport（连接池隔离）。
 	proxyPool *proxyPool
 

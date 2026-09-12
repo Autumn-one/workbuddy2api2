@@ -21,38 +21,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lxn/walk"
-
-	"workbuddy2api/internal/appconfig"
 	"workbuddy2api/internal/proxy"
 	"workbuddy2api/internal/upstream"
 )
-
-// setupProxy 按配置装配代理：拉节点 → 建分配表 → 恢复绑定 → 启动健康探测。
-// 返回 (registry, cancel)；未启用或拉取失败时返回 (nil, nil)（回落直连）。
-func (a *app) setupProxy(cfg *appconfig.Config) (*proxy.Registry, context.CancelFunc) {
-	if cfg == nil || !cfg.Proxy.Enabled {
-		return nil, nil
-	}
-	nodes, err := proxy.FetchNodes(cfg.Proxy.ClashAPI, cfg.Proxy.ClashSecret)
-	if err != nil {
-		log.Printf("代理：读取 Clash 节点失败（%v），本次回落直连", err)
-		return nil, nil
-	}
-	ls := proxy.BuildListeners(nodes, cfg.Proxy.PortBase)
-	if len(ls) == 0 {
-		log.Printf("代理：未生成任何 listener，回落直连")
-		return nil, nil
-	}
-	reg := proxy.NewRegistry(ls)
-	reg.LoadBindings(cfg.Proxy.BindingsFile)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go reg.HealthLoop(ctx, cfg.HealthIntervalDur)
-	log.Printf("代理：已启用，%d 个节点（%s），健康探测每 %s",
-		len(ls), regionSummary(ls), cfg.HealthIntervalDur)
-	return reg, cancel
-}
 
 // regionSummary 统计各地区节点数（日志用）。
 func regionSummary(ls []proxy.Listener) string {
@@ -83,35 +54,24 @@ func proxySelectorFor(reg *proxy.Registry) upstream.ProxySelector {
 	}
 }
 
-// autoApplyProxyAtStartup 启动时自动把 listeners 应用到 Clash（用户要求：不要手工粘贴）。
+// autoEnableProxyAtStartup 启动阶段自动开启代理（仅当 config.proxy.enabled=true）。
 //
-// 幂等且安全：注入前先移除上次的自动块，原有配置一字不改；
-// 任何一步失败都只记日志并继续（不阻塞启动，也不留半成品——ApplyListeners 内部会回滚）。
-func (a *app) autoApplyProxyAtStartup() {
-	if a.proxyReg == nil || a.cfg == nil || a.cfg.Proxy.ClashAPI == "" {
-		return
+// 与「一键开关」走完全相同的代码路径（enableProxyNow），保证行为一致——
+// 避免"配置启用"与"手动开关"两套逻辑各写一遍而漂移。
+func (a *app) autoEnableProxyAtStartup() {
+	if a.svc.Upstream() == nil {
+		return // 服务未启动，等用户点开关
 	}
-	dir := vergeDataDir()
-	if dir == "" {
-		log.Printf("代理：未找到 Clash Verge 数据目录，跳过自动应用（可手工点「一键应用到 Clash」）")
-		return
-	}
-	ls := a.proxyReg.Listeners()
-	cfgPath, err := proxy.ApplyListeners(a.cfg.Proxy.ClashAPI, a.cfg.Proxy.ClashSecret, dir, ls)
+	msg, err := a.enableProxyNow()
 	if err != nil {
-		log.Printf("代理：自动应用失败（%v）；可点「一键应用到 Clash」重试或用「复制配置（兜底）」手工粘贴", err)
+		log.Printf("代理：启动自动启用失败（%v）；可在「代理」页点「一键开启代理」重试", err)
 		return
 	}
-	// 探测确认端口是否真的起来（Clash 重载是异步的，给一点时间）
-	time.Sleep(1200 * time.Millisecond)
-	ok := 0
-	for _, l := range ls {
-		if proxy.ProbePort(l.Port) {
-			a.proxyReg.MarkHealthy(l.Port)
-			ok++
-		}
-	}
-	log.Printf("代理：已自动应用到 Clash（%s），%d/%d 个端口可用", filepath.Base(cfgPath), ok, len(ls))
+	log.Printf("代理（启动自动启用）：%s", msg)
+	a.mw.Synchronize(func() {
+		a.refreshProxyBindings()
+		a.refreshProxyToggle()
+	})
 }
 
 // refreshProxyBindings 刷新账号页的代理绑定显示（哪个账号在用哪个节点）。
@@ -252,40 +212,150 @@ func (a *app) doApplyProxyAuto() {
 	}()
 }
 
-// doGenListeners 生成 listeners 配置文本（自动应用失败时的兜底：供手工粘贴）。
-func (a *app) doGenListeners() {
-	if a.proxyReg == nil {
-		a.lblProxyHint.SetText("代理未启用：请在 config.json 里设置 proxy.enabled=true 后重启")
-		return
+// enableProxyNow 在【运行期】启用代理：自动发现 Clash → 拉节点 → 建分配表
+// → 自动应用 listeners 到 Clash → 注入选择器。全程无需改配置或重启。
+//
+// 这是用户要求的"简单"入口：GPU 上一个开关，点了就用。
+func (a *app) enableProxyNow() (string, error) {
+	dir := vergeDataDir()
+	if dir == "" {
+		return "", fmt.Errorf("未找到 Clash Verge 数据目录（请确认 Verge 已安装并运行）")
 	}
-	ls := a.proxyReg.Listeners()
-	yaml := proxy.RenderListenersYAML(ls)
-	a.lastListenersYAML = yaml
-	if a.teProxyCfg != nil {
-		// 只显示前几行（Label 不适合放长文本），完整内容用「复制配置」取。
-		lines := strings.Split(strings.TrimRight(yaml, "\n"), "\n")
-		head := lines
-		if len(head) > 14 {
-			head = head[:14]
+	// 自动发现 Clash 端点（用户不需要填 clash_api / secret）
+	ep, err := proxy.DiscoverClashEndpoint(dir, "")
+	if err != nil {
+		return "", err
+	}
+	if ok, msg := proxy.VerifyEndpoint(ep.API, ep.Secret); !ok {
+		return "", fmt.Errorf("连接 Clash 失败（%s）：%s", ep.API, msg)
+	}
+	nodes, err := proxy.FetchNodes(ep.API, ep.Secret)
+	if err != nil {
+		return "", fmt.Errorf("读取 Clash 节点失败: %w", err)
+	}
+	ls := proxy.BuildListeners(nodes, proxy.DefaultPortBase)
+	if len(ls) == 0 {
+		return "", fmt.Errorf("未取到任何节点")
+	}
+
+	// 建分配表并恢复历史绑定（IP 稳定）
+	reg := proxy.NewRegistry(ls)
+	bindPath := a.proxyBindingsPath
+	if bindPath == "" {
+		bindPath = filepath.Join(filepath.Dir(a.cfg.StateFile), "proxy-bindings.json")
+	}
+	reg.LoadBindings(bindPath)
+
+	// 自动应用 listeners 到 Clash（运行期重载，无需重启 Clash）
+	if _, err := proxy.ApplyListeners(ep.API, ep.Secret, dir, ls); err != nil {
+		return "", fmt.Errorf("应用到 Clash 失败: %w", err)
+	}
+	time.Sleep(1200 * time.Millisecond) // 等 Clash 重载
+
+	// 探测端口，统计可用数
+	ok := 0
+	for _, l := range ls {
+		if proxy.ProbePort(l.Port) {
+			reg.MarkHealthy(l.Port)
+			ok++
 		}
-		a.teProxyCfg.SetText("已生成 " + itoa(int64(len(ls))) + " 条 listener 配置（点「复制配置」取完整内容）:\r\n" +
-			strings.Join(head, "\r\n"))
 	}
-	a.lblProxyHint.SetText(fmt.Sprintf("已生成 %d 条 listener（端口 %d~%d）·%s",
-		len(ls), ls[0].Port, ls[len(ls)-1].Port, regionSummary(ls)))
+
+	// 注入到 upstream（运行期生效，旧请求不受影响）
+	up := a.svc.Upstream()
+	if up == nil {
+		return "", fmt.Errorf("服务未运行（请先启动服务）")
+	}
+	up.SetProxySelector(proxySelectorFor(reg))
+
+	// 保存状态供界面显示与退出时落盘
+	a.proxyReg = reg
+	a.proxyBindingsPath = bindPath
+	if a.proxyCancel != nil {
+		a.proxyCancel() // 停掉旧的健康探测循环
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.proxyCancel = cancel
+	go reg.HealthLoop(ctx, proxy.DefaultHealthInterval)
+
+	reg.SaveBindings(bindPath)
+	return fmt.Sprintf("已启用：%d 个节点（%s），%d/%d 个端口就绪",
+		len(ls), regionSummary(ls), ok, len(ls)), nil
 }
 
-// doCopyListeners 复制 listeners 配置到剪贴板。
-func (a *app) doCopyListeners() {
-	if a.lastListenersYAML == "" {
-		a.doGenListeners()
+// disableProxyNow 在【运行期】关闭代理：立刻回落直连，不重启。
+// 同时把 Clash 里的自动注入块清掉（不留垃圾配置）。
+func (a *app) disableProxyNow() (string, error) {
+	up := a.svc.Upstream()
+	if up == nil {
+		return "", fmt.Errorf("服务未运行")
 	}
-	if a.lastListenersYAML == "" {
+	up.SetProxySelector(nil) // 立刻回落直连
+
+	if a.proxyCancel != nil {
+		a.proxyCancel()
+		a.proxyCancel = nil
+	}
+	// 清理 Clash 里的自动注入块（传空列表 = 只清理）
+	if dir := vergeDataDir(); dir != "" {
+		ep, err := proxy.DiscoverClashEndpoint(dir, "")
+		if err == nil {
+			if _, aerr := proxy.ApplyListeners(ep.API, ep.Secret, dir, nil); aerr != nil {
+				log.Printf("代理：清理 Clash 配置失败（%v），已关闭代理但配置里可能留有自动块", aerr)
+			}
+		}
+	}
+	a.proxyReg = nil
+	return "已关闭：立即回落直连（Clash 里的自动配置已清理）", nil
+}
+
+// doToggleProxy 一键开关（GUI 按钮入口）。
+func (a *app) doToggleProxy() {
+	if a.proxyBusy {
+		a.lblProxyHint.SetText("操作进行中，请稍候…")
 		return
 	}
-	if err := walk.Clipboard().SetText(a.lastListenersYAML); err != nil {
-		a.lblProxyHint.SetText("复制失败：" + firstLine(err.Error()))
-		return
+	a.proxyBusy = true
+	wasOn := a.svc.Upstream() != nil && a.svc.Upstream().ProxySelectorEnabled()
+	a.lblProxyHint.SetText("正在处理…")
+
+	go func() {
+		var msg string
+		var err error
+		if wasOn {
+			msg, err = a.disableProxyNow()
+		} else {
+			msg, err = a.enableProxyNow()
+		}
+		a.mw.Synchronize(func() {
+			a.proxyBusy = false
+			if err != nil {
+				a.lblProxyHint.SetText("操作失败：" + firstLine(err.Error()))
+				return
+			}
+			a.lblProxyHint.SetText(msg)
+			a.refreshProxyBindings()
+			a.refreshProxyToggle()
+			log.Printf("代理开关：%s", msg)
+		})
+	}()
+}
+
+// refreshProxyToggle 同步开关按钮文案与状态标签。
+func (a *app) refreshProxyToggle() {
+	on := a.svc.Upstream() != nil && a.svc.Upstream().ProxySelectorEnabled()
+	if a.btnProxyToggle != nil {
+		if on {
+			a.btnProxyToggle.SetText("关闭代理")
+		} else {
+			a.btnProxyToggle.SetText("一键开启代理")
+		}
 	}
-	a.lblProxyHint.SetText("已复制（兜底用）。粘到 Verge 的 profiles/Merge.yaml 顶层后需重启 Clash；正常情况下点「一键应用到 Clash」即可。")
+	if a.lblProxyState != nil {
+		if on {
+			a.lblProxyState.SetText("● 已开启（每个账号走独立出口 IP）")
+		} else {
+			a.lblProxyState.SetText("○ 未开启（全部直连）")
+		}
+	}
 }
