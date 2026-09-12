@@ -431,8 +431,9 @@ func (a *app) buildUI() error {
 							dcl.Composite{
 								Layout: dcl.HBox{Spacing: 8},
 								Children: []dcl.Widget{
-									dcl.PushButton{Text: "生成 listeners 配置", MinSize: dcl.Size{Width: 140}, OnClicked: a.doGenListeners},
-									dcl.PushButton{Text: "复制配置", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCopyListeners},
+									// 一键应用：自动把 listeners 注入 Clash 配置并重载生效（无需手工粘贴/重启）。
+									dcl.PushButton{Text: "一键应用到 Clash", MinSize: dcl.Size{Width: 140}, OnClicked: a.doApplyProxyAuto},
+									dcl.PushButton{Text: "复制配置（兜底）", MinSize: dcl.Size{Width: 120}, OnClicked: a.doCopyListeners},
 									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
 									dcl.PushButton{Text: "切换选中账号节点", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
 									dcl.HSpacer{},

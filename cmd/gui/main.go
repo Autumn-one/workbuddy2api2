@@ -1278,6 +1278,8 @@ func main() {
 	a.proxyReg, a.proxyCancel = a.setupProxy(a.cfg)
 	a.proxyBindingsPath = a.cfg.Proxy.BindingsFile
 	a.svc.SetProxyRegistry(a.proxyReg)
+	// 自动把 listeners 应用到 Clash（用户要求：不要手工粘贴）。异步执行避免拖慢启动。
+	go a.autoApplyProxyAtStartup()
 
 	// 积分变动历史持久化：同目录，重启不丢。
 	a.creditLog = newCreditStore(filepath.Join(filepath.Dir(a.cfg.StateFile), creditLogFile))

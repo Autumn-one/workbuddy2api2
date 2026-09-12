@@ -9,8 +9,11 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
@@ -135,3 +138,54 @@ func RenderListenersYAML(ls []Listener) string {
 	}
 	return b.String()
 }
+
+// RawConfigsPut 向 Clash 的 PUT /configs 发送原始 payload（用于探测与重载）。
+// 返回 (状态码, 响应体片段)。仅用于诊断与自动化重载。
+func RawConfigsPut(apiBase, secret string, payload map[string]any) (int, string) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return 0, err.Error()
+	}
+	req, err := http.NewRequest(http.MethodPut, strings.TrimRight(apiBase, "/")+"/configs", bytes.NewReader(raw))
+	if err != nil {
+		return 0, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	cli := &http.Client{Timeout: 10 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return resp.StatusCode, strings.TrimSpace(string(b))
+}
+
+// ConfigFilePath 读取 Clash 当前使用的配置文件路径（GET /configs 的 path 字段）。
+func ConfigFilePath(apiBase, secret string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(apiBase, "/")+"/configs", nil)
+	if err != nil {
+		return "", err
+	}
+	if secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+	cli := &http.Client{Timeout: 8 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	var d struct {
+		Path string `json:"path"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&d) != nil {
+		return "", errDecode
+	}
+	return d.Path, nil
+}
+
+var errDecode = errors.New("clash configs decode failed")

@@ -15,7 +15,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/lxn/walk"
 
@@ -32,12 +36,12 @@ func (a *app) setupProxy(cfg *appconfig.Config) (*proxy.Registry, context.Cancel
 	}
 	nodes, err := proxy.FetchNodes(cfg.Proxy.ClashAPI, cfg.Proxy.ClashSecret)
 	if err != nil {
-		logf("代理：读取 Clash 节点失败（%v），本次回落直连", err)
+		log.Printf("代理：读取 Clash 节点失败（%v），本次回落直连", err)
 		return nil, nil
 	}
 	ls := proxy.BuildListeners(nodes, cfg.Proxy.PortBase)
 	if len(ls) == 0 {
-		logf("代理：未生成任何 listener，回落直连")
+		log.Printf("代理：未生成任何 listener，回落直连")
 		return nil, nil
 	}
 	reg := proxy.NewRegistry(ls)
@@ -45,7 +49,7 @@ func (a *app) setupProxy(cfg *appconfig.Config) (*proxy.Registry, context.Cancel
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go reg.HealthLoop(ctx, cfg.HealthIntervalDur)
-	logf("代理：已启用，%d 个节点（%s），健康探测每 %s",
+	log.Printf("代理：已启用，%d 个节点（%s），健康探测每 %s",
 		len(ls), regionSummary(ls), cfg.HealthIntervalDur)
 	return reg, cancel
 }
@@ -77,6 +81,37 @@ func proxySelectorFor(reg *proxy.Registry) upstream.ProxySelector {
 		}
 		return l.ProxyURL()
 	}
+}
+
+// autoApplyProxyAtStartup 启动时自动把 listeners 应用到 Clash（用户要求：不要手工粘贴）。
+//
+// 幂等且安全：注入前先移除上次的自动块，原有配置一字不改；
+// 任何一步失败都只记日志并继续（不阻塞启动，也不留半成品——ApplyListeners 内部会回滚）。
+func (a *app) autoApplyProxyAtStartup() {
+	if a.proxyReg == nil || a.cfg == nil || a.cfg.Proxy.ClashAPI == "" {
+		return
+	}
+	dir := vergeDataDir()
+	if dir == "" {
+		log.Printf("代理：未找到 Clash Verge 数据目录，跳过自动应用（可手工点「一键应用到 Clash」）")
+		return
+	}
+	ls := a.proxyReg.Listeners()
+	cfgPath, err := proxy.ApplyListeners(a.cfg.Proxy.ClashAPI, a.cfg.Proxy.ClashSecret, dir, ls)
+	if err != nil {
+		log.Printf("代理：自动应用失败（%v）；可点「一键应用到 Clash」重试或用「复制配置（兜底）」手工粘贴", err)
+		return
+	}
+	// 探测确认端口是否真的起来（Clash 重载是异步的，给一点时间）
+	time.Sleep(1200 * time.Millisecond)
+	ok := 0
+	for _, l := range ls {
+		if proxy.ProbePort(l.Port) {
+			a.proxyReg.MarkHealthy(l.Port)
+			ok++
+		}
+	}
+	log.Printf("代理：已自动应用到 Clash（%s），%d/%d 个端口可用", filepath.Base(cfgPath), ok, len(ls))
 }
 
 // refreshProxyBindings 刷新账号页的代理绑定显示（哪个账号在用哪个节点）。
@@ -126,7 +161,7 @@ func (a *app) doSwitchAccountNode() {
 		a.refreshProxyBindings()
 		a.lblAccts2.SetText(fmt.Sprintf("%s 的出口节点：%s → %s",
 			a.displayName(uid), orDash(before), l.Node))
-		logf("代理：账号 %s 切换节点 %s → %s（端口 %d）",
+		log.Printf("代理：账号 %s 切换节点 %s → %s（端口 %d）",
 			a.displayName(uid), orDash(before), l.Node, l.Port)
 	})
 }
@@ -156,7 +191,68 @@ func (a *app) doProbeProxiesNow() {
 	}()
 }
 
-// doGenListeners 生成 listeners 配置文本（供用户粘贴到 Clash 的 Merge 覆写文件）。
+// vergeDataDir 返回 Clash Verge 的数据目录（定位渲染出的完整配置）。
+// 支持多版本目录名（Verge 与 Verge Rev 的标识不同）。
+func vergeDataDir() string {
+	base := os.Getenv("APPDATA")
+	if base == "" {
+		return ""
+	}
+	cands := []string{
+		filepath.Join(base, "io.github.clash-verge-rev.clash-verge-rev"),
+		filepath.Join(base, "clash-verge"),
+		filepath.Join(base, "io.github.zzzgydi.clash-verge"),
+	}
+	for _, d := range cands {
+		if st, err := os.Stat(d); err == nil && st.IsDir() {
+			return d
+		}
+	}
+	return ""
+}
+
+// doApplyProxyAuto 一键把 listeners 应用到 Clash 并重载生效（无需手工粘贴）。
+func (a *app) doApplyProxyAuto() {
+	if a.proxyReg == nil {
+		a.lblProxyHint.SetText("代理未启用：请先在 config.json 里设置 proxy.enabled=true 并重启")
+		return
+	}
+	if a.cfg == nil || a.cfg.Proxy.ClashAPI == "" {
+		a.lblProxyHint.SetText("未配置 clash_api")
+		return
+	}
+	dir := vergeDataDir()
+	if dir == "" {
+		a.lblProxyHint.SetText("未找到 Clash Verge 数据目录（请确认 Verge 已安装并运行过）")
+		return
+	}
+	ls := a.proxyReg.Listeners()
+	a.lblProxyHint.SetText("正在应用配置到 Clash…")
+
+	go func() {
+		cfgPath, err := proxy.ApplyListeners(a.cfg.Proxy.ClashAPI, a.cfg.Proxy.ClashSecret, dir, ls)
+		a.mw.Synchronize(func() {
+			if err != nil {
+				a.lblProxyHint.SetText("自动应用失败：" + firstLine(err.Error()) +
+					"（可点「复制配置」手工粘到 Verge 的 Merge.yaml 后重启 Clash）")
+				return
+			}
+			// 应用后立即探测，确认端口真的起来了
+			ok := 0
+			for _, l := range ls {
+				if proxy.ProbePort(l.Port) {
+					a.proxyReg.MarkHealthy(l.Port)
+					ok++
+				}
+			}
+			a.refreshProxyBindings()
+			a.lblProxyHint.SetText(fmt.Sprintf("已自动应用到 Clash（%s）：%d/%d 个端口可用，无需重启",
+				filepath.Base(cfgPath), ok, len(ls)))
+		})
+	}()
+}
+
+// doGenListeners 生成 listeners 配置文本（自动应用失败时的兜底：供手工粘贴）。
 func (a *app) doGenListeners() {
 	if a.proxyReg == nil {
 		a.lblProxyHint.SetText("代理未启用：请在 config.json 里设置 proxy.enabled=true 后重启")
@@ -191,5 +287,5 @@ func (a *app) doCopyListeners() {
 		a.lblProxyHint.SetText("复制失败：" + firstLine(err.Error()))
 		return
 	}
-	a.lblProxyHint.SetText("配置已复制。粘到 Clash 的 Merge 覆写文件（profiles/Merge.yaml）的顶层，然后重启 Clash。")
+	a.lblProxyHint.SetText("已复制（兜底用）。粘到 Verge 的 profiles/Merge.yaml 顶层后需重启 Clash；正常情况下点「一键应用到 Clash」即可。")
 }
