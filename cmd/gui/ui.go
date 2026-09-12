@@ -118,6 +118,9 @@ func (a *app) buildUI() error {
 								Children: []dcl.Widget{
 									dcl.PushButton{AssignTo: &btnRefresh, Text: "刷新", MinSize: dcl.Size{Width: 80}, OnClicked: a.refreshAccounts},
 									dcl.PushButton{AssignTo: &a.btnRefreshCredits, Text: "刷新额度", MinSize: dcl.Size{Width: 90}, OnClicked: a.doRefreshCredits},
+									// 单账号操作：针对选中的那一行（批量版是"全部"，两者并存）。
+									dcl.PushButton{Text: "签到选中", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCheckinSelected},
+									dcl.PushButton{Text: "刷新选中额度", MinSize: dcl.Size{Width: 100}, OnClicked: a.doRefreshCreditsSelected},
 									dcl.PushButton{AssignTo: &btnCheckin, Text: "手动签到全部", MinSize: dcl.Size{Width: 110}, OnClicked: a.doCheckinAll},
 									// 优先级：每个账号可单独设权重值（选号权重乘子）。
 									// 权重越大越常被选中（如一次性账号希望优先消耗其额度）；
@@ -168,7 +171,7 @@ func (a *app) buildUI() error {
 									{Title: "成功/总", Width: 90, Alignment: dcl.AlignFar},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblAccountsHint, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行可删除；双击一行看该账号的积分变化历史。"},
+							dcl.Label{AssignTo: &a.lblAccountsHint, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行后可「签到选中」「刷新选中额度」或删除；双击一行看该账号的积分变化历史。"},
 						},
 					},
 
