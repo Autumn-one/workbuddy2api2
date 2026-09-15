@@ -90,3 +90,62 @@
 5. **不得销毁验证证据。** 隔离实例的日志与 `data/`（尤其 `credit-log.jsonl`）在验证结束后
    **不要立即删除**——它们是核对「是否真的没有消耗积分 / 是否发生异常」的唯一依据。
    确需清理时，先在回复中记录关键结论与账目自检结果，再删除。
+
+## 三、部署与 GUI 机制约定（改名替换 / 原地重启 / 列表签名闸门）
+
+### 改名替换部署（换掉正在运行的 exe，但不终结进程）
+
+**背景**：用户允许「替换应用本身」。Windows 下不能覆盖运行中的 exe（写入被拒），
+但同卷内**改名允许**。确立的部署做法：
+
+1. `mv wb2api-gui.exe wb2api-gui.prevN.exe`（N 递增：`.prev` / `.prev2` / `.prev3`…）
+2. `cp <新构建> wb2api-gui.exe`
+3. 旧进程继续运行、继续服务；下次启动吃新版。
+
+**`.prevN.exe` 命名是 load-bearing 约定，不得换别的形式**：托盘「重新启动」的
+`relaunchTarget` / `swappedOutExeName`（`cmd/gui/main.go`）靠解析 `X.prevN.exe`
+找回原名上的新 exe——运行中进程的 `os.Executable()` 返回的是改名后的 `.prevN`
+路径，直接拉它会起回旧版。改掉这个备份命名 = 原地重启悄悄退化。
+
+- 替换后提醒用户重启（托盘 →「重新启动」或手动退再开）；**不要替用户终结进程**。
+- `.prevN.exe` 既是回滚备份，也可能是「正在运行的映像」——删之前确认对应进程已退。
+
+### 干净构建
+
+- 出生产 exe 用 `git worktree add <tmp> HEAD` 从已提交代码构建，避免把工作区
+  未完成的 WIP 带进二进制；用完 `git worktree remove --force`。
+- 命令等价 `build-gui.ps1`：
+  `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -H windowsgui" -o wb2api-gui.exe ./cmd/gui`
+  （`rsrc_windows_amd64.syso` 已提交在包内，链接器自动带上 comctl32 清单）。
+
+### 账号列表刷新机制（签名闸门 + 轻量重绘）
+
+**背景（历史 bug）**：`refreshAccounts` 曾用 `tblSignature` 比对 `lastSig` 却从不
+写回——字段恒为空串，每 1.5s tick 都整表 `PublishRowsReset`（滚动重置、选中清空、
+闪白），即「列表一直在刷新」。已修复为两级路径：
+
+- `acctSigChanged`：比对 + 写回一体。签名相同 → `updateItems`（换数据快照 +
+  `PublishRowsChanged` / LVM_REDRAWITEMS，只重绘可见单元格，不动滚动与选中）；
+  不同 → 整表 `Replace` + 滚动位恢复。
+- **新加显示字段时的规则**：值变化必须触发整表重建的 → 加进 `tblSignature`；
+  高频运行态（在途、冷却倒计时等每秒都在变的）→ 不进签名，靠 `updateItems`
+  重绘自然更新。
+- 复选框显示值来自 `Status.Active`（在签名里），勾选变化必然整表重建对齐。
+
+### 复选框 = 活跃号池
+
+- 权威在 pool：`inactive` 集（持久化在 `state.json` 的 `inactive_accounts`）；
+  `pick` / `AvailableUIDs` / 半开探测 / 粘性会话全部跳过未勾选账号；
+  签到、额度刷新等维护路径**不受**勾选影响。
+- GUI 侧 `accountModel` 实现 `walk.ItemChecker`；勾选状态按 UID 存 `active` map，
+  `Replace` 时按 `Status.Active` 重建（行序变化不乱跳）。
+- 实时生效链：点击 → `SetChecked` → `onActiveChange` → `svc.SetAccountActive`
+  → `pool.SetActive` → dirty → flusher 5s 落盘。
+- 「全选 / 反选 + 号池 n/m」位于账号列表正上方一行右侧（用户指定的位置）。
+  反选到空不弹确认（用户明确知道后果 = 网关无号可用 503，点「全选」即恢复）。
+
+### 托盘「重新启动」（原地重开进程）
+
+- `relaunchSelf`：拉起独立 powershell 守望者（`Wait-Process` 本 PID 退出 →
+  `Start-Process` 新 exe），随后正常退出。等旧进程退出再启动，避免抢 listen 端口。
+- 与托盘里「启动/停止服务」不同：那对网关生效，这个是整个程序退出重开。
