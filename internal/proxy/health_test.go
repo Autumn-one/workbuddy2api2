@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -50,12 +52,16 @@ func TestProbeAllMixed(t *testing.T) {
 }
 
 // TestHealthLoopUpdatesRegistry 健康循环应把探测结果写进注册表。
+// TestHealthLoopUpdatesRegistry 健康循环应把【延迟探测】结果写进注册表：
+// 能转发 generate_204 的端口判健康（且延迟入缓存），不能转发的判不健康。
+// live 用真 HTTP 代理（转发到 httptest 目标），dead 用必然不可连接的 1 号端口。
 func TestHealthLoopUpdatesRegistry(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	live := ln.Addr().(*net.TCPAddr).Port
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer up.Close()
+	live, stop := fakeHTTPProxy(t, up.URL)
+	defer stop()
 
 	r := NewRegistry([]Listener{
 		{Name: "live", Port: live, Node: "香港", Region: RegionHK},
@@ -66,7 +72,7 @@ func TestHealthLoopUpdatesRegistry(t *testing.T) {
 	go r.HealthLoop(ctx, 50*time.Millisecond)
 
 	// 等第一轮探测完成（HealthLoop 启动时立即探一次）
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if r.Healthy(live) && !r.Healthy(1) {
 			break
@@ -79,7 +85,9 @@ func TestHealthLoopUpdatesRegistry(t *testing.T) {
 	if r.Healthy(1) {
 		t.Error("dead 端口应被标记不健康")
 	}
-	ln.Close()
+	if d := r.DelayOf("香港"); d <= 0 {
+		t.Errorf("live 节点延迟应入缓存（>0）, got %d", d)
+	}
 }
 
 // TestProbeLoopNoListeners 无 listener 时循环不 panic（空配置安全）。

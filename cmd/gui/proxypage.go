@@ -175,20 +175,16 @@ func (a *app) selectProxyBinding(uid string) {
 	}
 }
 
-// probeProxyHealth 检测全部节点的真实连通性（Clash 批量延迟接口）。
+// probeProxyHealth 检测全部节点的真实连通性（经各节点本地端口发 generate_204）。
 //
-// 为什么用延迟接口而非 TCP 探测：TCP 只能证明"Clash 在监听端口"，
-// 不能证明出口节点真能出网。延迟接口由 Clash 自己发探测（不经过本网关、
-// 不消耗上游模型积分），一次请求即拿到全部节点的真实可用性与延迟。
+// 为什么用经端口探测而非 Clash 批量延迟接口：批量接口会漏节点（超时节点被省略，
+// 实测冤枉过活节点），而经端口探测 = 与业务流量同一条链路，一个节点都不会漏，
+// 测出的延迟就是用户真实会经历的延迟。探测由 Clash 发出、不经本网关、不消耗积分。
 func (a *app) probeProxyHealth() (healthy, total int, err error) {
 	if a.proxyReg == nil {
 		return 0, 0, fmt.Errorf("代理未启用")
 	}
-	ep := a.clashEndpoint()
-	delays, derr := proxy.FetchDelays(ep.API, ep.Secret, "GLOBAL", proxy.DelayTimeout)
-	if derr != nil {
-		return 0, 0, fmt.Errorf("延迟检测失败: %w", derr)
-	}
+	delays := proxy.ProbeDelays(a.proxyReg.Listeners(), proxy.DelayProbeTimeout)
 	a.proxyReg.ApplyDelays(delays)
 	total = len(a.proxyReg.Listeners())
 	for _, l := range a.proxyReg.Listeners() {
@@ -371,11 +367,13 @@ func (a *app) doApplyProxyAuto() {
 					"（可点「复制配置」手工粘到 Verge 的 Merge.yaml 后重启 Clash）")
 				return
 			}
-			// 应用后立即探测，确认端口真的起来了
+			// 应用后立即用延迟探测确认端口真的起来了（与全局健康判定同口径：
+			// 不再用 TCP 探测 MarkHealthy——那会把"端口活着但节点死了"误判成可用）。
+			delays := proxy.ProbeDelays(ls, proxy.DelayProbeTimeout)
+			a.proxyReg.ApplyDelays(delays)
 			ok := 0
 			for _, l := range ls {
-				if proxy.ProbePort(l.Port) {
-					a.proxyReg.MarkHealthy(l.Port)
+				if a.proxyReg.Healthy(l.Port) {
 					ok++
 				}
 			}
@@ -476,18 +474,11 @@ func (a *app) enableProxyNow() (string, error) {
 	}
 	reg.EnsureAllAssigned(uids)
 
-	// 检测真实连通性（延迟接口）。失败时回落 TCP 探测（至少确认端口在监听）。
+	// 检测真实连通性：经每个节点本地端口发 generate_204（与业务同一条链路，
+	// 不会漏节点，延迟就是真实延迟）。失败节点上的账号在 ApplyDelays 内部自动换绑。
 	delayNote := ""
-	if delays, derr := proxy.FetchDelays(ep.API, ep.Secret, "GLOBAL", proxy.DelayTimeout); derr == nil {
-		reg.ApplyDelays(delays)
-	} else {
-		for _, l := range ls {
-			if proxy.ProbePort(l.Port) {
-				reg.MarkHealthy(l.Port)
-			}
-		}
-		delayNote = "（延迟检测不可用，已回落端口探测）"
-	}
+	delays := proxy.ProbeDelays(ls, proxy.DelayProbeTimeout)
+	reg.ApplyDelays(delays)
 	ok := 0
 	for _, l := range ls {
 		if reg.Healthy(l.Port) {
@@ -507,6 +498,14 @@ func (a *app) enableProxyNow() (string, error) {
 	a.proxyBindingsPath = bindPath
 	a.proxyStatePath = statePath
 	a.proxyLevel = level
+	// 自动换绑落盘 + 日志：节点被探测判死后，绑在它上面的账号已被挪到健康节点，
+	// 必须把新的对应关系立刻写回 proxy-bindings.json（否则重启后又绑回死节点）。
+	reg.SetAutoRebindHook(func(ev proxy.RebindEvent) {
+		log.Printf("代理：账号 %s 的节点 %s 已不可用，自动换到 %s（端口 %d）",
+			a.displayName(ev.UID), ev.FromNode, ev.ToNode, ev.ToPort)
+		a.proxyReg.SaveBindings(a.proxyBindingsPath)
+		a.mw.Synchronize(a.refreshProxyBindings)
+	})
 	if a.proxyCancel != nil {
 		a.proxyCancel() // 停掉旧的健康探测循环
 	}

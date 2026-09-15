@@ -84,12 +84,20 @@ func DelayHealthy(delays map[string]int, node string) bool {
 	return ok && d > 0
 }
 
-// ApplyDelays 把延迟结果写入注册表健康状态：
-// 延迟 > 0 → 健康；否则（0 或缺失）→ 不健康。
-// 这比 TCP 探测准确：反映的是"出口节点能否真正出网"。
+// ApplyDelays 把延迟结果写入注册表健康状态与延迟缓存，并自动换绑死节点上的账号。
+//
+// 健康判定：延迟 > 0 → 健康；否则（0 = 失败/超时）→ 不健康。
+// 本函数是唯一有权判定"节点不可用"的入口（不再被 TCP 端口探测覆盖）。
+//
+// 自动换绑（用户要求）：绑在失败节点上的账号立即换到【延迟最低的健康节点】，
+// 换绑后通过回调通知（GUI 落盘 + 日志）。全部节点失败时不换（防抖动把账号
+// 从一个死节点换到另一个死节点）；账号本来就绑在健康节点上不动（稳定优先）。
+//
+// 注意：本函数只做"按本轮结果对齐健康状态"，不解决"节点恢复了要不要换回来"——
+// 那由下一轮探测自动完成（健康节点被重新标记健康，但已换走的账号【不换回】，
+// 出口 IP 稳定优先于"回到老节点"）。
 func (r *Registry) ApplyDelays(delays map[string]int) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	// 缓存延迟供"按延迟选节点"与界面展示
 	if r.delays == nil {
 		r.delays = map[string]int{}
@@ -97,13 +105,41 @@ func (r *Registry) ApplyDelays(delays map[string]int) {
 	for k, v := range delays {
 		r.delays[k] = v
 	}
+	// 先对齐健康状态
+	healthyCount := 0
 	for _, l := range r.listeners {
 		if d, ok := delays[l.Node]; ok && d > 0 {
 			delete(r.unhealthy, l.Port)
+			healthyCount++
 		} else {
 			if _, seen := r.unhealthy[l.Port]; !seen {
 				r.unhealthy[l.Port] = time.Now()
 			}
+		}
+	}
+	// 自动换绑：把绑在失败节点上的账号挪到延迟最低的健康节点。
+	// 全部失败时不换——没有可用目标，换也是白换（且会引发连锁重分配）。
+	var events []RebindEvent
+	if healthyCount > 0 {
+		for uid, idx := range r.byUID {
+			if idx < 0 || idx >= len(r.listeners) {
+				continue
+			}
+			cur := r.listeners[idx]
+			if _, bad := r.unhealthy[cur.Port]; !bad {
+				continue // 当前节点健康，不动（稳定优先）
+			}
+			if l, ok := r.rebindLocked(uid); ok {
+				events = append(events, RebindEvent{UID: uid, FromNode: cur.Node, ToNode: l.Node, ToPort: l.Port})
+			}
+		}
+	}
+	cb := r.onAutoRebind
+	r.mu.Unlock()
+	// 回调在锁外调用，避免实现方阻塞注册表。
+	if cb != nil {
+		for _, ev := range events {
+			cb(ev)
 		}
 	}
 }

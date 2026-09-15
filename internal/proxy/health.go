@@ -1,16 +1,14 @@
-// health.go — 代理端口健康探测（低成本）。
+// health.go — 代理节点健康探测（真实延迟驱动）。
 //
-// 用户要求："定期以低成本的方式去检测这个代理节点是否通"。
+// 探测方式：经每个节点的【本地端口】发 generate_204（见 delayprobe.go）。
+// 这是与业务流量完全同一条链路，测出的延迟就是真实延迟，且：
+//   - 不会漏节点（批量 Clash API 会省略超时节点，实测冤枉过活节点）；
+//   - 判决权唯一——健康只由延迟决定，不再被 TCP 端口探测覆盖
+//     （原缺陷：死节点被 TCP 探测 MarkHealthy 复活，账号一直绑在死节点上）。
 //
-// 成本控制（关键）：
-//   - 只做【TCP 连通性】探测本地 Clash 端口——本地连接，不消耗真实流量、
-//     不打上游、不计费。端口能握上手说明 Clash 在监听该 listener。
-//   - 不做真实业务请求（那才会消耗流量/积分，且会暴露给上游）。
-//
-// 局限（必须诚实说明）：TCP 连通只证明"本地端口活着"，不保证出口节点真能通外网
-// （Clash 可能接受连接但节点本身挂了）。真实链路验证需要发一次外部请求——
-// 由调用方在"确实要发业务请求"时顺带判定：业务请求失败且是网络层错误 → 标记不健康。
-// 这样既不额外花钱，又能拿到真实信号。
+// 成本：每节点每周期一次 generate_204（几字节），不经本网关、不消耗上游模型积分。
+// 不依赖外网可达性之外的条件：无外网时全部延迟失败 → 全不健康 → 网关回落直连，
+// 与"节点全挂"的行为一致（宁可直连也不卡死）。
 package proxy
 
 import (
@@ -23,7 +21,14 @@ import (
 // ProbeTimeout 单次 TCP 探测超时（本地端口，通常 <10ms；给足余量）。
 const ProbeTimeout = 2 * time.Second
 
+// DelayProbeTimeout 单节点延迟探测超时（经本地端口发 generate_204 的总时限）。
+// 3s 与 Clash 延迟接口的超时口径一致：超过即认为"该节点现在不可用"。
+const DelayProbeTimeout = 3 * time.Second
+
 // ProbePort 探测单个本地代理端口是否可连接。返回 true 表示可连接。
+//
+// 保留用途：诊断分层——区分"Clash 没在监听端口"（配置/Clash 问题）与
+// "端口在监听但节点不通"（节点问题）。不再参与健康判定（见文件头注释）。
 func ProbePort(port int) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), ProbeTimeout)
 	defer cancel()
@@ -58,6 +63,9 @@ func itoa(n int) string {
 
 // ProbeAll 并发探测所有 listener，返回 端口 → 是否可连接。
 // 并发是为了不让串行探测拖长周期（本地连接很快，并发无副作用）。
+//
+// 保留用途：诊断提示（例如"全部延迟失败时，是 Clash 挂了还是节点全挂了"）。
+// 不参与健康判定——健康只由 ProbeDelays 的延迟结果决定。
 func ProbeAll(ls []Listener) map[int]bool {
 	out := make(map[int]bool, len(ls))
 	var mu sync.Mutex
@@ -76,11 +84,11 @@ func ProbeAll(ls []Listener) map[int]bool {
 	return out
 }
 
-// HealthLoop 定期探测并更新注册表健康状态，直到 ctx 结束。
+// HealthLoop 定期探测并更新注册表健康状态与延迟缓存，直到 ctx 结束。
 //
-// 只标记"探测失败"为不健康；探测成功会清除不健康标记（节点恢复后自动回归）。
-// 绑定关系不受影响：健康状态只影响【新分配】与【Rebind 的可选目标】，
-// 已绑定账号仍走原节点（稳定性优先，除非调用方显式 Rebind）。
+// 每轮 ProbeDelays + ApplyDelays：失败节点上的账号被自动换绑（ApplyDelays 内部）。
+// 已绑定的健康节点不受影响（稳定优先）；恢复健康的节点也不会把账号"抢回来"——
+// 出口 IP 稳定优先于"回到老节点"。
 func (r *Registry) HealthLoop(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = DefaultHealthInterval
@@ -99,18 +107,13 @@ func (r *Registry) HealthLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-// probeOnce 探测一轮并更新健康标记。
+// probeOnce 探测一轮：经每个节点本地端口发 generate_204，把结果写进注册表。
+// 延迟 > 0 → 健康；失败/超时 → 不健康，并触发 ApplyDelays 内部的自动换绑。
 func (r *Registry) probeOnce() {
 	ls := r.Listeners()
 	if len(ls) == 0 {
 		return
 	}
-	results := ProbeAll(ls)
-	for port, ok := range results {
-		if ok {
-			r.MarkHealthy(port)
-		} else {
-			r.MarkUnhealthy(port)
-		}
-	}
+	delays := ProbeDelays(ls, DelayProbeTimeout)
+	r.ApplyDelays(delays)
 }

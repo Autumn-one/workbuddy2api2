@@ -89,6 +89,17 @@ type Binding struct {
 	Region Region
 }
 
+// RebindEvent 一次因节点失败而发生的自动换绑（观测用，供 GUI 落盘/提示）。
+type RebindEvent struct {
+	UID      string
+	FromNode string
+	ToNode   string
+	ToPort   int
+}
+
+// RebindFunc 自动换绑回调（在持锁外调用）。必须非阻塞。
+type RebindFunc func(RebindEvent)
+
 // Registry 账号到代理端口的分配表（线程安全）。
 type Registry struct {
 	mu        sync.RWMutex
@@ -101,6 +112,15 @@ type Registry struct {
 	// delays 最近一次延迟探测结果（节点名 → 毫秒；0/缺失 = 不可用）。
 	// 仅用于"按延迟自动选节点"与界面展示，不参与健康判定（健康看 unhealthy）。
 	delays map[string]int
+	// onAutoRebind 节点失败自动换绑后的回调（GUI 落盘 proxy-bindings.json + 日志）。
+	onAutoRebind RebindFunc
+}
+
+// SetAutoRebindHook 注入自动换绑回调；nil = 关闭通知（换绑本身仍发生）。
+func (r *Registry) SetAutoRebindHook(fn RebindFunc) {
+	r.mu.Lock()
+	r.onAutoRebind = fn
+	r.mu.Unlock()
 }
 
 // NewRegistry 构建注册表；listeners 会按地区优先级稳定排序。
@@ -238,9 +258,18 @@ func (r *Registry) loadLocked() map[int]int {
 }
 
 // Rebind 强制账号换一个节点（当前节点不通时用）。返回新的绑定。
+//
+// 换绑目标按【延迟最低 + 负载最少】挑：既然要主动换，就换到当前最快的健康节点
+// （此前只按负载，可能换到一个低负载但慢/地区差的节点）。
+// 延迟缺失的节点（未探测）不参与"最快"竞争，防止换到一个还没验证过的节点。
 func (r *Registry) Rebind(uid string) (Listener, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.rebindLocked(uid)
+}
+
+// rebindLocked 是 Rebind 的锁内版（ApplyDelays 自动换绑复用）。调用方必须已持锁。
+func (r *Registry) rebindLocked(uid string) (Listener, bool) {
 	if len(r.listeners) == 0 {
 		return Listener{}, false
 	}
@@ -252,6 +281,7 @@ func (r *Registry) Rebind(uid string) (Listener, bool) {
 		load[curPort]-- // 排除自己，避免"自己占着位置"影响选择
 	}
 	best, bestLoad := -1, 1<<30
+	bestDelay := 1<<30
 	for i, l := range r.listeners {
 		if l.Port == curPort {
 			continue // 换就是要换掉当前这个
@@ -259,8 +289,14 @@ func (r *Registry) Rebind(uid string) (Listener, bool) {
 		if _, bad := r.unhealthy[l.Port]; bad {
 			continue
 		}
-		if load[l.Port] < bestLoad {
-			best, bestLoad = i, load[l.Port]
+		// 延迟优先，负载兜底：换绑的意图是"换到能用的最快的节点"。
+		// 延迟 0（未探测/失败）不参与最快竞争，但它仍是健康节点，作负载候选。
+		d := r.delays[l.Node]
+		if d <= 0 {
+			d = 1 << 29 // 未探测节点排在有实测延迟的后面、但仍在候选内
+		}
+		if d < bestDelay || (d == bestDelay && load[l.Port] < bestLoad) {
+			best, bestDelay, bestLoad = i, d, load[l.Port]
 		}
 	}
 	if best < 0 {
