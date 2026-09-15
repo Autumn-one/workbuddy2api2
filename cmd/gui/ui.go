@@ -762,37 +762,54 @@ func showCommandFor(minimized, visible bool) int32 {
 	return win.SW_SHOWNORMAL
 }
 
-// showWindow 从托盘把主窗口带回前台：还原（若最小化）→ 显示 → 置前。
+// showWindow 从托盘把主窗口带回前台：还原（最小化/收托盘）→ 显示 → 置前。
 //
 // Windows 前台锁定（foreground lock）：当本进程不是前台进程时，
-// SetActiveWindow/SetFocus 会被系统静默忽略（任务栏闪一下，窗口不置前）。
-// 因此必须走 SetForegroundWindow——而它要求先 AttachThreadInput 挂到当前
-// 前台线程，否则同样被忽略。这是 Windows 下"托盘点出窗口"的标准做法。
+// SetActiveWindow/SetFocus 会被系统静默忽略（任务栏闪一下，窗口不置前），
+// SetForegroundWindow 也一样会被拦——表现就是"点了托盘图标一点反应没有"
+// （窗口其实已 Show，但被压在其它窗口后面）。
+//
+// 两道保险：
+//  1. AttachThreadInput 先把 UI 线程挂到当前前台线程（标准绕过手法）；
+//  2. 置顶→取消置顶把窗口物理顶到 Z 序最上面——就算 SetForegroundWindow
+//     仍被前台锁拦下，窗口也肉眼可见地浮出来了。
 func (a *app) showWindow() {
 	if a.mw == nil {
 		return
 	}
 	hwnd := a.mw.Handle()
-	if win.IsIconic(hwnd) {
-		// 最小化：显式还原。SW_RESTORE 同时会激活窗口。
-		win.ShowWindow(hwnd, win.SW_RESTORE)
-		return
-	}
-	// 未最小化：显示 + 强制置前。
-	win.ShowWindow(hwnd, win.SW_SHOW)
-	win.BringWindowToTop(hwnd)
-	// 挂到当前前台线程，绕过前台锁定，才能真正抢到前台。
+	logf("托盘点击 → 唤起主窗口（iconic=%v）", win.IsIconic(hwnd))
+
+	// 1) 先挂输入队列：让后续 ShowWindow 激活与 SetForegroundWindow 都获得
+	//    前台线程的"输入关联"身份。
 	cur := win.GetForegroundWindow()
-	if cur != 0 {
-		curTid := win.GetWindowThreadProcessId(cur, nil)
-		myTid := win.GetCurrentThreadId()
-		if curTid != myTid {
-			win.AttachThreadInput(int32(myTid), int32(curTid), true)
-			defer win.AttachThreadInput(int32(myTid), int32(curTid), false)
-		}
+	curTid := win.GetWindowThreadProcessId(cur, nil)
+	myTid := win.GetCurrentThreadId()
+	attached := false
+	if cur != 0 && curTid != 0 && curTid != myTid {
+		attached = win.AttachThreadInput(int32(myTid), int32(curTid), true)
 	}
+	if attached {
+		defer win.AttachThreadInput(int32(myTid), int32(curTid), false)
+	}
+
+	// 2) 还原：SW_SHOW 把收进托盘（hidden）的窗口显示出来；
+	//    最小化（iconic）再走 SW_RESTORE 恢复原尺寸位置。
+	win.ShowWindow(hwnd, win.SW_SHOW)
+	if win.IsIconic(hwnd) {
+		win.ShowWindow(hwnd, win.SW_RESTORE)
+	}
+
+	// 3) 置顶→取消置顶：物理上浮到 Z 序最上，SetForegroundWindow 被拦也兜底。
+	win.SetWindowPos(hwnd, win.HWND_TOPMOST, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
+	win.SetWindowPos(hwnd, win.HWND_NOTOPMOST, 0, 0, 0, 0,
+		win.SWP_NOMOVE|win.SWP_NOSIZE|win.SWP_NOACTIVATE)
+
+	// 4) 正常路径抢前台焦点（挂过输入队列后一般能成）。
 	win.SetForegroundWindow(hwnd)
 	win.SetActiveWindow(hwnd)
+	win.BringWindowToTop(hwnd)
 	_ = a.mw.SetFocus()
 }
 
