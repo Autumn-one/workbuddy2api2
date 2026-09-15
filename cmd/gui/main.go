@@ -1178,12 +1178,13 @@ type app struct {
 
 	// 账号页「检测模型可用性」：模型下拉框 + 检测进行中标志 + 取消标志 + 按钮。
 	// cbMatrixModel 必须是账号页自己的控件——用户在点击检测前要能看到并修改模型。
-	cbMatrixModel    *walk.ComboBox
-	lastMatrixModels []string
-	matrixBusy       bool
-	matrixCancel     bool
-	btnMatrixProbe   *walk.PushButton
-	btnMatrixStop    *walk.PushButton
+	cbMatrixModel          *walk.ComboBox
+	lastMatrixModels       []string
+	matrixBusy             bool
+	matrixCancel           bool
+	btnMatrixProbe         *walk.PushButton
+	btnMatrixProbeSelected *walk.PushButton
+	btnMatrixStop          *walk.PushButton
 
 	// 测试页（手动探测账号×模型连通性）
 	cbProbeAcct   *walk.ComboBox

@@ -318,6 +318,72 @@ func (a *app) doMatrixProbe() {
 	}()
 }
 
+// doMatrixProbeSelected 账号页「检测选中」入口：只对【选中的那个账号】检测所选模型。
+// 与 doMatrixProbe（全量横向扫）互补：怀疑单个账号在某模型上有问题时，
+// 不必扫全部账号（省积分、快）。消耗 = 1 次真实请求（max_tokens=32）。
+func (a *app) doMatrixProbeSelected() {
+	if a.matrixBusy {
+		a.lblAccts2.SetText("检测进行中，请稍候…（可点「停止检测」中断）")
+		return
+	}
+	if !a.svc.Running() {
+		a.lblAccts2.SetText("服务未运行：请先到「服务」页点「启动服务」")
+		return
+	}
+	def := a.selectedMatrixModel()
+	if def == "" {
+		if a.modelRates == nil || len(a.modelRates.items) == 0 {
+			a.lblAccts2.SetText("模型清单为空：请先到「模型」页点「重新加载参数」")
+		} else {
+			a.lblAccts2.SetText("请先在账号页选择要检测的模型")
+		}
+		return
+	}
+	items := a.svc.Accounts()
+	a.takeSelection(func(idx int) {
+		if idx < 0 || idx >= len(items) {
+			a.lblAccts2.SetText("请先在表格里选中一个账号")
+			return
+		}
+		st := items[idx]
+		if st.Disabled {
+			a.lblAccts2.SetText("该账号已禁用，不参与检测")
+			return
+		}
+		name := a.displayName(st.UID)
+		// 单账号检测也确认一次：虽然是 1 次小请求，但会真实消耗积分（用户须知情）。
+		if walk.MsgBox(a.mw, appName,
+			fmt.Sprintf("将用账号 %s 检测模型 %s 是否可用。\n\n"+
+				"· 发起 1 次真实请求（max_tokens=32，消耗极小但会消耗积分）\n\n继续吗？", name, def),
+			walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
+			a.lblAccts2.SetText("已取消检测")
+			return
+		}
+
+		a.matrixBusy = true
+		if a.btnMatrixStop != nil {
+			a.btnMatrixStop.SetEnabled(true)
+		}
+		a.appendProbeLine(fmt.Sprintf("═══ 检测选中账号：%s × 模型 %s ═══", name, def))
+		go func() {
+			res := runProbe(a, st.UID, def, probeMaxTokens, "")
+			a.mw.Synchronize(func() {
+				a.matrixBusy = false
+				if a.btnMatrixStop != nil {
+					a.btnMatrixStop.SetEnabled(false)
+				}
+				a.appendProbeLine("  " + res.Summary())
+				a.appendProbeLine("═══ 检测完成 ═══")
+				if res.OK {
+					a.lblAccts2.SetText(fmt.Sprintf("%s：模型 %s 可用（%.1fs）", name, def, res.Elapsed.Seconds()))
+				} else {
+					a.lblAccts2.SetText(fmt.Sprintf("%s：模型 %s 不可用（%s）", name, def, firstLine(probeFailureText(res.ErrKind, res.Detail))))
+				}
+			})
+		}()
+	})
+}
+
 // doStopMatrixProbe 中断进行中的检测（已测结果保留）。
 func (a *app) doStopMatrixProbe() {
 	if !a.matrixBusy {
