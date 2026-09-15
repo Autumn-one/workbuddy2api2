@@ -464,6 +464,21 @@ func (a *app) enableProxyNow() (string, error) {
 	// ─── 步骤 3：建分配表并继承上次的账号→节点对应关系 ───
 	reg := proxy.NewRegistry(ls)
 	restored, lost := reg.LoadBindingsReport(bindPath)
+	// 自动换绑落盘 + 日志：节点被探测判死后，绑在它上面的账号会被挪到健康节点，
+	// 必须把新的对应关系立刻写回 proxy-bindings.json（否则重启后又绑回死节点）。
+	// 必须在首次 ApplyDelays 之前注册——启动那轮探测就会换绑（上次绑定的节点
+	// 可能已死），漏注册会导致启动换绑无日志（绑定仍会被后面的统一落盘修正，
+	// 但排查"为什么换节点"时缺证据）。
+	reg.SetAutoRebindHook(func(ev proxy.RebindEvent) {
+		log.Printf("代理：账号 %s 的节点 %s 已不可用，自动换到 %s（端口 %d）",
+			a.displayName(ev.UID), ev.FromNode, ev.ToNode, ev.ToPort)
+		if a.proxyReg != nil {
+			a.proxyReg.SaveBindings(a.proxyBindingsPath)
+		}
+		if a.mw != nil {
+			a.mw.Synchronize(a.refreshProxyBindings)
+		}
+	})
 
 	// 【关键】为全部账号立刻建立绑定：让界面一开启就显示"每个账号走哪个节点"，
 	// 而不是等请求发生才懒分配（那样列表默认空白，用户以为没生效）。
@@ -498,14 +513,6 @@ func (a *app) enableProxyNow() (string, error) {
 	a.proxyBindingsPath = bindPath
 	a.proxyStatePath = statePath
 	a.proxyLevel = level
-	// 自动换绑落盘 + 日志：节点被探测判死后，绑在它上面的账号已被挪到健康节点，
-	// 必须把新的对应关系立刻写回 proxy-bindings.json（否则重启后又绑回死节点）。
-	reg.SetAutoRebindHook(func(ev proxy.RebindEvent) {
-		log.Printf("代理：账号 %s 的节点 %s 已不可用，自动换到 %s（端口 %d）",
-			a.displayName(ev.UID), ev.FromNode, ev.ToNode, ev.ToPort)
-		a.proxyReg.SaveBindings(a.proxyBindingsPath)
-		a.mw.Synchronize(a.refreshProxyBindings)
-	})
 	if a.proxyCancel != nil {
 		a.proxyCancel() // 停掉旧的健康探测循环
 	}
