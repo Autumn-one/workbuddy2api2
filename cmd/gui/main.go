@@ -1629,7 +1629,11 @@ func (a *app) refreshAccounts() {
 	if a.tblSignature(items) == a.lastSig {
 		return
 	}
+	// 重建前记录滚动位置：PublishRowsReset 会把视口弹回顶部（用户抱怨
+	// 「滚到下面立刻被刷新顶回上面」），重建后必须按原偏移滚回去。
+	scrollPos := tvCaptureScroll(a.tvAccounts)
 	a.accounts.Replace(items)
+	tvRestoreScroll(a.tvAccounts, scrollPos, len(items))
 	if a.lblAccts2 != nil {
 		a.lblAccts2.SetText(fmt.Sprintf("共 %d 个账号", len(items)))
 	}

@@ -129,6 +129,10 @@ func (a *app) buildUI() error {
 										Layout: dcl.HBox{Spacing: 8, MarginsZero: true},
 										Children: []dcl.Widget{
 											dcl.PushButton{AssignTo: &btnRefresh, Text: "刷新", MinSize: dcl.Size{Width: 80}, OnClicked: a.refreshAccounts},
+											dcl.PushButton{Text: "全选", MinSize: dcl.Size{Width: 56}, OnClicked: a.doSelectAllActive},
+											dcl.PushButton{Text: "反选", MinSize: dcl.Size{Width: 56}, OnClicked: a.doInvertActive},
+											// 号池活跃计数：复选框操作的即时反馈（"号池 3/5"）。
+											dcl.Label{AssignTo: &a.lblActivePool, Text: "号池 -/-", Font: dcl.Font{Family: "Segoe UI", PointSize: 9, Bold: true}, MinSize: dcl.Size{Width: 60}},
 											dcl.PushButton{AssignTo: &a.btnRefreshCredits, Text: "刷新额度", MinSize: dcl.Size{Width: 90}, OnClicked: a.doRefreshCredits},
 											dcl.PushButton{Text: "签到选中", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCheckinSelected},
 											dcl.PushButton{Text: "刷新选中额度", MinSize: dcl.Size{Width: 100}, OnClicked: a.doRefreshCreditsSelected},
