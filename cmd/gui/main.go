@@ -324,6 +324,18 @@ func (m *accountModel) Replace(items []pool.Status) {
 	m.PublishRowsReset()
 }
 
+// updateItems 仅更新数据快照并请求重绘（不重建表结构）。
+// 供签名未变的周期刷新使用：PublishRowsChanged → LVM_REDRAWITEMS 只重画
+// 可见单元格，不重置滚动位置、不清选中、不闪白。
+// 仅在【行集未变】（签名相同 = UID 集与顺序不变，List 按 UID 排序稳定）
+// 时调用——索引→UID 的对应关系不变，items 直接换快照是安全的。
+func (m *accountModel) updateItems(items []pool.Status) {
+	m.items = items
+	if n := len(items); n > 0 {
+		m.PublishRowsChanged(0, n-1)
+	}
+}
+
 // accountUIDAt 返回第 i 行的账号 UID；越界返回空串。
 func accountUIDAt(rows []pool.Status, i int) string {
 	if i < 0 || i >= len(rows) {
@@ -1626,7 +1638,13 @@ func (a *app) refreshAccounts() {
 	// 恰好被其他字段的相同值掩盖）。统计是纯字符串计算，代价可忽略。
 	a.refreshTotalCredits(items)
 	a.refreshActivePoolLabel()
-	if a.tblSignature(items) == a.lastSig {
+	if !a.acctSigChanged(a.tblSignature(items)) {
+		// 签名未变 = 表格结构无需重建。只换数据快照 + 重绘可见单元格
+		// （LVM_REDRAWITEMS，LVN_GETDISPINFO 重新取 Value），让刻意不进签名的
+		// 高频字段（在途、冷却倒计时、熔断剩余）照常每 tick 刷新；
+		// 不做 Replace——PublishRowsReset 会重置滚动位置与选中行并整表闪白，
+		// 那正是「账号列表一直在刷新」的观感来源。
+		a.accounts.updateItems(items)
 		return
 	}
 	// 重建前记录滚动位置：PublishRowsReset 会把视口弹回顶部（用户抱怨
@@ -1647,6 +1665,21 @@ func (a *app) refreshAccounts() {
 	a.syncProbeChoices()
 }
 
+// acctSigChanged 账号表重建闸门：签名与上次相同 → false（不重建）；
+// 不同 → 写回 lastSig 并返回 true（走整表重建）。
+//
+// 历史 bug（本次修复）：refreshAccounts 此前只比对 lastSig 却从不写回，
+// 字段恒为 ""——非空账号集的签名永远 ≠ ""，签名检查形同虚设，每 1.5s 的
+// tick 都整表 Replace → PublishRowsReset，表现为「账号列表一直在刷新」
+// （滚动位被重置、选中行被清、整表闪白）。写回签名后重建只发生在真实变化时。
+func (a *app) acctSigChanged(sig string) bool {
+	if sig == a.lastSig {
+		return false
+	}
+	a.lastSig = sig
+	return true
+}
+
 // tblSignature 生成"是否需要重建账号表格"的指纹。
 //
 // 只收录【变化慢、且需要重建表格才能反映】的字段：
@@ -1656,8 +1689,9 @@ func (a *app) refreshAccounts() {
 //   - 它们是高频运行态，每次请求都在变（实测请求间隔仅几秒），若进签名会让
 //     签名几乎每个 tick（1.5s）都变化 → 反复 Replace → PublishRowsReset
 //     重建表格 → 【用户选中的行被清空】（实测缺陷：选中几秒后自动取消）；
-//   - 它们本来就不需要重建：表格 Value() 每帧实时读取当前值，签名不变时
-//     单元格文字照样是最新的（walk 会重绘可见单元格）。
+//   - 它们本来就不需要重建：签名不变时 updateItems 只换快照 +
+//     LVM_REDRAWITEMS 重绘可见单元格，LVN_GETDISPINFO 重新取 Value()
+//     即得最新文字——不重置滚动、不清选中、不闪白。
 //
 // 换言之：签名回答的是"表格结构/需要重置的内容变了吗"，不是"每个数字都变了吗"。
 func (a *app) tblSignature(items []pool.Status) string {
