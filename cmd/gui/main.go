@@ -119,6 +119,48 @@ func (b *logBuffer) Text() string {
 type accountModel struct {
 	walk.TableModelBase
 	items []pool.Status
+	// active 复选状态（勾选 = 在活跃号池）。与 pool 的 inactive 集由 GUI 侧双向同步；
+	// 存在 model 里是因为 walk 的 ItemChecker 按【行索引】查询，Rebuild 时按 UID 重新回填即可。
+	active map[string]bool
+	// onActiveChange 勾选状态变化回调（GUI 注入：写回池并刷新显示）；nil = 仅记录。
+	onActiveChange func(uid string, active bool)
+}
+
+// Checked 实现 walk.ItemChecker：复选框勾选状态（行索引 → 勾选）。
+// 越界或未记录默认勾选（新账号默认进号池，与 pool 默认一致）。
+func (m *accountModel) Checked(index int) bool {
+	if index < 0 || index >= len(m.items) {
+		return true
+	}
+	if m.active == nil {
+		return true
+	}
+	return m.active[m.items[index].UID]
+}
+
+// SetChecked 实现 walk.ItemChecker：用户点击复选框 → 更新本地状态并回调。
+func (m *accountModel) SetChecked(index int, checked bool) error {
+	if index < 0 || index >= len(m.items) {
+		return nil
+	}
+	uid := m.items[index].UID
+	if m.active == nil {
+		m.active = map[string]bool{}
+	}
+	if m.active[uid] == checked {
+		return nil
+	}
+	m.active[uid] = checked
+	if m.onActiveChange != nil {
+		m.onActiveChange(uid, checked)
+	}
+	return nil
+}
+
+// setActiveMap 整体回填复选状态（Rebuild 后按 UID 重新对齐）。
+// active 为 nil 时视为全选（账号从未被排除过）。
+func (m *accountModel) setActiveMap(active map[string]bool) {
+	m.active = active
 }
 
 // modelRateRow 模型参数表一行（含思考深度等全部可用参数）。
@@ -271,6 +313,14 @@ func (m *accountModel) Value(row, col int) interface{} {
 
 func (m *accountModel) Replace(items []pool.Status) {
 	m.items = items
+	// 复选状态以 pool 的 Status.Active 为权威重新对齐（行序可能变化，map 按 UID 查）。
+	// 保留 pool 里没有、但本地已知的历史 UID 状态意义不大——Replace 的 items 即当前全集，
+	// 直接按 items 重建 active map，杜绝幽灵 UID 残留。
+	active := make(map[string]bool, len(items))
+	for _, s := range items {
+		active[s.UID] = s.Active
+	}
+	m.active = active
 	m.PublishRowsReset()
 }
 
@@ -331,6 +381,11 @@ func accountState(s pool.Status) string {
 			return fmt.Sprintf("冷却中 %s", shortDur(time.Duration(s.CoolRemaining)*time.Second))
 		}
 		return "冷却中"
+	case !s.Active:
+		// 复选框未勾选放在【故障信号之后】：未启用是用户自选（非故障），
+		// 而禁用/疑似拉黑是"账号坏了"的告警，必须优先露出。
+		// 但它必须压过"正常"——未勾选的账号不在轮换里，显示"正常"会误导。
+		return "未启用（复选框未勾选）"
 	default:
 		return "正常"
 	}
@@ -428,7 +483,7 @@ func (m *proxyBindingModel) Replace(items []proxyBindingRow) {
 	m.PublishRowsReset()
 }
 
-// usageRow 界面上的一行用量（账号级汇总或账号×模型明细）。
+// usageRow 界面上的一行用量（明细 / 按账号 / 按模型）。
 type usageRow struct {
 	UID      string
 	Model    string
@@ -441,10 +496,42 @@ type usageRow struct {
 	Missing  int64
 }
 
-// usageModel 用量表模型：支持两种视图（账号×模型明细 / 账号级汇总）。
+// Total 总 token（输入 + 输出；缓存/思考是其子集，不重复计）。
+func (r usageRow) Total() int64 { return r.In + r.Out }
+
+// formatTokenCount 大数缩写：>=1e9 → X.XXB，>=1e6 → X.XXM，>=1e3 → X.XK，否则原样。
+// 用户要求：总 token 用 M/B 表示（一眼看出量级，不数零）。
+func formatTokenCount(n int64) string {
+	abs := n
+	if abs < 0 {
+		abs = -abs
+	}
+	switch {
+	case abs >= 1_000_000_000:
+		return trimFloat(float64(n)/1e9) + "B"
+	case abs >= 1_000_000:
+		return trimFloat(float64(n)/1e6) + "M"
+	case abs >= 1_000:
+		return trimFloat(float64(n)/1e3) + "K"
+	default:
+		return itoa(n)
+	}
+}
+
+// trimFloat 保留最多 2 位小数并去尾零（1.50 → 1.5，2.00 → 2）。
+func trimFloat(f float64) string {
+	s := fmt.Sprintf("%.2f", f)
+	s = strings.TrimRight(s, "0")
+	s = strings.TrimRight(s, ".")
+	return s
+}
+
+// usageModel 用量表模型：列随视图变化（明细/按账号/按模型）。
 type usageModel struct {
 	walk.TableModelBase
 	items []usageRow
+	// view: 0=明细（账号×模型×日期） 1=按账号 2=按模型
+	view int
 }
 
 func (m *usageModel) RowCount() int { return len(m.items) }
@@ -454,32 +541,68 @@ func (m *usageModel) Value(row, col int) interface{} {
 		return ""
 	}
 	r := m.items[row]
-	switch col {
+	// 列布局随视图变：
+	//   明细(0): 账号 | 模型 | 日期 | 请求 | 总token | 输入 | 输出 | 缓存 | 思考
+	//   按账号(1): 账号 | 请求 | 总token | 输入 | 输出 | 缓存 | 思考
+	//   按模型(2): 模型 | 请求 | 总token | 输入 | 输出 | 缓存 | 思考
+	switch m.view {
 	case 0:
-		return r.UID
+		switch col {
+		case 0:
+			return r.UID
+		case 1:
+			return r.Model
+		case 2:
+			return r.Day
+		case 3:
+			return itoa(r.Requests)
+		case 4:
+			return formatTokenCount(r.Total())
+		case 5:
+			return formatTokenCount(r.In)
+		case 6:
+			return formatTokenCount(r.Out)
+		case 7:
+			return formatTokenCount(r.Cached)
+		case 8:
+			return formatTokenCount(r.Think)
+		}
 	case 1:
-		if r.Model == "" {
-			return "（账号汇总）"
+		switch col {
+		case 0:
+			return r.UID
+		case 1:
+			return itoa(r.Requests)
+		case 2:
+			return formatTokenCount(r.Total())
+		case 3:
+			return formatTokenCount(r.In)
+		case 4:
+			return formatTokenCount(r.Out)
+		case 5:
+			return formatTokenCount(r.Cached)
+		case 6:
+			return formatTokenCount(r.Think)
 		}
-		return r.Model
 	case 2:
-		if r.Day == "" {
-			return "（全部日期）"
+		switch col {
+		case 0:
+			return r.Model
+		case 1:
+			return itoa(r.Requests)
+		case 2:
+			return formatTokenCount(r.Total())
+		case 3:
+			return formatTokenCount(r.In)
+		case 4:
+			return formatTokenCount(r.Out)
+		case 5:
+			return formatTokenCount(r.Cached)
+		case 6:
+			return formatTokenCount(r.Think)
 		}
-		return r.Day
-	case 3:
-		return itoa(r.Requests)
-	case 4:
-		return itoa(r.Cached)
-	case 5:
-		return itoa(r.In)
-	case 6:
-		return itoa(r.Out)
-	case 7:
-		return itoa(r.Think)
-	default:
-		return ""
 	}
+	return ""
 }
 
 func (m *usageModel) Replace(items []usageRow) {
@@ -1112,6 +1235,8 @@ type app struct {
 	// 账号页
 	tvAccounts *walk.TableView
 	lblAccts2  *walk.Label
+	// lblActivePool 号池活跃计数（"号池 3/5"），工具栏上一眼看出勾选结果。
+	lblActivePool *walk.Label
 	// lblTotalCredits 账号页的总积分统计（含未刷新额度的提示）。
 	lblTotalCredits *walk.Label
 	// btnRefreshCredits 手动批量刷新额度按钮（刷新期间禁用防重复点击）。
@@ -1137,6 +1262,8 @@ type app struct {
 	usage         *usageModel
 	// usageDays 与 cbUsageDay 平行（索引 → "YYYY-MM-DD"；0 = 全部日期）。
 	usageDays []string
+	// lastUsageSig 用量表上次刷新签名（防抖：签名不变不重建表格，防 1.5s 周期刷新闪烁）。
+	lastUsageSig string
 
 	// 代理（账号级出口 IP）
 	proxyReg    *proxy.Registry
@@ -1310,6 +1437,8 @@ func main() {
 	}
 	// 积分表的昵称解析：模型内只存原始 UID，渲染时才查昵称（改名不会影响过滤）。
 	a.credits.display = a.displayName
+	// 复选框勾选 → 池的活跃集（实时生效）。回调在 UI 线程执行（walk 事件），直接写池。
+	a.accounts.onActiveChange = a.onAccountActiveChanged
 
 	// 标准日志 → 内存面板 + 磁盘文件（带轮转）；请求日志也接到同一条链上
 	sink, logRot := setupLogging(a.logs)
@@ -1492,10 +1621,11 @@ func (a *app) refreshStatus() {
 
 func (a *app) refreshAccounts() {
 	items := a.svc.Accounts()
-	// 总积分统计独立于表格签名比对：签名相同只意味着"不必重建表格"，
+	// 总积分统计独立于表格签名比对：签名相同只意味着"不必重建表格",
 	// 不代表统计文案无需刷新（例如首次进入页面、或刷新额度后 credits 变化
 	// 恰好被其他字段的相同值掩盖）。统计是纯字符串计算，代价可忽略。
 	a.refreshTotalCredits(items)
+	a.refreshActivePoolLabel()
 	if a.tblSignature(items) == a.lastSig {
 		return
 	}
@@ -1529,9 +1659,10 @@ func (a *app) refreshAccounts() {
 func (a *app) tblSignature(items []pool.Status) string {
 	var b strings.Builder
 	for _, s := range items {
-		fmt.Fprintf(&b, "%s|%s|%d|%v|%v|%d|%g|%d|%v;",
+		// Active 必须进签名：勾选变化是低频用户操作，变化时必须重建表格以刷新复选框显示。
+		fmt.Fprintf(&b, "%s|%s|%d|%v|%v|%d|%g|%d|%v|%v;",
 			s.UID, s.Nickname, s.Credits, s.Cooling, s.Disabled, s.BreakerFails, s.Priority,
-			s.ContentRejects, s.SuspectedBanned)
+			s.ContentRejects, s.SuspectedBanned, s.Active)
 	}
 	return b.String()
 }
@@ -2040,6 +2171,79 @@ func (a *app) rememberAccountSelection() {
 func (a *app) refreshAccountsNow() {
 	a.lastSig = ""
 	a.refreshAccounts()
+}
+
+// ── 活跃号池（复选框）──
+
+// activePoolSig 当前活跃集的签名（排序后拼接），用于检测全选/反选后的整体变化。
+func activePoolSig(items []pool.Status) string {
+	var b strings.Builder
+	for _, s := range items {
+		if s.Active {
+			b.WriteString(s.UID)
+			b.WriteByte(',')
+		}
+	}
+	return b.String()
+}
+
+// onAccountActiveChanged 单个复选框点击后的回调（model → 池，实时生效）。
+// 池是权威：写池后用一次强制刷新把表格/状态/计数全部对齐（签名含 Active，必重建）。
+func (a *app) onAccountActiveChanged(uid string, active bool) {
+	a.svc.SetAccountActive(uid, active)
+	a.refreshAccountsNow()
+	a.refreshActivePoolLabel()
+}
+
+// doSelectAllActive 全选：所有账号进入活跃号池。
+func (a *app) doSelectAllActive() {
+	items := a.svc.Accounts()
+	uids := make([]string, 0, len(items))
+	for _, s := range items {
+		uids = append(uids, s.UID)
+	}
+	a.svc.SetActiveAccounts(uids)
+	a.refreshAccountsNow()
+	a.refreshActivePoolLabel()
+	a.lblAccts2.SetText(fmt.Sprintf("已全选：%d 个账号全部启用", len(uids)))
+}
+
+// doInvertActive 反选：勾选的取消、未勾选的选上。
+func (a *app) doInvertActive() {
+	items := a.svc.Accounts()
+	inverted := make([]string, 0, len(items))
+	for _, s := range items {
+		if !s.Active {
+			inverted = append(inverted, s.UID)
+		}
+	}
+	if len(inverted) == 0 && len(items) > 0 {
+		// 反选结果为空 = 当前全选时点反选：确认（后果是网关完全无号可用）。
+		if walk.MsgBox(a.mw, appName,
+			"反选后将没有任何账号被勾选，网关会完全无法处理请求（503）。\n确定继续吗？",
+			walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
+			return
+		}
+	}
+	a.svc.SetActiveAccounts(inverted)
+	a.refreshAccountsNow()
+	a.refreshActivePoolLabel()
+	a.lblAccts2.SetText(fmt.Sprintf("已反选：启用 %d / %d 个账号", len(inverted), len(items)))
+}
+
+// refreshActivePoolLabel 账号页工具栏上的活跃计数提示（一眼看出"几个号在跑"）。
+func (a *app) refreshActivePoolLabel() {
+	if a.lblActivePool == nil {
+		return
+	}
+	items := a.svc.Accounts()
+	active := 0
+	for _, s := range items {
+		if s.Active {
+			active++
+		}
+	}
+	a.lblActivePool.SetText(fmt.Sprintf("号池 %d/%d", active, len(items)))
 }
 
 func (a *app) doDeleteAccount() {

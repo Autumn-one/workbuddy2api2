@@ -176,6 +176,8 @@ func (a *app) buildUI() error {
 								AlternatingRowBG:    true,
 								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
 								StretchFactor:       1,
+								// 复选框 = 活跃号池开关：勾选的账号才参与请求轮换，实时生效。
+								CheckBoxes: true,
 								// 双击一行 = 直接看该账号的积分变化历史（跳到「日志」页并过滤）。
 								OnItemActivated: a.onAccountActivated,
 								Columns: []dcl.TableViewColumn{
@@ -189,7 +191,7 @@ func (a *app) buildUI() error {
 									{Title: "成功/总", Width: 90, Alignment: dcl.AlignFar},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblAccountsHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行后可「签到选中」「刷新选中额度」或删除；双击一行看该账号的积分变化历史。"},
+							dcl.Label{AssignTo: &a.lblAccountsHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "提示：勾选框 = 该账号参与请求轮换（实时生效，重启保留）。选中一行后可「签到选中」「刷新选中额度」或删除；双击一行看积分历史。"},
 						},
 					},
 
@@ -404,7 +406,7 @@ func (a *app) buildUI() error {
 									dcl.Label{Text: "视图"},
 									dcl.ComboBox{
 										AssignTo:              &a.cbUsageScope,
-										Model:                 []string{"账号 × 模型 明细", "账号级汇总"},
+										Model:                 []string{"账号 × 模型 明细", "按账号汇总", "按模型汇总"},
 										CurrentIndex:          0,
 										OnCurrentIndexChanged: a.refreshUsage,
 									},
@@ -749,20 +751,36 @@ func showCommandFor(minimized, visible bool) int32 {
 }
 
 // showWindow 从托盘把主窗口带回前台：还原（若最小化）→ 显示 → 置前。
+//
+// Windows 前台锁定（foreground lock）：当本进程不是前台进程时，
+// SetActiveWindow/SetFocus 会被系统静默忽略（任务栏闪一下，窗口不置前）。
+// 因此必须走 SetForegroundWindow——而它要求先 AttachThreadInput 挂到当前
+// 前台线程，否则同样被忽略。这是 Windows 下"托盘点出窗口"的标准做法。
 func (a *app) showWindow() {
 	if a.mw == nil {
 		return
 	}
-	minimized := win.IsIconic(a.mw.Handle())
-	if minimized {
+	hwnd := a.mw.Handle()
+	if win.IsIconic(hwnd) {
 		// 最小化：显式还原。SW_RESTORE 同时会激活窗口。
-		win.ShowWindow(a.mw.Handle(), showCommandFor(minimized, true))
+		win.ShowWindow(hwnd, win.SW_RESTORE)
 		return
 	}
-	// 未最小化：走 walk 的 Show()（内部 SW_SHOWNA）+ 置前 + 抢焦点，
-	// 保持既有"收进托盘后再点出来"的行为不变。
-	a.mw.Show()
-	_ = a.mw.Activate()
+	// 未最小化：显示 + 强制置前。
+	win.ShowWindow(hwnd, win.SW_SHOW)
+	win.BringWindowToTop(hwnd)
+	// 挂到当前前台线程，绕过前台锁定，才能真正抢到前台。
+	cur := win.GetForegroundWindow()
+	if cur != 0 {
+		curTid := win.GetWindowThreadProcessId(cur, nil)
+		myTid := win.GetCurrentThreadId()
+		if curTid != myTid {
+			win.AttachThreadInput(int32(myTid), int32(curTid), true)
+			defer win.AttachThreadInput(int32(myTid), int32(curTid), false)
+		}
+	}
+	win.SetForegroundWindow(hwnd)
+	win.SetActiveWindow(hwnd)
 	_ = a.mw.SetFocus()
 }
 

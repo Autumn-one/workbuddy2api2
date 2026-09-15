@@ -211,6 +211,31 @@ func (s *Service) SetPriority(uid string, priority float64) {
 	p.SetPriority(uid, priority)
 }
 
+// SetAccountActive 设置账号是否进入活跃号池（GUI 复选框：临时指定只用某几个账号）。
+// 实时生效（下一个请求的 Pick 即跳过未勾选账号）；勾选状态持久化在 state.json。
+// 服务未启动时空操作（账号表本来就空，无框可勾）。
+func (s *Service) SetAccountActive(uid string, active bool) {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.SetActive(uid, active)
+}
+
+// SetActiveAccounts 精确设定活跃集（全选/反选/单框切换后的整体对齐）。
+// activeUIDs 为空 = 无号可用（GUI 侧自行防呆/确认）。
+func (s *Service) SetActiveAccounts(activeUIDs []string) {
+	s.mu.Lock()
+	p := s.pool
+	s.mu.Unlock()
+	if p == nil {
+		return
+	}
+	p.SetActiveSet(activeUIDs)
+}
+
 // Start 按配置装配并启动服务（幂等）。
 func (s *Service) Start(cfg *appconfig.Config) error {
 	s.mu.Lock()

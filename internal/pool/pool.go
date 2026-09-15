@@ -77,6 +77,10 @@ type Status struct {
 	PeakActive   bool      `json:"peak_active"`    // 峰值是否仍在可见窗口内
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+
+	// Active 是否在活跃号池中（GUI 复选框勾选的账号）。false = 用户临时排除出轮换；
+	// 只影响 chat 选号，不影响签到/额度刷新等维护路径。
+	Active bool `json:"active"`
 }
 
 // CreditChange 一次积分变动（观测用，不参与任何决策）。
@@ -249,6 +253,9 @@ type stateAccount struct {
 // stateFile 持久化格式。
 type stateFile struct {
 	Accounts map[string]stateAccount `json:"accounts"`
+	// InactiveAccounts 用户临时排除出号池的账号 UID（GUI 复选框未勾选的账号）。
+	// 缺字段（旧文件）= 空 = 全部活跃，与引入该功能前行为一致。
+	InactiveAccounts []string `json:"inactive_accounts,omitempty"`
 }
 
 // flushInterval 后台落盘周期。
@@ -299,6 +306,11 @@ type Pool struct {
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+
+	// inactive 用户通过 GUI 复选框临时排除出号池的账号集合（chat 选号不再命中）。
+	// 空集 = 全部账号活跃（默认）。该集合持久化在 state.json，重启后恢复。
+	// 与 disabled 正交：disabled 是 session 死亡（需重登），inactive 是用户临时指定。
+	inactive map[string]bool
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -331,6 +343,7 @@ func New(stateFp string) *Pool {
 		breakerCooldownMax: defaultBreakerCooldownMax,
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
+		inactive:           map[string]bool{},
 	}
 	if stateFp != "" {
 		p.load()
@@ -472,6 +485,60 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
+// ── 活跃号池（GUI 复选框）──
+
+// SetActive 设置账号是否在活跃号池中（false = 用户临时排除，chat 不再命中）。
+// 只影响选号，不影响签到/额度刷新等维护路径。变更会落盘（重启后恢复）。
+func (p *Pool) SetActive(uid string, active bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.byUID[uid]; !ok {
+		return
+	}
+	if active {
+		delete(p.inactive, uid)
+	} else {
+		p.inactive[uid] = true
+	}
+	p.dirty.Store(true)
+}
+
+// SetActiveSet 精确设定活跃集：activeUIDs 列出的账号为活跃，其余已知账号全部排除。
+// 全选 = 传全部 UID；反选 = GUI 先算好反转后的集合再传入。
+// 注意：activeUIDs 为空时【字面生效】——没有任何账号参与选号，chat 将返回 503，
+// 该状态在 GUI 状态列与日志里明确可见（用户明确操作的预期结果，不静默纠正）。
+func (p *Pool) SetActiveSet(activeUIDs []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	keep := make(map[string]bool, len(activeUIDs))
+	for _, u := range activeUIDs {
+		keep[u] = true
+	}
+	for uid := range p.byUID {
+		if keep[uid] {
+			delete(p.inactive, uid)
+		} else {
+			p.inactive[uid] = true
+		}
+	}
+	p.dirty.Store(true)
+	if len(p.inactive) == len(p.byUID) && len(p.byUID) > 0 {
+		log.Printf("pool: 活跃号池已空（复选框全未勾选），chat 请求将无号可用")
+	}
+}
+
+// IsActive 报告账号是否在活跃号池中（不存在的账号按活跃算：未知账号不参与选号，语义无所谓）。
+func (p *Pool) IsActive(uid string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return !p.inactive[uid]
+}
+
+// active 报告 uid 是否在活跃集（调用方持锁）。
+func (p *Pool) active(uid string) bool {
+	return !p.inactive[uid]
+}
+
 // startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘；
 // 顺带按固定周期清扫已过期的模型级冷却条目（防止（账号×模型）map 无限增长）。
 func (p *Pool) startFlusher() {
@@ -528,6 +595,7 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	for uid := range p.byUID {
 		if !seen[uid] {
 			delete(p.byUID, uid)
+			delete(p.inactive, uid) // 剔除的账号连带清出排除集，防 UID 幽灵残留
 			changed = true
 		}
 	}
@@ -576,6 +644,9 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
+		if !p.active(uid) {
+			continue // 用户复选框排除：不参与 chat 选号
+		}
 		if !e.healthy(now) {
 			continue
 		}
@@ -603,7 +674,7 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 	}
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
-		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用与用户排除的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now)
 	}
 	// top5 短名单按三因子权重降序截断（而非 credits 单纯降序）：否则闲置补偿 + 成功率
@@ -665,9 +736,12 @@ func (p *Pool) pick(tried map[string]bool, model string) *auth.Auth {
 // 无候选或未命中概率时返回 nil。调用方需已持 p.mu。
 func (p *Pool) pickHalfOpenLocked(model string, now time.Time) *auth.Auth {
 	var cands []*entry
-	for _, e := range p.byUID {
+	for uid, e := range p.byUID {
 		if e.disabled {
 			continue
+		}
+		if !p.active(uid) {
+			continue // 用户复选框排除的账号不做半开探测
 		}
 		// 与 HalfOpenAllowed 共用同一判定（entry.modelProbeWindow）
 		if !e.modelProbeWindow(model, now) {
@@ -728,6 +802,9 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time) *a
 	for uid, e := range p.byUID {
 		if tried != nil && tried[uid] {
 			continue
+		}
+		if !p.active(uid) {
+			continue // 用户复选框排除的账号不参与兜底
 		}
 		if e.disabled {
 			continue // 禁用的账号永不参与兜底
@@ -1437,6 +1514,9 @@ func (p *Pool) AvailableUIDs() []string {
 	now := time.Now()
 	uids := make([]string, 0, len(p.byUID))
 	for uid, e := range p.byUID {
+		if !p.active(uid) {
+			continue // 用户复选框排除
+		}
 		if !e.healthy(now) {
 			continue
 		}
@@ -1461,6 +1541,9 @@ func (p *Pool) PickByUID(uid, model string) *auth.Auth {
 	if !ok {
 		return nil
 	}
+	if !p.active(uid) {
+		return nil // 用户复选框排除：粘性会话也解开，回落普通轮换
+	}
 	now := time.Now()
 	if !e.healthy(now) {
 		return nil
@@ -1484,7 +1567,10 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	for _, e := range p.byUID {
+	for uid, e := range p.byUID {
+		if !p.active(uid) {
+			continue // 用户复选框排除：不参与健康/冷却/满载计数（对外口径与选号一致）
+		}
 		total++
 		switch {
 		case e.disabled:
@@ -1509,7 +1595,10 @@ func (p *Pool) ServableNow() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	now := time.Now()
-	for _, e := range p.byUID {
+	for uid, e := range p.byUID {
+		if !p.active(uid) {
+			continue // 用户复选框排除：不参与可服务判定
+		}
 		if e.healthy(now) && !p.inFlightFull(e) {
 			return true
 		}
@@ -1554,6 +1643,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		ContentRejects:  e.contentRejects,
 		SuspectedBanned: e.contentRejects >= suspectBanThreshold && now.Before(e.until),
 		BreakerUntil:    e.breakerUntil,
+		Active:          !p.inactive[uid],
 	}
 	if pk, ok := e.peakVisible(now); ok {
 		st.InFlightPeak = pk
@@ -1584,6 +1674,9 @@ func (p *Pool) load() {
 		return
 	}
 	p.applyAccountsLocked(sf.Accounts)
+	for _, uid := range sf.InactiveAccounts {
+		p.inactive[uid] = true
+	}
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
@@ -1675,6 +1768,13 @@ func (p *Pool) notePersistFail(err error) {
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	sf := stateFile{Accounts: map[string]stateAccount{}}
+	for uid := range p.inactive {
+		// 只记录仍存在的账号（SyncToDir 已删的账号顺带清出排除集）。
+		if _, ok := p.byUID[uid]; ok {
+			sf.InactiveAccounts = append(sf.InactiveAccounts, uid)
+		}
+	}
+	sort.Strings(sf.InactiveAccounts)
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
 			Credits:      e.credits,
