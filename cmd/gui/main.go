@@ -1368,6 +1368,8 @@ type app struct {
 	tray     *walk.NotifyIcon
 	trayOK   bool // 托盘图标是否注册成功（决定关闭时能否用气泡提示）
 	quitting bool
+	// restarting 原地重启进行中（托盘「重新启动」已拉起守望者，防连点重复拉起）。
+	restarting bool
 }
 
 // logFilePath 落盘日志路径（启动后填入）；无控制台窗口时靠它排查问题。
@@ -2310,6 +2312,74 @@ func (a *app) doDeleteAccount() {
 func (a *app) takeSelection(fn func(int)) {
 	idx := a.tvAccounts.CurrentIndex()
 	fn(idx)
+}
+
+// ── 原地重启（托盘菜单）──
+
+// relaunchSelf 原地重启进程：先拉起一个"等本进程退出后再启动 exe"的守望者，
+// 然后走正常退出流程（停服务、落盘、收托盘）。
+// 用途：exe 被外部「改名替换」成新版后，用户右键托盘即可吃上新版本，
+// 不用手动退出再双击。守望者等旧 PID 退出（监听端口随之释放）再启动新 exe，
+// 避免新旧进程抢同一 listen 端口。
+func (a *app) relaunchSelf() {
+	if a.restarting {
+		return // 已在退出流程中，防连点
+	}
+	target := relaunchTarget()
+	ps := fmt.Sprintf(
+		"try { Wait-Process -Id %d -Timeout 30 -ErrorAction Stop } catch {}; "+
+			"Start-Process -FilePath '%s' -WorkingDirectory '%s'",
+		os.Getpid(),
+		strings.ReplaceAll(target, "'", "''"),
+		strings.ReplaceAll(exeDir(), "'", "''"))
+	if err := exec.Command("powershell", "-NoProfile", "-NonInteractive",
+		"-WindowStyle", "Hidden", "-Command", ps).Start(); err != nil {
+		walk.MsgBox(a.mw, appName, "重启失败（守望进程拉起失败）：\n"+err.Error(), walk.MsgBoxIconError)
+		return
+	}
+	a.restarting = true
+	log.Printf("原地重启：等待本进程退出后启动 %s", target)
+	a.quit()
+}
+
+// relaunchTarget 决定重启时要拉起哪个 exe。
+//
+// 正常情况就是自己（os.Executable()）。但「改名替换」场景下（运行中的
+// wb2api-gui.exe 被改名成 wb2api-gui.prevN.exe、新版占了原名），
+// GetModuleFileName 返回的是【改名后】的路径——直接拉它会起回旧版。
+// 此时按 .prevN 后缀约定找回原名：那里放着的就是新版 exe。
+func relaunchTarget() string {
+	exe, err := os.Executable()
+	if err != nil || exe == "" {
+		return exe
+	}
+	if name, ok := swappedOutExeName(filepath.Base(exe)); ok {
+		cand := filepath.Join(filepath.Dir(exe), name)
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
+	}
+	return exe
+}
+
+// swappedOutExeName 若文件名符合「改名替换」约定（X.prevN.exe，N 可省），
+// 返回原名 X.exe；否则 ok=false。与部署侧 rename 备份命名保持同一约定。
+func swappedOutExeName(base string) (string, bool) {
+	i := strings.LastIndex(base, ".prev")
+	if i <= 0 {
+		return "", false
+	}
+	mid := base[i+len(".prev"):]
+	if !strings.HasSuffix(strings.ToLower(mid), ".exe") {
+		return "", false
+	}
+	num := mid[:len(mid)-len(".exe")]
+	for _, r := range num {
+		if r < '0' || r > '9' {
+			return "", false
+		}
+	}
+	return base[:i] + ".exe", true
 }
 
 // ── 开机自启 ──

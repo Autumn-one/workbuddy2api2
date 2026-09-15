@@ -699,6 +699,13 @@ func (a *app) initTray() {
 	stopA.Triggered().Attach(a.doStop)
 	_ = ni.ContextMenu().Actions().Add(stopA)
 
+	// 原地重启进程：exe 被外部换新后（改名替换），不用手动关再开。
+	// 与上面「停止/启动服务」不同——那对网关生效，这个是整个程序退出重开。
+	restartA := walk.NewAction()
+	_ = restartA.SetText("重新启动（加载最新 exe）")
+	restartA.Triggered().Attach(func() { a.relaunchSelf() })
+	_ = ni.ContextMenu().Actions().Add(restartA)
+
 	_ = ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 
 	quit := walk.NewAction()
