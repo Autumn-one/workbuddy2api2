@@ -1866,6 +1866,9 @@ func (a *app) doLoginDone() {
 			a.lblLogin.SetText(msg)
 			a.leURL.SetText("")
 			a.refreshAccounts()
+			// 新账号立即补齐代理绑定并显示（否则要等下次刷新才出现对应行）；
+			// 代理未开启时内部直接清空返回，无额外开销。
+			a.refreshProxyBindings()
 		})
 	}()
 }
