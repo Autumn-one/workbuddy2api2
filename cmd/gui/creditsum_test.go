@@ -20,12 +20,12 @@ func TestSumCreditsBasic(t *testing.T) {
 		{UID: "b", Credits: 250, CreditsKnown: true},
 		{UID: "c", Credits: 30, CreditsKnown: true},
 	}
-	got, unknown, known := sumCredits(items)
+	got, unknown, invalid, known := sumCredits(items)
 	if got != 380 {
 		t.Errorf("总数=%d want 380", got)
 	}
-	if unknown != 0 || known != 3 {
-		t.Errorf("unknown=%d known=%d want 0/3", unknown, known)
+	if unknown != 0 || invalid != 0 || known != 3 {
+		t.Errorf("unknown=%d invalid=%d known=%d want 0/0/3", unknown, invalid, known)
 	}
 }
 
@@ -36,23 +36,54 @@ func TestSumCreditsSkipsUnknown(t *testing.T) {
 		{UID: "b", Credits: 0, CreditsKnown: false}, // 从未刷新过 → 未知，不是 0
 		{UID: "c", Credits: 0, CreditsKnown: true},  // 真的是 0（额度用尽）
 	}
-	got, unknown, known := sumCredits(items)
+	got, unknown, invalid, known := sumCredits(items)
 	if got != 100 {
 		t.Errorf("总数=%d want 100（未知不得当 0 计入）", got)
 	}
 	if unknown != 1 {
 		t.Errorf("未知账号数=%d want 1", unknown)
 	}
+	if invalid != 0 {
+		t.Errorf("无效账号数=%d want 0", invalid)
+	}
 	if known != 2 {
 		t.Errorf("已知账号数=%d want 2", known)
 	}
 }
 
+// TestSumCreditsSkipsNeverSucceeded 核心：发生过调用但从未成功的账号不计入总数。
+func TestSumCreditsSkipsNeverSucceeded(t *testing.T) {
+	items := []pool.Status{
+		{UID: "good", Credits: 500, CreditsKnown: true, SuccessCount: 3, ErrTotal: 1}, // 有效
+		{UID: "dead", Credits: 900, CreditsKnown: true, SuccessCount: 0, ErrTotal: 7}, // 无效：调用过但从未成功
+		{UID: "new", Credits: 200, CreditsKnown: true},                                // 从未调用过 → 未证伪，按有效
+	}
+	got, unknown, invalid, known := sumCredits(items)
+	if got != 700 {
+		t.Errorf("总数=%d want 700（dead 的 900 不得计入）", got)
+	}
+	if unknown != 0 || invalid != 1 || known != 2 {
+		t.Errorf("unknown=%d invalid=%d known=%d want 0/1/2", unknown, invalid, known)
+	}
+}
+
+// TestSumCreditsInvalidZeroCredits 无效账号即使积分为 0 也只计入 invalid 计数，
+// 不得混入 known（口径一致：known 表示"参与求和的有效账号数"）。
+func TestSumCreditsInvalidZeroCredits(t *testing.T) {
+	items := []pool.Status{
+		{UID: "dead0", Credits: 0, CreditsKnown: true, SuccessCount: 0, ErrTotal: 2},
+	}
+	got, _, invalid, known := sumCredits(items)
+	if got != 0 || invalid != 1 || known != 0 {
+		t.Errorf("got total=%d invalid=%d known=%d want 0/1/0", got, invalid, known)
+	}
+}
+
 // TestSumCreditsEmpty 空列表安全。
 func TestSumCreditsEmpty(t *testing.T) {
-	got, unknown, known := sumCredits(nil)
-	if got != 0 || unknown != 0 || known != 0 {
-		t.Errorf("空列表应全 0, got %d/%d/%d", got, unknown, known)
+	got, unknown, invalid, known := sumCredits(nil)
+	if got != 0 || unknown != 0 || invalid != 0 || known != 0 {
+		t.Errorf("空列表应全 0, got %d/%d/%d/%d", got, unknown, invalid, known)
 	}
 }
 
@@ -72,6 +103,23 @@ func TestTotalCreditsText(t *testing.T) {
 			name:  "含未知账号要提示",
 			items: []pool.Status{{Credits: 1000, CreditsKnown: true}, {Credits: 0, CreditsKnown: false}},
 			want:  "总积分 1,000 · 2 个账号（1 个未刷新额度，未计入）",
+		},
+		{
+			name: "含从未成功账号要提示且不计入",
+			items: []pool.Status{
+				{UID: "good", Credits: 1000, CreditsKnown: true, SuccessCount: 2},
+				{UID: "dead", Credits: 800, CreditsKnown: true, ErrTotal: 5},
+			},
+			want: "总积分 1,000 · 2 个账号（1 个从未调用成功，未计入）",
+		},
+		{
+			name: "未知与无效同时存在时合并提示",
+			items: []pool.Status{
+				{UID: "good", Credits: 1000, CreditsKnown: true, SuccessCount: 1},
+				{UID: "unk", CreditsKnown: false},
+				{UID: "dead", Credits: 500, CreditsKnown: true, ErrTotal: 3},
+			},
+			want: "总积分 1,000 · 3 个账号（1 个未刷新额度、1 个从未调用成功，未计入）",
 		},
 		{
 			name:  "空账号",
