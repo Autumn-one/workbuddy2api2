@@ -2255,14 +2255,8 @@ func (a *app) doInvertActive() {
 			inverted = append(inverted, s.UID)
 		}
 	}
-	if len(inverted) == 0 && len(items) > 0 {
-		// 反选结果为空 = 当前全选时点反选：确认（后果是网关完全无号可用）。
-		if walk.MsgBox(a.mw, appName,
-			"反选后将没有任何账号被勾选，网关会完全无法处理请求（503）。\n确定继续吗？",
-			walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
-			return
-		}
-	}
+	// 反选到空不再弹确认框：用户明确知道这意味着"网关暂时无号可用"（503），
+	// 状态列与号池计数会立刻显示结果，想恢复点「全选」即可。
 	a.svc.SetActiveAccounts(inverted)
 	a.refreshAccountsNow()
 	a.refreshActivePoolLabel()
