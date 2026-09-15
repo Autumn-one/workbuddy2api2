@@ -36,10 +36,12 @@ func (a *app) buildUI() error {
 		AssignTo: &a.mw,
 		Title:    appName + " · 控制台",
 		Icon:     ic,
-		MinSize:  dcl.Size{Width: 800, Height: 540},
+		MinSize:  dcl.Size{Width: 700, Height: 540},
 		// 尺寸：多数页面用不到宽窗口（表格可横向滚动，需要时用户拖大即可）。
-		// 从 1080 逐步收窄到 880。
-		Size:   dcl.Size{Width: 880, Height: 620},
+		// 从 1080 逐步收窄到 780。账号/代理两页的工具栏已改成分组 Flow 布局：
+		// 窗口变窄时按组整体换行，不会像 HBox 那样把右侧按钮直接裁出窗口，
+		// 因此默认宽度可以安全地再降一档。
+		Size:   dcl.Size{Width: 780, Height: 620},
 		Font:   dcl.Font{Family: "Segoe UI", PointSize: 9},
 		Layout: dcl.VBox{MarginsZero: false},
 		Children: []dcl.Widget{
@@ -61,7 +63,7 @@ func (a *app) buildUI() error {
 									dcl.Composite{
 										Layout: dcl.HBox{Spacing: 6},
 										Children: []dcl.Widget{
-											dcl.Label{AssignTo: &a.lblAddr, Text: "—"},
+											dcl.Label{AssignTo: &a.lblAddr, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "—"},
 											dcl.PushButton{
 												Text:      "复制",
 												MinSize:   dcl.Size{Width: 52},
@@ -69,12 +71,12 @@ func (a *app) buildUI() error {
 											},
 											// 复制结果提示：刻意不用 lblState —— 它每 1.5s 被
 											// refreshStatus 重写，提示会被立刻冲掉。
-											dcl.Label{AssignTo: &a.lblCopyHint, Text: ""},
+											dcl.Label{AssignTo: &a.lblCopyHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: ""},
 											dcl.HSpacer{},
 										},
 									},
 									dcl.Label{Text: "账号"},
-									dcl.Label{AssignTo: &a.lblAccts, Text: "—"},
+									dcl.Label{AssignTo: &a.lblAccts, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "—"},
 								},
 							},
 							dcl.Composite{
@@ -116,33 +118,41 @@ func (a *app) buildUI() error {
 						Title:  "账号",
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
+							// 工具栏用【固定两行 HBox】：Flow 布局会把内容最小宽度反馈给主窗口
+							// （实测：拖宽后窗口被卡在宽尺寸，拖不回去），且 Flow 容器高度按
+							// "全部排一行"估算会把下面的列表顶得很远。两行 HBox 高度固定，列表紧贴。
 							dcl.Composite{
-								Layout: dcl.HBox{Spacing: 8},
+								Layout:  dcl.VBox{Spacing: 6, MarginsZero: true},
+								MaxSize: dcl.Size{Height: 64}, // 封顶：杜绝布局估算把工具栏撑高
 								Children: []dcl.Widget{
-									dcl.PushButton{AssignTo: &btnRefresh, Text: "刷新", MinSize: dcl.Size{Width: 80}, OnClicked: a.refreshAccounts},
-									dcl.PushButton{AssignTo: &a.btnRefreshCredits, Text: "刷新额度", MinSize: dcl.Size{Width: 90}, OnClicked: a.doRefreshCredits},
-									// 单账号操作：针对选中的那一行（批量版是"全部"，两者并存）。
-									dcl.PushButton{Text: "签到选中", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCheckinSelected},
-									dcl.PushButton{Text: "刷新选中额度", MinSize: dcl.Size{Width: 100}, OnClicked: a.doRefreshCreditsSelected},
-									dcl.PushButton{AssignTo: &btnCheckin, Text: "手动签到全部", MinSize: dcl.Size{Width: 110}, OnClicked: a.doCheckinAll},
-									// 优先级：每个账号可单独设权重值（选号权重乘子）。
-									// 权重越大越常被选中（如一次性账号希望优先消耗其额度）；
-									// <1 表示降低优先级；0 = 取消设置（回到 1.0）。
-									dcl.Label{Text: "优先级"},
-									dcl.LineEdit{AssignTo: &a.lePriority, CueBanner: "如 3 / 0.5", MinSize: dcl.Size{Width: 70}},
-									dcl.PushButton{Text: "设置", MinSize: dcl.Size{Width: 60}, OnClicked: a.doApplyPriority},
-									dcl.PushButton{Text: "取消", MinSize: dcl.Size{Width: 60}, OnClicked: func() { a.doSetPriority(0) }},
-									dcl.PushButton{Text: "解除疑似拉黑", MinSize: dcl.Size{Width: 110}, OnClicked: a.doClearSuspectBan},
-									dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
-									// 一键检测：先选模型，再横向扫全部账号的可用性。
-									// 模型下拉框必须在账号页——用户点击前要能看到并修改要测哪个模型。
-									// 会消耗少量积分（每账号 1 次小请求），点击后有确认提示。
-									dcl.Label{Text: "检测模型"},
-									dcl.ComboBox{AssignTo: &a.cbMatrixModel, Model: []string{"（请先到「模型」页加载参数）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 180}},
-									dcl.PushButton{AssignTo: &a.btnMatrixProbe, Text: "检测模型可用性", MinSize: dcl.Size{Width: 120}, OnClicked: a.doMatrixProbe},
-									dcl.PushButton{AssignTo: &a.btnMatrixStop, Text: "停止检测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doStopMatrixProbe},
-									dcl.HSpacer{},
-									dcl.Label{AssignTo: &a.lblAccts2, Text: ""},
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 8, MarginsZero: true},
+										Children: []dcl.Widget{
+											dcl.PushButton{AssignTo: &btnRefresh, Text: "刷新", MinSize: dcl.Size{Width: 80}, OnClicked: a.refreshAccounts},
+											dcl.PushButton{AssignTo: &a.btnRefreshCredits, Text: "刷新额度", MinSize: dcl.Size{Width: 90}, OnClicked: a.doRefreshCredits},
+											dcl.PushButton{Text: "签到选中", MinSize: dcl.Size{Width: 80}, OnClicked: a.doCheckinSelected},
+											dcl.PushButton{Text: "刷新选中额度", MinSize: dcl.Size{Width: 100}, OnClicked: a.doRefreshCreditsSelected},
+											dcl.PushButton{AssignTo: &btnCheckin, Text: "手动签到全部", MinSize: dcl.Size{Width: 110}, OnClicked: a.doCheckinAll},
+											dcl.PushButton{Text: "解除疑似拉黑", MinSize: dcl.Size{Width: 110}, OnClicked: a.doClearSuspectBan},
+											dcl.PushButton{AssignTo: &btnDelete, Text: "删除选中账号", MinSize: dcl.Size{Width: 110}, OnClicked: a.doDeleteAccount},
+										},
+									},
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 8, MarginsZero: true},
+										Children: []dcl.Widget{
+											dcl.Label{Text: "优先级"},
+											dcl.LineEdit{AssignTo: &a.lePriority, CueBanner: "如 3 / 0.5", MinSize: dcl.Size{Width: 70}},
+											dcl.PushButton{Text: "设置", MinSize: dcl.Size{Width: 60}, OnClicked: a.doApplyPriority},
+											dcl.PushButton{Text: "取消", MinSize: dcl.Size{Width: 60}, OnClicked: func() { a.doSetPriority(0) }},
+											dcl.Label{Text: "检测模型"},
+											dcl.ComboBox{AssignTo: &a.cbMatrixModel, Model: []string{"（请先到「模型」页加载参数）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 160}, MaxSize: dcl.Size{Width: 200}},
+											dcl.PushButton{AssignTo: &a.btnMatrixProbe, Text: "检测全部", MinSize: dcl.Size{Width: 80}, OnClicked: a.doMatrixProbe},
+											dcl.PushButton{AssignTo: &a.btnMatrixProbeSelected, Text: "检测选中", MinSize: dcl.Size{Width: 80}, OnClicked: a.doMatrixProbeSelected},
+											dcl.PushButton{AssignTo: &a.btnMatrixStop, Text: "停止检测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doStopMatrixProbe},
+											dcl.HSpacer{},
+											dcl.Label{AssignTo: &a.lblAccts2, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: ""},
+										},
+									},
 								},
 							},
 							dcl.Composite{
@@ -151,18 +161,21 @@ func (a *app) buildUI() error {
 									// 总积分统计：账号页一眼看到全部账号的积分总量。
 									// 字体加大加粗以便扫视；未知账号（未刷新过额度）不计入并明确提示。
 									dcl.Label{
-										AssignTo: &a.lblTotalCredits,
-										Text:     "总积分 0 · 0 个账号",
-										Font:     dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+										AssignTo:     &a.lblTotalCredits,
+										Text:         "总积分 0 · 0 个账号",
+										Font:         dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+										MinSize:      dcl.Size{Width: 10},
+										EllipsisMode: dcl.EllipsisEnd,
 									},
 									dcl.HSpacer{},
 								},
 							},
 							dcl.TableView{
-								AssignTo:         &a.tvAccounts,
-								Model:            a.accounts,
-								AlternatingRowBG: true,
-								StretchFactor:    1,
+								AssignTo:            &a.tvAccounts,
+								Model:               a.accounts,
+								AlternatingRowBG:    true,
+								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+								StretchFactor:       1,
 								// 双击一行 = 直接看该账号的积分变化历史（跳到「日志」页并过滤）。
 								OnItemActivated: a.onAccountActivated,
 								Columns: []dcl.TableViewColumn{
@@ -176,7 +189,7 @@ func (a *app) buildUI() error {
 									{Title: "成功/总", Width: 90, Alignment: dcl.AlignFar},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblAccountsHint, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行后可「签到选中」「刷新选中额度」或删除；双击一行看该账号的积分变化历史。"},
+							dcl.Label{AssignTo: &a.lblAccountsHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "提示：账号来自 auths 目录下的凭证文件。选中一行后可「签到选中」「刷新选中额度」或删除；双击一行看该账号的积分变化历史。"},
 						},
 					},
 
@@ -196,14 +209,15 @@ func (a *app) buildUI() error {
 								Children: []dcl.Widget{
 									dcl.PushButton{AssignTo: &btnReloadRates, Text: "重新加载参数", MinSize: dcl.Size{Width: 110}, OnClicked: func() { go a.loadModelRates() }},
 									dcl.HSpacer{},
-									dcl.Label{AssignTo: &a.lblModelHint, Text: ""},
+									dcl.Label{AssignTo: &a.lblModelHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: ""},
 								},
 							},
 							dcl.TableView{
-								AssignTo:         &a.tvModelRates,
-								Model:            a.modelRates,
-								AlternatingRowBG: true,
-								StretchFactor:    1,
+								AssignTo:            &a.tvModelRates,
+								Model:               a.modelRates,
+								AlternatingRowBG:    true,
+								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+								StretchFactor:       1,
 								Columns: []dcl.TableViewColumn{
 									{Title: "模型 ID", Width: 160},
 									{Title: "名称", Width: 150},
@@ -219,7 +233,7 @@ func (a *app) buildUI() error {
 									{Title: "说明", Width: 200},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblModelDetail, Text: "选中一行查看该模型的完整参数。"},
+							dcl.Label{AssignTo: &a.lblModelDetail, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "选中一行查看该模型的完整参数。"},
 						},
 					},
 
@@ -235,8 +249,10 @@ func (a *app) buildUI() error {
 								Children: []dcl.Widget{
 									dcl.Label{Text: "账号"},
 									dcl.Label{Text: "模型"},
-									dcl.ComboBox{AssignTo: &a.cbProbeAcct, MinSize: dcl.Size{Width: 260}},
-									dcl.ComboBox{AssignTo: &a.cbProbeModel, MinSize: dcl.Size{Width: 260}},
+									// MaxSize 封顶：ComboBox 最小宽度 = 最宽选项文本宽，
+									// 长账号名/长模型 ID 会把整行撑宽。
+									dcl.ComboBox{AssignTo: &a.cbProbeAcct, MinSize: dcl.Size{Width: 260}, MaxSize: dcl.Size{Width: 260}},
+									dcl.ComboBox{AssignTo: &a.cbProbeModel, MinSize: dcl.Size{Width: 260}, MaxSize: dcl.Size{Width: 260}},
 									dcl.Label{Text: "提示词（可选）"},
 									dcl.Label{Text: "输出上限（可选）"},
 									dcl.LineEdit{AssignTo: &a.leProbePrompt, CueBanner: "留空 = 仅回复1", MinSize: dcl.Size{Width: 260}},
@@ -286,7 +302,7 @@ func (a *app) buildUI() error {
 									dcl.HSpacer{},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblLogin, Text: "等待操作。"},
+							dcl.Label{AssignTo: &a.lblLogin, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "等待操作。"},
 							dcl.VSpacer{},
 						},
 					},
@@ -302,10 +318,11 @@ func (a *app) buildUI() error {
 								StretchFactor: 1,
 								Children: []dcl.Widget{
 									dcl.TableView{
-										AssignTo:         &a.tvCheckin,
-										Model:            a.checkins,
-										AlternatingRowBG: true,
-										StretchFactor:    1,
+										AssignTo:            &a.tvCheckin,
+										Model:               a.checkins,
+										AlternatingRowBG:    true,
+										LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+										StretchFactor:       1,
 										Columns: []dcl.TableViewColumn{
 											{Title: "时间", Width: 120},
 											{Title: "账号", Width: 190},
@@ -324,22 +341,26 @@ func (a *app) buildUI() error {
 										Layout: dcl.HBox{Spacing: 8},
 										Children: []dcl.Widget{
 											dcl.Label{Text: "按账号过滤"},
+											// MaxSize 封顶：下拉项是账号昵称，长昵称会把整行撑宽。
 											dcl.ComboBox{
 												AssignTo:              &a.cbCreditFilter,
 												Model:                 []string{creditAllLabel},
 												CurrentIndex:          0,
 												OnCurrentIndexChanged: a.onCreditFilterChanged,
+												MinSize:               dcl.Size{Width: 120},
+												MaxSize:               dcl.Size{Width: 200},
 											},
 											dcl.PushButton{Text: "显示全部", MinSize: dcl.Size{Width: 80}, OnClicked: func() { a.setCreditFilter(creditAllUIDs) }},
 											dcl.HSpacer{},
-											dcl.Label{AssignTo: &a.lblCreditFilter, Text: ""},
+											dcl.Label{AssignTo: &a.lblCreditFilter, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: ""},
 										},
 									},
 									dcl.TableView{
-										AssignTo:         &a.tvCredits,
-										Model:            a.credits,
-										AlternatingRowBG: true,
-										StretchFactor:    1,
+										AssignTo:            &a.tvCredits,
+										Model:               a.credits,
+										AlternatingRowBG:    true,
+										LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+										StretchFactor:       1,
 										Columns: []dcl.TableViewColumn{
 											{Title: "时间", Width: 120},
 											{Title: "账号", Width: 160},
@@ -399,15 +420,18 @@ func (a *app) buildUI() error {
 								},
 							},
 							dcl.Label{
-								AssignTo: &a.lblUsageTotal,
-								Text:     "—",
-								Font:     dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+								AssignTo:     &a.lblUsageTotal,
+								Text:         "—",
+								Font:         dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+								MinSize:      dcl.Size{Width: 10},
+								EllipsisMode: dcl.EllipsisEnd,
 							},
 							dcl.TableView{
-								AssignTo:         &a.tvUsage,
-								Model:            a.usage,
-								AlternatingRowBG: true,
-								StretchFactor:    1,
+								AssignTo:            &a.tvUsage,
+								Model:               a.usage,
+								AlternatingRowBG:    true,
+								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+								StretchFactor:       1,
 								Columns: []dcl.TableViewColumn{
 									{Title: "账号", Width: 140},
 									{Title: "模型", Width: 190},
@@ -431,21 +455,28 @@ func (a *app) buildUI() error {
 							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "每个账号走一个独立的出口 IP（各绑一个 Clash 节点），避免「同 IP 下多账号」被批量风控。" +
 								"\r\n用法：点下面那个开关即可 —— 会自动找到 Clash、读取节点、配置好并生效，" +
 								"不需要改配置文件、不需要重启任何东西。"},
+							// 与账号页相同：固定两行 HBox（不用 Flow——它会把内容最小宽度
+							// 反馈给主窗口导致拖宽后拖不回去，且高度估算把列表顶远）。
 							dcl.Composite{
-								Layout: dcl.HBox{Spacing: 10},
+								Layout:  dcl.VBox{Spacing: 6, MarginsZero: true},
+								MaxSize: dcl.Size{Height: 64},
 								Children: []dcl.Widget{
-									// 一键开关：自动发现 Clash + 自动配置 + 运行期生效（无需改配置/重启）。
-									dcl.PushButton{AssignTo: &a.btnProxyToggle, Text: "开启代理", MinSize: dcl.Size{Width: 130}, OnClicked: a.doToggleProxy},
-									dcl.Label{AssignTo: &a.lblProxyState, Text: "○ 未开启（全部直连）", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
-									dcl.HSpacer{},
-									dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
 									dcl.Composite{
-										Layout: dcl.HBox{Spacing: 8},
+										Layout: dcl.HBox{Spacing: 8, MarginsZero: true},
+										Children: []dcl.Widget{
+											// 一键开关：自动发现 Clash + 自动配置 + 运行期生效（无需改配置/重启）。
+											dcl.PushButton{AssignTo: &a.btnProxyToggle, Text: "开启代理", MinSize: dcl.Size{Width: 130}, OnClicked: a.doToggleProxy},
+											dcl.Label{AssignTo: &a.lblProxyState, Text: "○ 未开启（全部直连）", Font: dcl.Font{Family: "Segoe UI", PointSize: 10, Bold: true}},
+											dcl.PushButton{Text: "立即探测", MinSize: dcl.Size{Width: 80}, OnClicked: a.doProbeProxiesNow},
+										},
+									},
+									dcl.Composite{
+										Layout: dcl.HBox{Spacing: 8, MarginsZero: true},
 										Children: []dcl.Widget{
 											dcl.Label{Text: "指定节点"},
 											// 可选节点（含地区/延迟/可用状态），供手动选择；
-											// 不选时网关按“地区优先 + 可用”自动分配。
-											dcl.ComboBox{AssignTo: &a.cbNodePick, Model: []string{"（开启代理后可选）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 260}},
+											// 不选时网关按"地区优先 + 可用"自动分配。
+											dcl.ComboBox{AssignTo: &a.cbNodePick, Model: []string{"（开启代理后可选）"}, CurrentIndex: 0, MinSize: dcl.Size{Width: 200}, MaxSize: dcl.Size{Width: 240}},
 											dcl.PushButton{Text: "指定给选中账号", MinSize: dcl.Size{Width: 120}, OnClicked: a.doSelectNodeForAccount},
 											dcl.PushButton{Text: "换一个节点（自动）", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
 											dcl.PushButton{Text: "交还自动分配", MinSize: dcl.Size{Width: 110}, OnClicked: a.doAutoAssignSelected},
@@ -454,12 +485,13 @@ func (a *app) buildUI() error {
 									},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblProxyHint, Text: "启动时会自动开启；也可以点「开启代理」立即开启。"},
+							dcl.Label{AssignTo: &a.lblProxyHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "启动时会自动开启；也可以点「开启代理」立即开启。"},
 							dcl.TableView{
-								AssignTo:         &a.tvProxyBindings,
-								Model:            a.proxyBindings,
-								AlternatingRowBG: true,
-								StretchFactor:    1,
+								AssignTo:            &a.tvProxyBindings,
+								Model:               a.proxyBindings,
+								AlternatingRowBG:    true,
+								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+								StretchFactor:       1,
 								Columns: []dcl.TableViewColumn{
 									{Title: "账号", Width: 150},
 									{Title: "出口节点", Width: 300},
@@ -468,7 +500,7 @@ func (a *app) buildUI() error {
 									{Title: "连通", Width: 70},
 								},
 							},
-							dcl.Label{AssignTo: &a.teProxyCfg, Text: "（点「生成 listeners 配置」后显示，可复制到 Clash）"},
+							dcl.Label{AssignTo: &a.teProxyCfg, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "（点「生成 listeners 配置」后显示，可复制到 Clash）"},
 						},
 					},
 
@@ -552,7 +584,7 @@ func (a *app) buildUI() error {
 									dcl.HSpacer{},
 								},
 							},
-							dcl.Label{AssignTo: &a.lblCfgHint, Text: "签到/保活时刻写法：[9,21] 表示每天 9 点与 21 点。"},
+							dcl.Label{AssignTo: &a.lblCfgHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "签到/保活时刻写法：[9,21] 表示每天 9 点与 21 点。"},
 							dcl.VSpacer{},
 						},
 					},

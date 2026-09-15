@@ -281,7 +281,7 @@ func (r *Registry) rebindLocked(uid string) (Listener, bool) {
 		load[curPort]-- // 排除自己，避免"自己占着位置"影响选择
 	}
 	best, bestLoad := -1, 1<<30
-	bestDelay := 1<<30
+	bestDelay := 1 << 30
 	for i, l := range r.listeners {
 		if l.Port == curPort {
 			continue // 换就是要换掉当前这个
