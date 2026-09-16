@@ -17,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/lxn/walk"
-
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -245,7 +243,9 @@ func (a *app) syncMatrixModels() {
 // ─────────────────────────── UI 接线 ───────────────────────────
 
 // doMatrixProbe 账号页「检测模型可用性」入口：
-// 选模型 → 确认消耗 → 逐账号探测 → 结果写入「测试」页的结果区。
+// 选模型 → 逐账号探测 → 结果写入「测试」页的结果区。
+// 不再弹二次确认框（点击按钮本身即用户意图；消耗提示写进起始横幅，
+// 期间仍可用「停止检测」中断）。
 func (a *app) doMatrixProbe() {
 	if a.matrixBusy {
 		a.lblAccts2.SetText("检测进行中，请稍候…（可点「停止检测」中断）")
@@ -271,21 +271,12 @@ func (a *app) doMatrixProbe() {
 		}
 		return
 	}
-	// 明确告知消耗：每次检测 = 账号数 × 1 个真实请求。
+	// 消耗提示并入起始横幅：每次检测 = 账号数 × 1 个真实请求。
 	n := 0
 	for _, st := range items {
 		if !st.Disabled {
 			n++
 		}
-	}
-	if walk.MsgBox(a.mw, appName,
-		fmt.Sprintf("将逐账号检测模型 %s 是否可用。\n\n"+
-			"· 会发起约 %d 次真实请求（每个账号 1 次，max_tokens=32，消耗极小但会消耗积分）\n"+
-			"· 串行执行并带间隔，避免触发上游限流导致误判\n"+
-			"· 期间可点「停止检测」中断\n\n继续吗？", def, n),
-		walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
-		a.lblAccts2.SetText("已取消检测")
-		return
 	}
 
 	a.matrixBusy = true
@@ -297,7 +288,7 @@ func (a *app) doMatrixProbe() {
 	if a.tabs != nil {
 		_ = a.tabs.SetCurrentIndex(a.tabIndexByTitle("测试"))
 	}
-	a.appendProbeLine(fmt.Sprintf("═══ 开始检测：模型 %s × %d 个账号 ═══", def, n))
+	a.appendProbeLine(fmt.Sprintf("═══ 开始检测：模型 %s × %d 个账号（每账号 1 次真实请求，串行带间隔） ═══", def, n))
 
 	go func() {
 		rows := runMatrixProbe(a, def, func() bool { return a.matrixCancel }, func(r matrixRow) {
@@ -351,14 +342,6 @@ func (a *app) doMatrixProbeSelected() {
 			return
 		}
 		name := a.displayName(st.UID)
-		// 单账号检测也确认一次：虽然是 1 次小请求，但会真实消耗积分（用户须知情）。
-		if walk.MsgBox(a.mw, appName,
-			fmt.Sprintf("将用账号 %s 检测模型 %s 是否可用。\n\n"+
-				"· 发起 1 次真实请求（max_tokens=32，消耗极小但会消耗积分）\n\n继续吗？", name, def),
-			walk.MsgBoxYesNo|walk.MsgBoxIconQuestion) != walk.DlgCmdYes {
-			a.lblAccts2.SetText("已取消检测")
-			return
-		}
 
 		a.matrixBusy = true
 		if a.btnMatrixStop != nil {
