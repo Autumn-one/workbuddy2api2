@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -185,37 +186,49 @@ func ProbePorters(localPorts []int, apiHostPort string, timeout time.Duration) [
 	}
 	// 探测用的 Authorization 头：/version 是 Clash 的公开只读接口，无需鉴权；
 	// 若用户配了 secret，缺少它也只是 401 —— 那同样证明"端口能转发"（链路通）。
-	out := make([]ProbeResult, 0, len(localPorts))
-	for _, port := range localPorts {
-		proxyURL := "http://127.0.0.1:" + itoa(port)
-		target := "http://" + host + "/version"
-		res := ProbeResult{ProxyURL: proxyURL}
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			res.Err = err.Error()
-			out = append(out, res)
-			continue
-		}
-		tr := &http.Transport{Proxy: http.ProxyURL(u)}
-		req, err := http.NewRequest(http.MethodGet, target, nil)
-		if err != nil {
-			res.Err = err.Error()
-			out = append(out, res)
-			continue
-		}
-		resp, err := (&http.Client{Timeout: timeout, Transport: tr}).Do(req)
-		if err != nil {
-			res.Err = truncateErr(err.Error())
-			out = append(out, res)
-			continue
-		}
-		res.Status = resp.StatusCode
-		_ = resp.Body.Close()
-		// 2xx/3xx/401/403 都说明"请求经该端口转发到目标并拿到了响应"。
-		res.OK = resp.StatusCode > 0 && resp.StatusCode < 500
-		out = append(out, res)
+	//
+	// 并发实现：串行循环会让总耗时 = 全部端口耗时之和（46 个端口、死节点
+	// 各烧满 timeout 时可达近一分钟）；并发后总耗时 ≈ 最慢端口。
+	out := make([]ProbeResult, len(localPorts))
+	var wg sync.WaitGroup
+	for i, port := range localPorts {
+		wg.Add(1)
+		go func(i, port int) {
+			defer wg.Done()
+			out[i] = probePorter(port, host, timeout)
+		}(i, port)
 	}
+	wg.Wait()
 	return out
+}
+
+// probePorter 经单个本地端口请求本地 Clash API /version，返回该端口的探测结果。
+func probePorter(port int, host string, timeout time.Duration) ProbeResult {
+	proxyURL := "http://127.0.0.1:" + itoa(port)
+	target := "http://" + host + "/version"
+	res := ProbeResult{ProxyURL: proxyURL}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		res.Err = err.Error()
+		return res
+	}
+	tr := &http.Transport{Proxy: http.ProxyURL(u)}
+	defer tr.CloseIdleConnections()
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		res.Err = err.Error()
+		return res
+	}
+	resp, err := (&http.Client{Timeout: timeout, Transport: tr}).Do(req)
+	if err != nil {
+		res.Err = truncateErr(err.Error())
+		return res
+	}
+	res.Status = resp.StatusCode
+	_ = resp.Body.Close()
+	// 2xx/3xx/401/403 都说明"请求经该端口转发到目标并拿到了响应"。
+	res.OK = resp.StatusCode > 0 && resp.StatusCode < 500
+	return res
 }
 
 // truncateErr 截断错误文本（日志用，避免超长）。

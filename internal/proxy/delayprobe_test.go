@@ -49,6 +49,23 @@ func TestProbeDelaysMeasuresLatency(t *testing.T) {
 	}
 }
 
+// TestProbeDelaysLocal502IsUnhealthy 回归（实测缺陷）：Clash listener 在
+// 代理名解析不到/组为空/出口失败时会本地秒回 502——请求没经过节点。
+// 若把 5xx 记为成功，坏端口会显示"1ms 假健康"，账号永远绑在死端口上。
+func TestProbeDelaysLocal502IsUnhealthy(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer up.Close()
+	port, stop := fakeHTTPProxy(t, up.URL)
+	defer stop()
+
+	got := ProbeDelays([]Listener{{Name: "p", Node: "坏节点", Port: port}}, 3*time.Second)
+	if got["坏节点"] != 0 {
+		t.Errorf("经代理拿到 502 应判不可用(0)，got %d", got["坏节点"])
+	}
+}
+
 // TestProbeDelaysDeadPortIsZero 失败端口延迟必须为 0（不可用）。
 func TestProbeDelaysDeadPortIsZero(t *testing.T) {
 	got := ProbeDelays([]Listener{{Name: "p", Node: "死节点", Port: 1}}, 500*time.Millisecond)

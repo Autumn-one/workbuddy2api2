@@ -73,8 +73,12 @@ func probeOneDelay(port int, timeout time.Duration) int {
 	// 但读完能避免底层把"半截响应"记为连接错误）。
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
-	// 任意 HTTP 状态码都说明"请求经节点到达目标并拿到了响应"——链路是通的。
-	// （generate_204 正常返回 204；即使被劫持成别的码，通就是通。）
+	// 5xx 不能算"通"：Clash listener 在代理名解析不到 / 组为空 / 出口失败时
+	// 会本地秒回 502——请求根本没经过节点。若把 502 记为成功，坏端口会显示成
+	// "1ms 假健康"，账号永远绑在死端口上。只有 <500 才说明目标真的应答了。
+	if resp.StatusCode >= 500 {
+		return 0
+	}
 	d := time.Since(start).Milliseconds()
 	if d <= 0 {
 		return 1 // 本地回环快得测不出毫秒级，记 1 以区别于失败 0
