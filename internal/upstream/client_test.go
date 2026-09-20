@@ -261,6 +261,64 @@ func TestFetchModelsVerifiedEffortsSupplementShownButNotDowngrade(t *testing.T) 
 	}
 }
 
+// TestFetchModelsAliasEntrySynthesized 验证别名模型补录：
+// 上游 cli 列表只有 kimi-k3-1 时，FetchModels 额外合成 kimi-k3 条目——
+// id/展示名独立，其余字段克隆（倍率/容量/默认档/补全档位一致），不继承
+// IsDefault；且别名不进降级缓存，reasoning_effort 原样透传。
+func TestFetchModelsAliasEntrySynthesized(t *testing.T) {
+	var outbound []byte
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			// 与上游对 kimi-k3-1 实测一致：只给 defaultEffort、不给 supportedEfforts。
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"kimi-k3-1","name":"Kimi-K3","maxInputTokens":1000000,"maxOutputTokens":32000,"credits":"x1.62 credits","isDefault":true,"reasoning":{"defaultEffort":"medium"}}
+			],"agents":[{"name":"cli","models":["kimi-k3-1"]}]}}`), nil
+		default:
+			outbound, _ = io.ReadAll(r.Body)
+			return &http.Response{
+				StatusCode: 200,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
+			}, nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+	infos, err := c.FetchModels(a)
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if len(infos) != 2 {
+		t.Fatalf("infos=%+v want 2 项（base + 别名）", infos)
+	}
+	alias := infos[1]
+	if alias.ID != "kimi-k3" || alias.Name != "kimi-k3-origin" {
+		t.Errorf("alias id/name=%q/%q want kimi-k3/kimi-k3-origin", alias.ID, alias.Name)
+	}
+	if alias.IsDefault {
+		t.Errorf("别名不应继承 IsDefault")
+	}
+	if alias.CreditsRate != 1.62 || alias.ContextWindow != 1000000 || alias.DefaultEffort != "medium" {
+		t.Errorf("克隆字段不符: %+v", alias)
+	}
+	// 展示档继承 base 的补全值（kimi-k3-1 已入 verifiedEffortsSupplement）。
+	if len(alias.Efforts) != 3 {
+		t.Errorf("alias.Efforts=%v want 3 项（继承 base 补全档位）", alias.Efforts)
+	}
+
+	// 别名不进降级缓存：reasoning_effort=max 原样透传（上游未对别名声明）。
+	if _, status, _, err := c.ChatStream(a, []byte(`{"model":"kimi-k3","reasoning_effort":"max","messages":[]}`)); err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(outbound, &m); err != nil {
+		t.Fatalf("outbound unmarshal: %v (%s)", err, outbound)
+	}
+	if got := m["reasoning_effort"]; got != "max" {
+		t.Errorf("reasoning_effort=%v want max（别名应透传）", got)
+	}
+}
+
 func TestChatStreamHardCreditError(t *testing.T) {
 	c := testClient(func(r *http.Request) (*http.Response, error) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil

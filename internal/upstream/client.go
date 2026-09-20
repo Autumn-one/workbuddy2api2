@@ -799,6 +799,24 @@ var verifiedEffortsSupplement = map[string][]string{
 	// 反面证据（已并入文档）：简单题上三档会重叠甚至倒序（曾有 low 59 > high 46 > max 33），
 	// 那是信噪比不足，不代表档位失效——收录结论以难题实测为准。
 	"deepseek-v4.1-flash": {"low", "high", "max"},
+	// 证据：本网关实测（2026-09-19，3x10 多米诺铺法计数题，串行各 1 发）——
+	// low think=140/4.2s 显著浅于 high think=337/8.8s 与 max think=294/8.1s；
+	// low 档独立有效，high/max 单轮未拉开但均深于 low。注意上游不校验档位取值
+	//（bogus 亦返回 200），档位真实性按行为差异判定。
+	"kimi-k3-1": {"low", "high", "max"},
+}
+
+// aliasModelEntries 上游 cli 列表未收录、但本网关实测可调用的别名模型。
+//
+// 列表项整体克隆自 base 条目（倍率/容量/能力/展示档位一致），仅改 id 与展示名
+// （name 避免与 base 的显示名重复）；不进 rawEfforts——上游未对别名声明
+// supportedEfforts，reasoning_effort 对别名永远透传。
+var aliasModelEntries = []struct {
+	id   string // 暴露给客户端的别名 id
+	base string // 克隆来源的上游列表 id
+	name string // 展示名
+}{
+	{"kimi-k3", "kimi-k3-1", "kimi-k3-origin"},
 }
 
 // verifiedEfforts 上游未声明 supportedEfforts 时，用实测档位补全【展示用】能力。
@@ -917,6 +935,21 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
+	}
+	// 别名模型补录：克隆 base 条目（Efforts 已是 verifiedEfforts 后的展示值）。
+	// base 不在上游列表 → 别名大概率同样失效，不补。
+	for _, al := range aliasModelEntries {
+		for i := range out {
+			if out[i].ID != al.base {
+				continue
+			}
+			mi := out[i]
+			mi.ID = al.id
+			mi.Name = al.name
+			mi.IsDefault = false // 别名不继承"默认模型"标记，避免列表出现两个默认
+			out = append(out, mi)
+			break
+		}
 	}
 	// 刷新 effort 能力缓存（供请求体降级）。
 	// 只收录【上游原始声明】的 supportedEfforts：展示层补全的实测档位不参与降级，
