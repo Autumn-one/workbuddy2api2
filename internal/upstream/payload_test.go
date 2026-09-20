@@ -229,6 +229,35 @@ func TestEffectiveParamsMirrorPreparedBody(t *testing.T) {
 	}
 }
 
+// TestEffectiveParamsThinkCtl 日志应能看到思考开关类透传字段：
+// thinking.type / reasoning.effort / enable_thinking——回答"谁关了思考、用的什么参数"。
+func TestEffectiveParamsThinkCtl(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"thinking disabled object", `{"model":"m","thinking":{"type":"disabled"}}`, "thinking:disabled"},
+		{"thinking enabled object", `{"model":"m","thinking":{"type":"enabled"}}`, "thinking:enabled"},
+		{"thinking bare string", `{"model":"m","thinking":"disabled"}`, "thinking:disabled"},
+		{"thinking bare bool", `{"model":"m","thinking":false}`, "thinking:false"},
+		{"nested reasoning effort", `{"model":"m","reasoning":{"effort":"none"}}`, "reasoning:none"},
+		{"enable_thinking bool", `{"model":"m","enable_thinking":false}`, "enable_thinking:false"},
+		{"chat_template_kwargs", `{"model":"m","chat_template_kwargs":{"enable_thinking":false}}`, "tpl_enable:false"},
+		{"multiple joined", `{"model":"m","thinking":{"type":"disabled"},"reasoning":{"effort":"none"}}`, "thinking:disabled,reasoning:none"},
+		{"absent", `{"model":"m","reasoning_effort":"high"}`, ""},
+		{"empty thinking object ignored", `{"model":"m","thinking":{}}`, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, params := PrepareBodyOptWithEffortsAndParams([]byte(c.body), false, nil, nil)
+			if params.ThinkCtl != c.want {
+				t.Errorf("ThinkCtl=%q want %q", params.ThinkCtl, c.want)
+			}
+		})
+	}
+}
+
 // TestEffectiveParamsDoesNotChangeBody 日志能力必须零副作用：
 // 与不含参数的旧 API 产出逐字节相同（否则会悄悄改变发往上游的请求）。
 func TestEffectiveParamsDoesNotChangeBody(t *testing.T) {

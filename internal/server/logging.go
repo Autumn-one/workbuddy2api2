@@ -423,6 +423,9 @@ func intOrDash(n int) string {
 //     发生降级时显示为 effort=high←max（←后是客户端原始请求值）。
 //   - max=：客户端指定的输出上限（max_tokens / max_completion_tokens），
 //     为 0/未给时显示 max=-（此时由上游默认值决定，日志不猜测）。
+//   - thinkctl：思考开关类字段摘要（thinking.type / reasoning.effort 嵌套 /
+//     enable_thinking 等透传字段），形如 thinking:disabled；未携带显示 -。
+//     与 think= 列（上游实际回报的思考 token 数）配合，可核对"关思考"是否真生效。
 //
 // 上下文大小（prompt_tokens）不在此处，它由 usage 的 ctx= 字段展示：
 // 前者是"客户端要求的输出上限"，后者是"上游实际报的输入用量"，两者不可混同。
@@ -438,5 +441,9 @@ func paramsText(p upstream.EffectiveParams) string {
 	if p.MaxTokens > 0 {
 		maxTok = fmt.Sprintf("%d", p.MaxTokens)
 	}
-	return fmt.Sprintf("effort=%s max=%s", effort, maxTok)
+	thinkCtl := p.ThinkCtl
+	if thinkCtl == "" {
+		thinkCtl = "-"
+	}
+	return fmt.Sprintf("effort=%s max=%s thinkctl=%s", effort, maxTok, thinkCtl)
 }

@@ -177,10 +177,22 @@ func TestLogChatRowNoUsageShowsDash(t *testing.T) {
 	out := captureStdout(t, func() {
 		logChatRow(0, time.Second, "glm-5.2", "sync", &auth.Auth{UID: "s1"}, http.StatusServiceUnavailable, -1, -1, -1, -1, upstream.EffectiveParams{})
 	})
-	for _, want := range []string{"effort=-", "max=-", "ctx=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
+	for _, want := range []string{"effort=-", "max=-", "thinkctl=-", "ctx=-", "TTFB=-", "tok=-", "-tok/s", "| 503 |"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("row missing %q:\n%s", want, out)
 		}
+	}
+}
+
+// TestLogChatRowThinkCtl thinkctl 列要原样展示客户端的思考开关指令
+//（与 think= 列的实际思考 token 数配合，核对"关思考"是否生效）。
+func TestLogChatRowThinkCtl(t *testing.T) {
+	withChatLog(t)
+	out := captureStdout(t, func() {
+		logChatRow(0, time.Second, "m", "sync", &auth.Auth{UID: "u"}, 200, 1, -1, -1, 0, upstream.EffectiveParams{ThinkCtl: "thinking:disabled"})
+	})
+	if !strings.Contains(out, "thinkctl=thinking:disabled") {
+		t.Errorf("row missing thinkctl: %s", out)
 	}
 }
 

@@ -6,6 +6,7 @@ package upstream
 import (
 	"encoding/json"
 	"log"
+	"strconv"
 	"strings"
 
 	"workbuddy2api/internal/auth"
@@ -74,6 +75,11 @@ type EffectiveParams struct {
 	// MaxTokens 客户端指定的输出上限（max_tokens / max_completion_tokens）；0 = 未指定。
 	MaxTokens int
 
+	// ThinkCtl 客户端携带的思考开关类指令（区别于强度档 reasoning_effort）的紧凑摘要，
+	// 形如 "thinking:disabled"、"reasoning:none"；多来源逗号拼接；空串 = 未携带。
+	// 这些字段网关一律透传，本字段只回答日志里的"思考被谁开关、用的什么参数"。
+	ThinkCtl string
+
 	// Proxy 本次请求【实际使用】的代理地址（如 http://127.0.0.1:34567）；
 	// 空串 = 直连（未配置代理、或代理不可达已回落）。
 	//
@@ -103,11 +109,49 @@ func extractEffort(obj map[string]any) string {
 	return ""
 }
 
+// extractThinkCtl 汇总请求体里的思考开关类字段（区别于强度档 reasoning_effort），只读不写。
+// 已知词汇（均为透传字段，语义由上游解释）：
+//   - thinking.type（DeepSeek 官方 OpenAI 格式开关：enabled/disabled）；
+//     thinking 为裸字符串/布尔时按原值记录
+//   - reasoning.effort（Responses 风格嵌套写法：none/low/...）
+//   - enable_thinking、chat_template_kwargs.enable_thinking（Qwen/vLLM 风格布尔开关）
+// 均未携带返回空串。
+func extractThinkCtl(obj map[string]any) string {
+	var parts []string
+	switch t := obj["thinking"].(type) {
+	case map[string]any:
+		if v, _ := t["type"].(string); v != "" {
+			parts = append(parts, "thinking:"+v)
+		}
+	case string:
+		if t != "" {
+			parts = append(parts, "thinking:"+t)
+		}
+	case bool:
+		parts = append(parts, "thinking:"+strconv.FormatBool(t))
+	}
+	if r, ok := obj["reasoning"].(map[string]any); ok {
+		if v, _ := r["effort"].(string); v != "" {
+			parts = append(parts, "reasoning:"+v)
+		}
+	}
+	if v, ok := obj["enable_thinking"].(bool); ok {
+		parts = append(parts, "enable_thinking:"+strconv.FormatBool(v))
+	}
+	if k, ok := obj["chat_template_kwargs"].(map[string]any); ok {
+		if v, ok := k["enable_thinking"].(bool); ok {
+			parts = append(parts, "tpl_enable:"+strconv.FormatBool(v))
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 // extractEffectiveParams 从【已改写】的请求对象里取出关键参数。
 // 只读不写：绝不因日志需求改动出站请求体。
 func extractEffectiveParams(obj map[string]any) EffectiveParams {
 	var p EffectiveParams
 	p.Effort = extractEffort(obj)
+	p.ThinkCtl = extractThinkCtl(obj)
 	// 输出上限：优先 max_completion_tokens（OpenAI 新字段），其次 max_tokens。
 	for _, k := range []string{"max_completion_tokens", "max_tokens"} {
 		if v, ok := toInt(obj[k]); ok {
