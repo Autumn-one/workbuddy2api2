@@ -202,7 +202,7 @@ func TestSyncToDirCleansInactive(t *testing.T) {
 	p.Add(&auth.Auth{UID: "u2"})
 	p.SetActive("u2", false)
 	// 模拟 u2 凭证文件被删：目录只剩 u1。
-	p.SyncToDir([]*auth.Auth{{UID: "u1"}})
+	p.SyncToDir([]*auth.Auth{{UID: "u1"}}, nil)
 	if len(p.inactive) != 0 {
 		t.Fatalf("删除账号后排除集应为空, inactive=%v", p.inactive)
 	}

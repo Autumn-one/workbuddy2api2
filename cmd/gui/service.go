@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"sync"
@@ -244,11 +245,12 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 		return nil
 	}
 
-	auths, err := auth.LoadDir(cfg.AuthDir)
+	auths, keep, err := loadAuthsWithWarn(cfg.AuthDir)
 	if err != nil {
 		s.lastErr = err.Error()
 		return fmt.Errorf("加载账号目录失败: %w", err)
 	}
+	log.Printf("已加载 %d 个账号（%s）", len(auths), cfg.AuthDir)
 
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 	mode := "noop"
@@ -259,7 +261,7 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 	p := pool.New(cfg.StateFile)
 	p.SetStore(store)
 	p.RestoreFromSnapshot()
-	p.SyncToDir(auths)
+	p.SyncToDir(auths, keep)
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(cfg.Pool.MaxInFlight)
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
@@ -322,6 +324,7 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go sch.Run(ctx)
+	go authBackupLoop(ctx, cfg.AuthDir)
 	srv := &http.Server{Handler: h, ReadHeaderTimeout: 30 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
 
@@ -373,11 +376,11 @@ func (s *Service) ReloadAccounts() (int, error) {
 	if p == nil || cfg == nil {
 		return 0, fmt.Errorf("服务未运行")
 	}
-	auths, err := auth.LoadDir(cfg.AuthDir)
+	auths, keep, err := loadAuthsWithWarn(cfg.AuthDir)
 	if err != nil {
 		return 0, err
 	}
-	p.SyncToDir(auths)
+	p.SyncToDir(auths, keep)
 	if s.OnAccountsChanged != nil {
 		s.OnAccountsChanged()
 	}
@@ -388,4 +391,51 @@ func (s *Service) ReloadAccounts() (int, error) {
 func (s *Service) Restart(cfg *appconfig.Config) error {
 	s.Stop()
 	return s.Start(cfg)
+}
+
+// loadAuthsWithWarn 扫描凭证目录并返回 keepUIDs（文件在但解析失败的 UID 集合）。
+// 坏文件逐条打告警日志——一次性登录凭证的损坏必须显性可见，
+// 不能表现得像"账号被删了"一样无声消失。
+func loadAuthsWithWarn(dir string) ([]*auth.Auth, map[string]bool, error) {
+	auths, bad, err := auth.LoadDir(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	var keep map[string]bool
+	for _, bf := range bad {
+		uid := auth.UIDFromFileName(bf.Path)
+		log.Printf("警告：凭证文件无法读取/解析，已跳过加载（文件仍在磁盘，不会被当作已删除）: %s: %v",
+			bf.Path, bf.Err)
+		if uid != "" {
+			if keep == nil {
+				keep = map[string]bool{}
+			}
+			keep[uid] = true
+		}
+	}
+	return auths, keep, nil
+}
+
+// authBackupLoop 周期性给凭证目录做快照（SnapshotDir 内部指纹去重，
+// 内容没变时只读一遍目录哈希，不写盘）。启动时先立即做一次。
+func authBackupLoop(ctx context.Context, dir string) {
+	snapshotOnce := func() {
+		p, changed, err := auth.SnapshotDir(dir, 200)
+		if err != nil {
+			log.Printf("账号目录快照失败: %v", err)
+		} else if changed {
+			log.Printf("账号快照已更新: %s", p)
+		}
+	}
+	snapshotOnce()
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			snapshotOnce()
+		}
+	}
 }

@@ -76,19 +76,20 @@ func TestUsageRowsFromAccounts(t *testing.T) {
 	}
 }
 
-// TestUsageTotalText 顶部汇总文案：含请求数/输入/输出/缓存，且缺 usage 时明确提示。
+// TestUsageTotalText 顶部汇总文案：以总 token 为主（M/B 缩写），请求数次之。
 func TestUsageTotalText(t *testing.T) {
 	st := guiUsageTestStore(t)
-	txt := usageTotalText(st, "", false)
-	for _, want := range []string{"合计", "全部日期", "请求 4", "输入 1,000", "输出 100"} {
+	txt := usageTotalText(st, "", usageViewDetail)
+	// 总 token = 输入 1000 + 输出 100 = 1100 → 1.1K
+	for _, want := range []string{"全部日期", "总 token 1.1K", "请求 4"} {
 		if !strings.Contains(txt, want) {
 			t.Errorf("文案缺 %q:\n%s", want, txt)
 		}
 	}
-	// 单日 + 账号级视图
-	txt2 := usageTotalText(st, "2026-09-12", true)
-	if !strings.Contains(txt2, "2026-09-12") || !strings.Contains(txt2, "账号级") {
-		t.Errorf("单日/账号级文案错误:\n%s", txt2)
+	// 单日 + 按账号视图
+	txt2 := usageTotalText(st, "2026-09-12", usageViewByAccount)
+	if !strings.Contains(txt2, "2026-09-12") || !strings.Contains(txt2, "按账号") {
+		t.Errorf("单日/按账号文案错误:\n%s", txt2)
 	}
 }
 
@@ -97,37 +98,122 @@ func TestUsageTotalTextMissingHint(t *testing.T) {
 	st := server.NewTokenUsageStore("")
 	defer st.Close()
 	st.Record("u1", "m1", time.Now(), server.TokenDelta{In: -1, Out: -1}) // 模拟失败请求无 usage
-	txt := usageTotalText(st, "", false)
+	txt := usageTotalText(st, "", usageViewDetail)
 	if !strings.Contains(txt, "未返回 usage") {
 		t.Errorf("应提示缺 usage 的请求数:\n%s", txt)
 	}
 }
 
-// TestUsageModelRendersRows 表格列映射（含汇总行占位文案）。
+// TestUsageRowsFromModels 模型级汇总：按模型聚合，请求/token 正确。
+func TestUsageRowsFromModels(t *testing.T) {
+	st := guiUsageTestStore(t)
+	rows := usageRowsFromModels(st, "")
+	if len(rows) == 0 {
+		t.Fatal("按模型汇总不应为空")
+	}
+	// 模型汇总行的 UID 应为空（只有 Model 有值）
+	for _, r := range rows {
+		if r.Model == "" {
+			t.Errorf("模型汇总行 Model 不应为空: %+v", r)
+		}
+		if r.Requests == 0 {
+			t.Errorf("模型汇总行请求数不应为 0: %+v", r)
+		}
+	}
+}
+
+// TestFormatTokenCount M/B/K 缩写。
+func TestFormatTokenCount(t *testing.T) {
+	cases := []struct {
+		in   int64
+		want string
+	}{
+		{0, "0"}, {999, "999"}, {1000, "1K"}, {1234, "1.23K"},
+		{1_000_000, "1M"}, {1_500_000, "1.5M"}, {2_345_678, "2.35M"},
+		{1_000_000_000, "1B"}, {1_200_000_000, "1.2B"},
+	}
+	for _, c := range cases {
+		if got := formatTokenCount(c.in); got != c.want {
+			t.Errorf("formatTokenCount(%d)=%q want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// TestUsageSignatureStable 防抖签名：同数据/视图/日期应相同，任一变化应不同。
+func TestUsageSignatureStable(t *testing.T) {
+	rows := []usageRow{
+		{UID: "u1", Model: "m1", Day: "2026-09-12", In: 100, Out: 50, Requests: 2},
+	}
+	s1 := usageSignature(usageViewDetail, "", rows)
+	s2 := usageSignature(usageViewDetail, "", rows)
+	if s1 != s2 {
+		t.Error("同数据签名应相同（否则会无谓重建表格闪烁）")
+	}
+	// 视图变 → 签名变
+	if s1 == usageSignature(usageViewByAccount, "", rows) {
+		t.Error("视图变化应改变签名")
+	}
+	// 日期变 → 签名变
+	if s1 == usageSignature(usageViewDetail, "2026-09-12", rows) {
+		t.Error("日期变化应改变签名")
+	}
+	// 数据变 → 签名变
+	rows2 := []usageRow{{UID: "u1", Model: "m1", Day: "2026-09-12", In: 101, Out: 50, Requests: 2}}
+	if s1 == usageSignature(usageViewDetail, "", rows2) {
+		t.Error("数据变化应改变签名")
+	}
+}
+
+// TestUsageModelRendersRows 表格列映射：明细视图（账号×模型×日期+总token M/B 缩写）。
 func TestUsageModelRendersRows(t *testing.T) {
-	m := &usageModel{}
+	m := &usageModel{view: usageViewDetail}
 	m.Replace([]usageRow{
 		{UID: "木瓜", Model: "glm-5.2", Day: "2026-09-12", Requests: 5, Cached: 800, In: 1000, Out: 50, Think: 20},
-		{UID: "木瓜", Day: "", Requests: 5, In: 1000},
 	})
-	if m.RowCount() != 2 {
+	if m.RowCount() != 1 {
 		t.Fatalf("行数=%d", m.RowCount())
 	}
-	want := []string{"木瓜", "glm-5.2", "2026-09-12", "5", "800", "1000", "50", "20"}
+	// 明细列：账号|模型|日期|请求|总token|输入|输出|缓存|思考
+	// 总 token = 1000+50 = 1050 → 1.05K
+	want := []string{"木瓜", "glm-5.2", "2026-09-12", "5", "1.05K", "1K", "50", "800", "20"}
 	for col, w := range want {
 		if got := m.Value(0, col); got != w {
 			t.Errorf("col %d=%v want %q", col, got, w)
 		}
 	}
-	// 汇总行：模型与日期显示占位文案
-	if got := m.Value(1, 1); got != "（账号汇总）" {
-		t.Errorf("汇总行模型列=%v", got)
-	}
-	if got := m.Value(1, 2); got != "（全部日期）" {
-		t.Errorf("汇总行日期列=%v", got)
-	}
 	// 越界安全
 	if got := m.Value(9, 0); got != "" {
 		t.Errorf("越界应返回空, got %v", got)
+	}
+}
+
+// TestUsageModelRendersByAccount 按账号视图的列映射。
+func TestUsageModelRendersByAccount(t *testing.T) {
+	m := &usageModel{view: usageViewByAccount}
+	m.Replace([]usageRow{
+		{UID: "木瓜", Requests: 12, In: 2_000_000, Out: 500_000, Cached: 100_000, Think: 50_000},
+	})
+	// 按账号列：账号|请求|总token|输入|输出|缓存|思考
+	// 总 token = 2.5M
+	want := []string{"木瓜", "12", "2.5M", "2M", "500K", "100K", "50K"}
+	for col, w := range want {
+		if got := m.Value(0, col); got != w {
+			t.Errorf("col %d=%v want %q", col, got, w)
+		}
+	}
+}
+
+// TestUsageModelRendersByModel 按模型视图的列映射。
+func TestUsageModelRendersByModel(t *testing.T) {
+	m := &usageModel{view: usageViewByModel}
+	m.Replace([]usageRow{
+		{Model: "glm-5.2", Requests: 3, In: 1_000_000, Out: 200_000},
+	})
+	// 按模型列：模型|请求|总token|输入|输出|缓存|思考
+	want := []string{"glm-5.2", "3", "1.2M", "1M", "200K", "0", "0"}
+	for col, w := range want {
+		if got := m.Value(0, col); got != w {
+			t.Errorf("col %d=%v want %q", col, got, w)
+		}
 	}
 }

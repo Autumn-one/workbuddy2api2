@@ -168,15 +168,44 @@ func (s *TokenUsageStore) ByAccount() []TokenUsageRow {
 func (s *TokenUsageStore) ByAccountForDay(day string) []TokenUsageRow {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return aggregateBy(s.rows, true, day)
+}
+
+// ByModel 模型级汇总（对明细 sum，自然 rollup）。
+func (s *TokenUsageStore) ByModel() []TokenUsageRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return aggregateBy(s.rows, false, "")
+}
+
+// ByModelForDay 指定日期的模型级汇总。
+func (s *TokenUsageStore) ByModelForDay(day string) []TokenUsageRow {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return aggregateBy(s.rows, false, day)
+}
+
+// aggregateBy 按账号（byAccount=true）或模型（false）汇总；day 非空时只统计该日期。
+// 结果按维度名升序（顺序稳定）。
+func aggregateBy(rows map[tokenUsageKey]*TokenUsageRow, byAccount bool, day string) []TokenUsageRow {
 	agg := map[string]*TokenUsageRow{}
-	for _, r := range s.rows {
-		if r.Day != day {
+	for k, r := range rows {
+		if day != "" && k.Day != day {
 			continue
 		}
-		a, ok := agg[r.UID]
+		name := k.Model
+		if byAccount {
+			name = k.UID
+		}
+		a, ok := agg[name]
 		if !ok {
-			a = &TokenUsageRow{UID: r.UID}
-			agg[r.UID] = a
+			a = &TokenUsageRow{}
+			if byAccount {
+				a.UID = name
+			} else {
+				a.Model = name
+			}
+			agg[name] = a
 		}
 		addInto(a, r)
 	}
@@ -184,7 +213,12 @@ func (s *TokenUsageStore) ByAccountForDay(day string) []TokenUsageRow {
 	for _, a := range agg {
 		out = append(out, *a)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].UID != out[j].UID {
+			return out[i].UID < out[j].UID
+		}
+		return out[i].Model < out[j].Model
+	})
 	return out
 }
 

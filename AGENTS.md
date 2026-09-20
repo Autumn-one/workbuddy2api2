@@ -149,3 +149,26 @@
 - `relaunchSelf`：拉起独立 powershell 守望者（`Wait-Process` 本 PID 退出 →
   `Start-Process` 新 exe），随后正常退出。等旧进程退出再启动，避免抢 listen 端口。
 - 与托盘里「启动/停止服务」不同：那对网关生效，这个是整个程序退出重开。
+
+## 四、凭证防丢约定（一次性登录账号）
+
+背景：账号凭证（`auths/workbuddy-<uid>.json`）只能登录一次，丢了找不回。
+围绕它的硬性约定：
+
+- **写入一律原子**：任何写凭证文件的路径必须走 `auth.WriteFileAtomic`
+  （tmp → fsync → rename），禁止裸 `os.WriteFile`——中途断电/崩溃会留半个
+  JSON，而 `LoadDir` 解析失败 = 账号消失。
+- **坏文件不静默**：`LoadDir` 返回 `(auths, bad, err)`，bad 里的文件必须
+  逐条打告警日志；其 UID（`UIDFromFileName` 从文件名还原）传入
+  `SyncToDir(auths, keepUIDs)` 保号——文件还在磁盘但没解析出来 ≠ 已删除，
+  不得把它的池内状态从 state.json 抹掉。
+- **快照备份**：`auth.SnapshotDir(authDir, 200)` 把整目录复制到
+  `<authDir 同级>/auths-backup/auths-<时间戳>/`，内容指纹去重、保留 200 份。
+  服务启动即做一次 + 每 5 分钟一次（`authBackupLoop` / cmd/server 同款），
+  登录保存成功后立即再做一次。凭证丢失时从最新快照改名恢复。
+- **删除只进回收站**：GUI「删除账号」是 `os.Rename` 到 `auths/.trash/`
+  （时间戳前缀），不物理删除；`.trash` 子目录不匹配 `workbuddy*.json`
+  顶层 glob，不会误载。恢复 = 把文件改名移回 `auths/`。
+- **账号表自愈**：`refreshAccounts` 每个 tick 核对原生 ListView 行数与
+  模型行数，不一致即强制重建并打 `账号表自愈` 日志——曾观测到长运行实例
+  首次开窗表格空白但后端正常，签名闸门挡不住这种 widget 脱节。

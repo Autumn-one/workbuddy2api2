@@ -710,12 +710,25 @@ func TestRemoveMissingFromDir(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SyncToDir([]*auth.Auth{{UID: "u2"}})
+	p.SyncToDir([]*auth.Auth{{UID: "u2"}}, nil)
 	if p.Pick() == nil || p.Pick().UID != "u2" {
 		t.Fatal("u1 should be removed")
 	}
 	if _, ok := p.Status("u1"); ok {
 		t.Fatal("u1 should not exist")
+	}
+}
+
+// TestSyncToDirKeepsBadFiles 凭证文件存在但解析失败时（损坏/占用），
+// keepUIDs 里的账号必须保留——一次性凭证不能因一次解析失败被当作已删除。
+func TestSyncToDirKeepsBadFiles(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.Add(&auth.Auth{UID: "u2"})
+	// 目录里 u2 的文件损坏：扫描结果只剩 u1，但 u2 的文件还在（keepUIDs 保号）。
+	p.SyncToDir([]*auth.Auth{{UID: "u1"}}, map[string]bool{"u2": true})
+	if _, ok := p.Status("u2"); !ok {
+		t.Fatal("u2 文件损坏但仍在磁盘，不应被剔除")
 	}
 }
 

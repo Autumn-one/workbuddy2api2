@@ -583,10 +583,17 @@ func (p *Pool) Add(a *auth.Auth) {
 
 // SyncToDir 用最新扫描结果对齐池：新账号加入、消失的账号剔除（状态保留）。
 // 剔除结果持久化回 state.json，避免已删账号在下次启动时被 load() 复活。
-func (p *Pool) SyncToDir(auths []*auth.Auth) {
+//
+// keepUIDs：文件仍在磁盘但本次扫描没能解析的 UID（例如损坏的 workbuddy-<uid>.json）。
+// 这些账号【不算消失】——一次性凭证绝不能因为一次解析失败就被当作已删除，
+// 否则其冷却/积分/排除集状态会被连带从 state.json 抹掉。
+func (p *Pool) SyncToDir(auths []*auth.Auth, keepUIDs map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	seen := make(map[string]bool, len(auths))
+	seen := make(map[string]bool, len(auths)+len(keepUIDs))
+	for uid := range keepUIDs {
+		seen[uid] = true
+	}
 	for _, a := range auths {
 		seen[a.UID] = true
 		p.upsertLocked(a)

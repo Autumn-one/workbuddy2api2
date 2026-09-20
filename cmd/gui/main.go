@@ -21,9 +21,11 @@ import (
 	"time"
 
 	"github.com/lxn/walk"
+	"github.com/lxn/win"
 	"golang.org/x/sys/windows/registry"
 
 	"workbuddy2api/internal/appconfig"
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/oauthflow"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/proxy"
@@ -37,6 +39,8 @@ const (
 	runKey   = "WorkBuddy2API"
 	cfgFile  = "config.json"
 	logLines = 800
+	// lvmGetItemCount 即 Win32 LVM_GETITEMCOUNT（lxn/win 未导出该常量）。
+	lvmGetItemCount = win.LVM_FIRST + 4
 )
 
 // ─────────────────────────── 日志缓冲 ───────────────────────────
@@ -1640,6 +1644,18 @@ func (a *app) refreshAccounts() {
 	// 恰好被其他字段的相同值掩盖）。统计是纯字符串计算，代价可忽略。
 	a.refreshTotalCredits(items)
 	a.refreshActivePoolLabel()
+	// 自愈护栏：原生 ListView 行数与模型行数不一致时（观测到长运行实例
+	// 首次开窗表格空白、但后端账号正常），说明 widget 行集已与模型脱节——
+	// 此时签名多半未变，updateItems 只重绘可见单元格、不会恢复行数，
+	// 不干预会永远空白。每个 tick 核对一次，不一致强制整表重建并留日志，
+	// 下次再出现"看不到账号"可直接在 gui.log 里查到证据。
+	if a.tvAccounts != nil {
+		lvRows := int(win.SendMessage(a.tvAccounts.Handle(), lvmGetItemCount, 0, 0))
+		if lvRows != len(items) {
+			log.Printf("账号表自愈：界面行数 %d ≠ 数据行数 %d，强制重建", lvRows, len(items))
+			a.lastSig = ""
+		}
+	}
 	if !a.acctSigChanged(a.tblSignature(items)) {
 		// 签名未变 = 表格结构无需重建。只换数据快照 + 重绘可见单元格
 		// （LVM_REDRAWITEMS，LVN_GETDISPINFO 重新取 Value），让刻意不进签名的
@@ -2022,6 +2038,12 @@ func (a *app) doLoginDone() {
 			a.mw.Synchronize(func() { a.lblLogin.SetText("保存凭证失败：" + firstLine(err.Error())) })
 			return
 		}
+		// 新凭证落盘是最高价值时刻：立即快照（不等周期备份；失败只记日志）。
+		if sp, changed, serr := auth.SnapshotDir(a.cfg.AuthDir, 200); serr != nil {
+			log.Printf("账号目录快照失败: %v", serr)
+		} else if changed {
+			log.Printf("账号快照已更新: %s", sp)
+		}
 		// 热加载进账号池
 		n, rerr := a.svc.ReloadAccounts()
 		a.mw.Synchronize(func() {
@@ -2289,12 +2311,21 @@ func (a *app) doDeleteAccount() {
 		}
 		st := items[idx]
 		if walk.MsgBox(a.mw, appName,
-			"确定删除账号 "+stringOr(st.Nickname, st.UID)+" 吗？\n\n会删除 auths 下的凭证文件（不可恢复）。",
+			"确定删除账号 "+stringOr(st.Nickname, st.UID)+" 吗？\n\n凭证文件会移入 auths\\.trash（需要时可手动恢复）。",
 			walk.MsgBoxYesNo|walk.MsgBoxIconWarning) != walk.DlgCmdYes {
 			return
 		}
 		path := filepath.Join(a.cfg.AuthDir, "workbuddy-"+st.UID+".json")
-		if err := os.Remove(path); err != nil {
+		// 一次性登录凭证绝不物理删除：移入 .trash 子目录（LoadDir 的
+		// workbuddy*.json glob 不匹配子目录，不会误载）。误删可从那里改名恢复。
+		trash := filepath.Join(a.cfg.AuthDir, ".trash")
+		if err := os.MkdirAll(trash, 0o700); err != nil {
+			a.lblAccts2.SetText("删除失败：" + err.Error())
+			return
+		}
+		dst := filepath.Join(trash,
+			time.Now().Format("20060102-150405")+"-"+filepath.Base(path))
+		if err := os.Rename(path, dst); err != nil {
 			a.lblAccts2.SetText("删除失败：" + err.Error())
 			return
 		}

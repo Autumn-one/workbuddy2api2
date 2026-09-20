@@ -37,9 +37,18 @@ func main() {
 		}
 	}
 
-	auths, err := auth.LoadDir(cfg.AuthDir)
+	auths, bad, err := auth.LoadDir(cfg.AuthDir)
 	if err != nil {
 		log.Fatalf("load auths: %v", err)
+	}
+	// 坏文件显性告警 + 保号：文件还在磁盘但没解析出来时，把其 UID 传进
+	// SyncToDir，避免被当作"已删除"从 state.json 里抹掉（一次性登录凭证）。
+	keep := map[string]bool{}
+	for _, bf := range bad {
+		log.Printf("WARN: credential file unreadable/unparseable, skipped but kept: %s: %v", bf.Path, bf.Err)
+		if uid := auth.UIDFromFileName(bf.Path); uid != "" {
+			keep[uid] = true
+		}
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
@@ -49,8 +58,8 @@ func main() {
 	p := pool.New(cfg.StateFile)
 	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
 	p.SetStore(store)
-	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
-	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
+	p.RestoreFromSnapshot()  // 择新恢复：Redis 快照比本地新才采用，否则本地优先
+	p.SyncToDir(auths, keep) // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
 
 	// 熔断器 + 在途上限 + 三因子加权调优（从 config 注入，非正值回退默认）。
 	p.SetBreaker(cfg.Pool.BreakerThreshold, cfg.BreakerCooldownDur, cfg.BreakerCooldownMaxD)
@@ -113,6 +122,28 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
+
+	// 凭证目录快照：内容变化才落新副本（指纹去重），凭证丢失时兜底。
+	go func() {
+		snap := func() {
+			if pth, changed, err := auth.SnapshotDir(cfg.AuthDir, 200); err != nil {
+				log.Printf("auth snapshot failed: %v", err)
+			} else if changed {
+				log.Printf("auth snapshot updated: %s", pth)
+			}
+		}
+		snap()
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				snap()
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,

@@ -22,6 +22,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"workbuddy2api/internal/auth"
 )
 
 // 上游常量（CN only）
@@ -222,7 +224,10 @@ func SaveAuthFile(dir string, b *Bundle) (string, bool, error) {
 	if err != nil {
 		return "", false, err
 	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
+	// 原子落盘：这些凭证一次性登录不可再获，直接 WriteFile 中途断电/崩溃
+	// 会留下半个 JSON——LoadDir 解析失败 → 账号静默消失。tmp+fsync+rename
+	// 保证要么旧文件要么新文件，永远不是残件。
+	if err := auth.WriteFileAtomic(path, raw, 0o600); err != nil {
 		return "", false, err
 	}
 	return path, overwritten, nil

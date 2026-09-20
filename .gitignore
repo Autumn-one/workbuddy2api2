@@ -64,3 +64,6 @@ docs/
 !README.md
 !使用指南.md
 !AGENTS.md
+
+# auths 凭证快照备份（含 token，绝不上库）
+auths-backup/

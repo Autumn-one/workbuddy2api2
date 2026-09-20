@@ -138,31 +138,74 @@ func (a *Auth) SaveAtomic() error {
 	if err != nil {
 		return err
 	}
-	tmp := a.FilePath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, a.FilePath)
+	return WriteFileAtomic(a.FilePath, raw, 0o600)
 }
 
-// LoadDir 扫描并解析 dir 下 workbuddy*.json；解析失败的文件静默跳过（启动日志由调用方统计）。
-func LoadDir(dir string) ([]*Auth, error) {
+// WriteFileAtomic 写 tmp → fsync → rename 三步落盘。
+// fsync 保证断电后 rename 落的位置指向完整数据而非未刷盘的半页；
+// rename 保证读者要么看到旧文件要么看到新文件，永远看不到半个文件。
+func WriteFileAtomic(path string, raw []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// BadFile 一个存在但无法读取/解析的凭证文件。
+// 这些账号只能登录一次，凭证损坏必须【显性暴露】而不是静默跳过——
+// 静默会让"文件坏了"表现得和"账号被删了"一模一样。
+type BadFile struct {
+	Path string
+	Err  error
+}
+
+// LoadDir 扫描并解析 dir 下 workbuddy*.json。
+// 读取/解析失败的文件收进 bad 返回（不再静默跳过），由调用方记录告警；
+// 上层可结合 UIDFromFileName 保留坏文件账号的池内状态。
+func LoadDir(dir string) (auths []*Auth, bad []BadFile, err error) {
 	files, err := filepath.Glob(filepath.Join(dir, "workbuddy*.json"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var out []*Auth
 	for _, f := range files {
 		raw, err := os.ReadFile(f)
 		if err != nil {
+			bad = append(bad, BadFile{Path: f, Err: err})
 			continue
 		}
 		a, err := Parse(raw)
 		if err != nil {
+			bad = append(bad, BadFile{Path: f, Err: err})
 			continue
 		}
 		a.FilePath = f
-		out = append(out, a)
+		auths = append(auths, a)
 	}
-	return out, nil
+	return auths, bad, nil
+}
+
+// UIDFromFileName 从 workbuddy-<uid>.json 文件名还原 UID。
+// 用于文件内容损坏时的兜底：至少能把 UID 保住，不让它被判成"已删除"。
+func UIDFromFileName(path string) string {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "workbuddy-") || !strings.HasSuffix(base, ".json") {
+		return ""
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(base, "workbuddy-"), ".json")
 }
