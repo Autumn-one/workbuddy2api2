@@ -22,10 +22,14 @@ Set-Location -LiteralPath $Root
 if (-not $env:GOPROXY) { $env:GOPROXY = 'https://goproxy.cn,direct' }
 
 $syso = Join-Path $Root 'cmd\gui\rsrc_windows_amd64.syso'
+$ico  = Join-Path $Root 'cmd\gui\app.ico'
 $rsrc = Join-Path (go env GOPATH) 'bin\rsrc.exe'
 
 if (Test-Path -LiteralPath $rsrc) {
-    & $rsrc -arch amd64 -manifest (Join-Path $Root 'cmd\gui\app.manifest') -o $syso
+    # -ico 把应用图标嵌进 exe：Windows 任务栏/资源管理器对 windowsgui 程序
+    # 取的是 exe 的图标资源，不走运行时 WM_SETICON；不嵌则任务栏显示通用空白图标。
+    # app.ico 由 tools/genicon 生成（go run ./tools/genicon -o cmd/gui/app.ico）。
+    & $rsrc -arch amd64 -manifest (Join-Path $Root 'cmd\gui\app.manifest') -ico $ico -o $syso
     if ($LASTEXITCODE -ne 0) { Write-Error 'rsrc 生成 syso 失败' }
 } elseif (-not (Test-Path -LiteralPath $syso)) {
     Write-Warning '未找到 rsrc，且缺少 rsrc_windows_amd64.syso。'
