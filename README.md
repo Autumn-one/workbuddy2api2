@@ -418,7 +418,9 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）**含扩展参数**：思考深度档位、能力标志、消耗倍率 |
+| `POST /v1/images/generations` | Bearer（`api_key` 非空时） | 文生图（OpenAI 兼容）；默认模型 `hunyuan-image-alpha`；返回 `{created, data:[{url}]}` |
+| `POST /v1/images/edits` | Bearer（`api_key` 非空时） | 图生图编辑；`image` 支持 data URL / http(s) URL / 裸 base64（**不支持本地路径**）；默认模型 `hunyuan-image-v2.0-general-edit` |
+| `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）**含扩展参数**：思考深度档位、能力标志、消耗倍率；`?all=1` 返回上游全量目录（含非 cli 分组，带 `agents`/`disabled`/`callable` 标记） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503 |
 
@@ -590,6 +592,8 @@ GUI「用量」页记录所有账号、所有模型的 token 用量，维度是*
 | 端点 | 方法 | Host | 用途 |
 |---|---|---|---|
 | `/v2/chat/completions` | POST | `copilot.tencent.com` | 聊天补全（SSE） |
+| `/v2/images/generations` | POST | 同上 | 文生图（非流式 JSON） |
+| `/v2/images/edits` | POST | 同上 | 图生图编辑（非流式 JSON） |
 | `/console/enterprises/personal/models` | GET | 同上 | 动态模型列表 |
 | `/v2/plugin/auth/token/refresh` | POST | 同上 | token 刷新 |
 | `/v2/billing/meter/daily-checkin` | POST | `www.codebuddy.cn` | 每日签到 |

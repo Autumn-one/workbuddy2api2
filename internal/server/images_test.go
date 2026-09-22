@@ -1,0 +1,174 @@
+package server
+
+import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
+)
+
+// newFakeUpstreamByPath 与 newFakeUpstream 同构，但 behavior 能看到 URL path
+// （区分 /v2/chat/completions 与 /v2/images/*）。
+func newFakeUpstreamByPath(behavior func(authz, path string) (status int, body string)) *upstream.Client {
+	return &upstream.Client{
+		HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			status, body := behavior(r.Header.Get("Authorization"), r.URL.Path)
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+			}, nil
+		})},
+		ChatBaseCN:    "https://fake.example",
+		BillingBaseCN: "https://fake.example",
+	}
+}
+
+func TestImageGenerationsOK(t *testing.T) {
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		if path != "/v2/images/generations" {
+			t.Fatalf("unexpected path %s", path)
+		}
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/a.png","revised_prompt":"rp"}]}}`
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/images/generations", "application/json",
+		strings.NewReader(`{"prompt":"a cat"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var out struct {
+		Created int64 `json:"created"`
+		Data    []struct {
+			URL           string `json:"url"`
+			RevisedPrompt string `json:"revised_prompt"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Data) != 1 || out.Data[0].URL != "https://img.example/a.png" || out.Data[0].RevisedPrompt != "rp" {
+		t.Fatalf("out=%+v", out)
+	}
+}
+
+// TestImageGenerationsRotatesOn429 429 queue-full → 换号重试成功。
+func TestImageGenerationsRotatesOn429(t *testing.T) {
+	var calls atomic.Int32
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		calls.Add(1)
+		if authz == "Bearer at-bad" {
+			return 429, `{"code":14003,"msg":"Hunyuan image queue is full for model [hunyuan-image-alpha], please try again later"}`
+		}
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/ok.png"}]}}`
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/images/generations", "application/json",
+		strings.NewReader(`{"prompt":"a cat","model":"hunyuan-image-alpha"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("expected 2 upstream calls (rotate), got %d", calls.Load())
+	}
+}
+
+// TestImageGenerationsValidation prompt 缺失 / edits 缺 image → 400，不打上游。
+func TestImageGenerationsValidation(t *testing.T) {
+	var calls atomic.Int32
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		calls.Add(1)
+		return 200, `{"code":0,"data":{"data":[{"url":"x"}]}}`
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	for _, tc := range []struct{ path, body string }{
+		{"/v1/images/generations", `{}`},
+		{"/v1/images/generations", `{"prompt":"  "}`},
+		{"/v1/images/edits", `{"prompt":"p"}`},                          // 缺 image
+		{"/v1/images/edits", `{"prompt":"p","image":"C:\\x.png"}`},       // 本地路径
+		{"/v1/images/edits", `{"prompt":"p","image":"!!!garbage!!!"}`},   // 非 base64
+	} {
+		resp, err := http.Post(srv.URL+tc.path, "application/json", strings.NewReader(tc.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 400 {
+			t.Fatalf("%s %s: status=%d", tc.path, tc.body, resp.StatusCode)
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("upstream must not be called on validation failure, got %d", calls.Load())
+	}
+}
+
+// TestImageEditsOK edits 正常路径：base64 输入被归一化为 data URL。
+func TestImageEditsOK(t *testing.T) {
+	var gotBody []byte
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/e.png"}]}}`
+	})
+	// 捕获请求体需要更底层的 fake——直接用 RoundTripper。
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(r.Body)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"data":[{"url":"https://img.example/e.png"}]}}`)),
+		}, nil
+	})
+	pngB64 := "iVBORw0KGgoAAAANSUhEUg==" // PNG 魔数前缀
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/images/edits", "application/json",
+		strings.NewReader(`{"prompt":"make it blue","image":"`+pngB64+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+	}
+	var reqBody map[string]any
+	if err := json.Unmarshal(gotBody, &reqBody); err != nil {
+		t.Fatal(err)
+	}
+	if reqBody["model"] != defaultImageEditModel {
+		t.Fatalf("default model=%v", reqBody["model"])
+	}
+	imgs, _ := reqBody["image"].([]any)
+	if len(imgs) != 1 || imgs[0] != "data:image/png;base64,"+pngB64 {
+		t.Fatalf("image not normalized: %v", reqBody["image"])
+	}
+}

@@ -55,6 +55,8 @@ func NewHandler(cfg Config) *Handler {
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
+	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imageGenerations))
+	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imageEdits))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
@@ -257,6 +259,17 @@ func modelEntry(mi upstream.ModelInfo) map[string]any {
 	}
 	if mi.SupportsReasoning {
 		caps["reasoning"] = true
+	}
+	// 生图能力：按上游 tags 标记（text-to-image → /v1/images/generations；
+	// image-to-image/image-edit → /v1/images/edits）。仅 ?all=1 视图可见——
+	// 这类模型不在 cli 组，正常 /v1/models 列表不含它们。
+	for _, t := range mi.Tags {
+		switch t {
+		case "text-to-image":
+			caps["image_generation"] = true
+		case "image-to-image", "image-edit":
+			caps["image_edit"] = true
+		}
 	}
 	if len(caps) > 0 {
 		entry["capabilities"] = caps
