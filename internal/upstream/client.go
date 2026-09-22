@@ -741,6 +741,10 @@ type ModelInfo struct {
 	SupportsToolCall  bool // 支持工具调用
 	OnlyReasoning     bool // 只能推理（无法关闭思考链）
 
+	// ── 分组与可用性（FetchAllModels 才有意义；FetchModels 返回的条目 Agents 恒含 "cli"、Disabled 恒为 false）──
+	Agents   []string // 上游 agent 分组归属（如 ["cli"]）；空 = 不在任何分组
+	Disabled bool     // 上游 disabled 标记
+
 	// ── 描述与元信息 ──
 	DescriptionZh string   // 中文简介
 	DescriptionEn string   // 英文简介
@@ -836,13 +840,21 @@ func verifiedEfforts(id string, declared []string) []string {
 	return append([]string(nil), sup...)
 }
 
-// FetchModels 调上游动态模型接口。
-// 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
-func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+// modelAgentGroups 上游 models 信封里的一个 agent 分组（如 "cli"、"Explore"）。
+type modelAgentGroups struct {
+	Name   string   `json:"name"`
+	Models []string `json:"models"`
+}
+
+// fetchModelsRaw 拉取并解析上游 models 信封。
+// 返回原始目录条目与分组列表（分组是上游控制模型用途的机制：只在 "cli" 组里的
+// 模型才是本网关可对话的；如 hunyuan-image-alpha 带 text-to-image tag、不在 cli
+// 组——存在但不可对话）。
+func (c *Client) fetchModelsRaw(a *auth.Auth) ([]dynModel, []modelAgentGroups, error) {
 	url := c.chatBase(a) + "/console/enterprises/personal/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
@@ -852,44 +864,96 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	req.Header.Set("User-Agent", clientUA)
 	resp, err := c.clientFor(a, false).Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		return nil, nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
 	}
 	var env struct {
 		Code int `json:"code"`
 		Data struct {
-			Models []dynModel `json:"models"`
-			Agents []struct {
-				Name   string   `json:"name"`
-				Models []string `json:"models"`
-			} `json:"agents"`
+			Models []dynModel         `json:"models"`
+			Agents []modelAgentGroups `json:"agents"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("models parse: %w", err)
+		return nil, nil, fmt.Errorf("models parse: %w", err)
 	}
 	if env.Code != 0 {
-		return nil, fmt.Errorf("models api code=%d", env.Code)
+		return nil, nil, fmt.Errorf("models api code=%d", env.Code)
 	}
+	return env.Data.Models, env.Data.Agents, nil
+}
+
+// modelInfoFromDyn 把上游 dynModel 装配成 ModelInfo（cli/全量两条路径共用）。
+// agents 为该模型所属的上游 agent 分组名列表（可空）。
+func modelInfoFromDyn(m dynModel, agents []string) ModelInfo {
+	rate, _ := ParseCreditsRate(m.Credits)
+	// 上游对固定单档模型只给 reasoning.effort，对可调档模型只给
+	// reasoning.supportedEfforts（实测互斥）；默认档优先取 defaultEffort，
+	// 回落 effort，保证两类模型都有"默认档"可显示。
+	defEffort := m.Reasoning.DefaultEffort
+	if defEffort == "" {
+		defEffort = m.Reasoning.Effort
+	}
+	return ModelInfo{
+		ID:                 m.ID,
+		Name:               m.Name,
+		ContextWindow:      m.MaxInputTokens,
+		MaxTokens:          m.MaxOutputTokens,
+		Efforts:            verifiedEfforts(m.ID, m.Reasoning.SupportedEfforts),
+		CreditsText:        m.Credits,
+		CreditsRate:        rate,
+		DefaultEffort:      defEffort,
+		CanDisableThinking: m.Reasoning.CanDisableThinking,
+		ReasoningSummary:   m.Reasoning.Summary,
+		SupportsImages:     m.SupportsImages,
+		SupportsReasoning:  m.SupportsReasoning,
+		SupportsToolCall:   m.SupportsToolCall,
+		OnlyReasoning:      m.OnlyReasoning,
+		Agents:             agents,
+		Disabled:           m.Disabled,
+		DescriptionZh:      m.DescriptionZh,
+		DescriptionEn:      m.DescriptionEn,
+		Vendor:             m.Vendor,
+		Tags:               m.Tags,
+		IsDefault:          m.IsDefault,
+		Temperature:        m.Temperature,
+		TopP:               m.TopP,
+		TopK:               m.TopK,
+	}
+}
+
+// FetchCatalog 一次请求返回两个视图：
+//   - cli：FetchModels 口径（cli 分组 ∩ 未禁用 + 别名补录），即"本网关可对话"集合；
+//   - all：上游全量目录（含非 cli 分组与 disabled 条目），顺序为 cli 成员在前
+//     （按 cli 声明顺序）、其余按目录原序。【不含】别名——别名是本地合成、非上游模型。
+//
+// 成功时刷新 effort 能力缓存（仅收录 cli 模型的上游原始声明，语义同原 FetchModels）。
+func (c *Client) FetchCatalog(a *auth.Auth) (cli []ModelInfo, all []ModelInfo, err error) {
+	models, groups, err := c.fetchModelsRaw(a)
+	if err != nil {
+		return nil, nil, err
+	}
+	// 两个方向的分组索引：cliIDs = "cli" 组的成员 ID 列表（有序）；
+	// agentsByID = 模型 ID → 所属分组名列表（供 Agents 字段标注）。
 	var cliIDs []string
-	for _, ag := range env.Data.Agents {
+	agentsByID := make(map[string][]string, len(models))
+	for _, ag := range groups {
 		if ag.Name == "cli" {
 			cliIDs = ag.Models
-			break
+		}
+		for _, id := range ag.Models {
+			agentsByID[id] = append(agentsByID[id], ag.Name)
 		}
 	}
-	if len(cliIDs) == 0 {
-		return nil, fmt.Errorf("no cli agent models found")
-	}
-	dynMap := make(map[string]dynModel, len(env.Data.Models))
-	for _, m := range env.Data.Models {
+	dynMap := make(map[string]dynModel, len(models))
+	for _, m := range models {
 		dynMap[m.ID] = m
 	}
-	out := make([]ModelInfo, 0, len(cliIDs))
+	cli = make([]ModelInfo, 0, len(cliIDs))
 	// rawEfforts 只记录【上游原始声明】的可选档，供请求体降级使用（理由见函数尾注释）。
 	rawEfforts := make(map[string][]string, len(cliIDs))
 	for _, id := range cliIDs {
@@ -900,54 +964,23 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if len(m.Reasoning.SupportedEfforts) > 0 {
 			rawEfforts[id] = m.Reasoning.SupportedEfforts
 		}
-		rate, _ := ParseCreditsRate(m.Credits)
-		// 上游对固定单档模型只给 reasoning.effort，对可调档模型只给
-		// reasoning.supportedEfforts（实测互斥）；默认档优先取 defaultEffort，
-		// 回落 effort，保证两类模型都有"默认档"可显示。
-		defEffort := m.Reasoning.DefaultEffort
-		if defEffort == "" {
-			defEffort = m.Reasoning.Effort
-		}
-		out = append(out, ModelInfo{
-			ID:                 m.ID,
-			Name:               m.Name,
-			ContextWindow:      m.MaxInputTokens,
-			MaxTokens:          m.MaxOutputTokens,
-			Efforts:            verifiedEfforts(id, m.Reasoning.SupportedEfforts),
-			CreditsText:        m.Credits,
-			CreditsRate:        rate,
-			DefaultEffort:      defEffort,
-			CanDisableThinking: m.Reasoning.CanDisableThinking,
-			ReasoningSummary:   m.Reasoning.Summary,
-			SupportsImages:     m.SupportsImages,
-			SupportsReasoning:  m.SupportsReasoning,
-			SupportsToolCall:   m.SupportsToolCall,
-			OnlyReasoning:      m.OnlyReasoning,
-			DescriptionZh:      m.DescriptionZh,
-			DescriptionEn:      m.DescriptionEn,
-			Vendor:             m.Vendor,
-			Tags:               m.Tags,
-			IsDefault:          m.IsDefault,
-			Temperature:        m.Temperature,
-			TopP:               m.TopP,
-			TopK:               m.TopK,
-		})
+		cli = append(cli, modelInfoFromDyn(m, agentsByID[id]))
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
-	}
+	// realCount 记录真实 cli 成员数（别名补录前的长度）——全量视图取这一段，
+	// 别名是本地合成、不属于上游目录，不进 all。
+	realCount := len(cli)
 	// 别名模型补录：克隆 base 条目（Efforts 已是 verifiedEfforts 后的展示值）。
 	// base 不在上游列表 → 别名大概率同样失效，不补。
 	for _, al := range aliasModelEntries {
-		for i := range out {
-			if out[i].ID != al.base {
+		for i := range cli {
+			if cli[i].ID != al.base {
 				continue
 			}
-			mi := out[i]
+			mi := cli[i]
 			mi.ID = al.id
 			mi.Name = al.name
 			mi.IsDefault = false // 别名不继承"默认模型"标记，避免列表出现两个默认
-			out = append(out, mi)
+			cli = append(cli, mi)
 			break
 		}
 	}
@@ -957,7 +990,36 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.effortsMu.Lock()
 	c.efforts = rawEfforts
 	c.effortsMu.Unlock()
-	return out, nil
+
+	// 全量视图：cli 实成员（不含别名）在前，其余按目录原序。
+	// 去重按【已入 all 的条目】而非 cliIDs 名单——cli 组里的 disabled 成员
+	// 不进 cli 视图，但必须出现在全量视图里（Agents=["cli"] + Disabled=true）。
+	emitted := make(map[string]bool, realCount)
+	for _, mi := range cli[:realCount] {
+		emitted[mi.ID] = true
+	}
+	all = make([]ModelInfo, 0, len(models))
+	all = append(all, cli[:realCount]...)
+	for _, m := range models {
+		if emitted[m.ID] {
+			continue
+		}
+		all = append(all, modelInfoFromDyn(m, agentsByID[m.ID]))
+	}
+	return cli, all, nil
+}
+
+// FetchModels 调上游动态模型接口，返回本网关可对话的模型列表（cli 分组口径）。
+// 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
+func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
+	cli, _, err := c.FetchCatalog(a)
+	if err != nil {
+		return nil, err
+	}
+	if len(cli) == 0 {
+		return nil, fmt.Errorf("no cli agent models found")
+	}
+	return cli, nil
 }
 
 // ParseCreditsRate 从上游 credits 原文解析消耗倍率。

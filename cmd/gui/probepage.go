@@ -248,8 +248,8 @@ func (a *app) syncProbeChoices() {
 		acctNames = append(acctNames, probeAccountLabel(st.Nickname, st.UID, accountState(st)))
 		uids = append(uids, st.UID)
 	}
-	// 模型：来自「模型」页已加载的实时表
-	models := probeModelChoices(a.modelRates.items)
+	// 模型：固定取 cli 可对话清单（非 cli 模型只供展示，探测它们只会报错/白耗积分）
+	models := probeModelChoices(a.cliRows)
 
 	uidChanged := !equalStrs(uids, a.probeUIDs)
 	modelChanged := !equalStrs(models, a.lastProbeModels)

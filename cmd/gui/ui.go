@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/lxn/walk"
@@ -206,6 +207,8 @@ func (a *app) buildUI() error {
 						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
 						Children: []dcl.Widget{
 							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "模型参数（全部来自上游 models 接口实时拉取，非本地写死；缓存 1 小时）。" +
+								"\r\n· 默认只列【可对话】模型（上游 cli 分组）；勾选下方开关可查看上游全量目录——" +
+								"非 cli 分组（如 text-to-image 生图模型）与已禁用条目仅供观测，发 chat 不可用。" +
 								"\r\n· 思考深度：默认档（上游 defaultEffort）+ 可选档（supportedEfforts）。可调档模型才能切档，" +
 								"其余为固定单档。请求里写 reasoning_effort 时，网关会按可选档自动降级。" +
 								"\r\n· 倍率越低越省积分：账号剩余积分 ÷ 倍率 ≈ 可用次数当量。" +
@@ -215,6 +218,11 @@ func (a *app) buildUI() error {
 								Layout: dcl.HBox{Spacing: 8},
 								Children: []dcl.Widget{
 									dcl.PushButton{AssignTo: &btnReloadRates, Text: "重新加载参数", MinSize: dcl.Size{Width: 110}, OnClicked: func() { go a.loadModelRates() }},
+									dcl.CheckBox{
+										AssignTo:  &a.ckShowAllModels,
+										Text:      "显示全部上游模型（含非 CLI / 已禁用，仅供查看，不可对话）",
+										OnClicked: func() { a.renderModelRows() },
+									},
 									dcl.HSpacer{},
 									dcl.Label{AssignTo: &a.lblModelHint, MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: ""},
 								},
@@ -237,6 +245,7 @@ func (a *app) buildUI() error {
 									{Title: "图片", Width: 55},
 									{Title: "工具", Width: 55},
 									{Title: "厂商", Width: 55},
+									{Title: "分组", Width: 90},
 									{Title: "说明", Width: 200},
 								},
 							},
@@ -648,19 +657,35 @@ func (a *app) buildUI() error {
 func modelDetailText(r modelRateRow) string {
 	cap := fmt.Sprintf("%d", r.ContextWindow)
 	out := fmt.Sprintf("%d", r.MaxTokens)
+	inCLI := false
+	for _, g := range strings.Split(r.Agents, ",") {
+		if strings.TrimSpace(g) == "cli" {
+			inCLI = true
+			break
+		}
+	}
+	callable := "是（cli 分组）"
+	if !inCLI {
+		callable = "否（不属于 cli 分组）"
+	}
+	if r.Disabled {
+		callable = "否（上游已禁用）"
+	}
 	detail := fmt.Sprintf(
 		"%s（%s）\r\n"+
 			"思考深度：默认档 %s ｜ 可选档 %s ｜ 可关闭思考 %s ｜ 只能推理 %s\r\n"+
 			"容量：上下文 %s tokens ｜ 最大输出 %s tokens\r\n"+
 			"能力：图片输入 %s ｜ 工具调用 %s ｜ 推理 %s\r\n"+
 			"计费：消耗倍率 %s\r\n"+
-			"元信息：厂商 %s ｜ 标签 %s ｜ 默认模型 %s",
+			"元信息：厂商 %s ｜ 标签 %s ｜ 默认模型 %s ｜ 分组 %s\r\n"+
+			"可否对话：%s",
 		r.ID, r.Name,
 		r.Effort, r.Supported, r.CanDisable, r.OnlyReason,
 		cap, out,
 		r.Images, r.ToolCall, orDash(r.Reason),
 		r.Rate,
-		r.Vendor, r.Tags, r.IsDeflt,
+		r.Vendor, r.Tags, r.IsDeflt, r.Agents,
+		callable,
 	)
 	if r.Desc != "" {
 		detail += "\r\n说明：" + r.Desc

@@ -190,10 +190,12 @@ type modelRateRow struct {
 	Reason   string // 推理能力
 
 	// 元信息
-	Vendor  string
-	Tags    string
-	IsDeflt string
-	Desc    string
+	Agents   string // 上游 agent 分组（如 "cli"）；空显示 "—"。禁用条目追加"（禁用）"
+	Disabled bool
+	Vendor   string
+	Tags     string
+	IsDeflt  string
+	Desc     string
 }
 
 type modelRateModel struct {
@@ -232,6 +234,11 @@ func (m *modelRateModel) Value(row, col int) interface{} {
 	case 10:
 		return r.Vendor
 	case 11:
+		if r.Disabled {
+			return r.Agents + "（禁用）"
+		}
+		return r.Agents
+	case 12:
 		return r.Desc
 	default:
 		return ""
@@ -1118,78 +1125,107 @@ func (a *app) loadModelRates() {
 	if acct == nil {
 		return
 	}
-	infos, err := up.FetchModels(acct)
+	cliInfos, allInfos, err := up.FetchCatalog(acct)
 	if err != nil {
 		log.Printf("拉取模型参数失败: %v", err)
 		return
 	}
-	rows := make([]modelRateRow, 0, len(infos))
-	for _, mi := range infos {
-		rate := "—"
-		if mi.CreditsRate > 0 {
-			rate = fmt.Sprintf("×%.2f", mi.CreditsRate)
-		}
-		// 思考档：上游对固定单档模型给 defaultEffort，对可调档模型给 supportedEfforts。
-		effort := mi.DefaultEffort
-		if effort == "" {
-			effort = "—"
-		}
-		supported := "—"
-		if len(mi.Efforts) > 0 {
-			supported = strings.Join(mi.Efforts, "/")
-		}
-		canDisable := "—"
-		if len(mi.Efforts) > 0 || mi.CanDisableThinking {
-			canDisable = yesNo(mi.CanDisableThinking)
-		}
-		onlyReason := "—"
-		if mi.OnlyReasoning {
-			onlyReason = "是"
-		}
-		tags := "—"
-		if len(mi.Tags) > 0 {
-			tags = strings.Join(mi.Tags, ",")
-		}
-		isDef := "—"
-		if mi.IsDefault {
-			isDef = "是"
-		}
-		desc := mi.DescriptionZh
-		if desc == "" {
-			desc = mi.DescriptionEn
-		}
-		rows = append(rows, modelRateRow{
-			ID:            mi.ID,
-			Name:          mi.Name,
-			Rate:          rate,
-			RateV:         mi.CreditsRate,
-			Effort:        effort,
-			Supported:     supported,
-			CanDisable:    canDisable,
-			OnlyReason:    onlyReason,
-			ContextWindow: mi.ContextWindow,
-			MaxTokens:     mi.MaxTokens,
-			Images:        yesNo(mi.SupportsImages),
-			ToolCall:      yesNo(mi.SupportsToolCall),
-			Reason:        yesNo(mi.SupportsReasoning),
-			Vendor:        orDash(mi.Vendor),
-			Tags:          tags,
-			IsDeflt:       isDef,
-			Desc:          desc,
-		})
+	cliRows := make([]modelRateRow, 0, len(cliInfos))
+	for _, mi := range cliInfos {
+		cliRows = append(cliRows, modelRateRowFrom(mi))
+	}
+	allRows := make([]modelRateRow, 0, len(allInfos))
+	for _, mi := range allInfos {
+		allRows = append(allRows, modelRateRowFrom(mi))
 	}
 	a.mw.Synchronize(func() {
-		a.modelRates.Replace(rows)
-		if a.lblModelHint != nil {
-			a.lblModelHint.SetText(fmt.Sprintf("共 %d 个模型", len(rows)))
-		}
-		if a.lblModelDetail != nil && len(rows) > 0 {
-			a.lblModelDetail.SetText("选中一行查看该模型的完整参数。")
-		}
+		a.cliRows = cliRows
+		a.allRows = allRows
+		a.renderModelRows()
 		a.syncProbeChoices()
 		a.syncMatrixModels()
 	})
-	log.Printf("模型参数已加载：%d 个模型", len(rows))
+	log.Printf("模型参数已加载：%d 个可对话模型（上游目录共 %d 个）", len(cliRows), len(allRows))
+}
+
+// modelRateRowFrom 把一个 ModelInfo 装配成表格行（cli/全量视图共用）。
+func modelRateRowFrom(mi upstream.ModelInfo) modelRateRow {
+	rate := "—"
+	if mi.CreditsRate > 0 {
+		rate = fmt.Sprintf("×%.2f", mi.CreditsRate)
+	}
+	// 思考档：上游对固定单档模型给 defaultEffort，对可调档模型给 supportedEfforts。
+	effort := mi.DefaultEffort
+	if effort == "" {
+		effort = "—"
+	}
+	supported := "—"
+	if len(mi.Efforts) > 0 {
+		supported = strings.Join(mi.Efforts, "/")
+	}
+	canDisable := "—"
+	if len(mi.Efforts) > 0 || mi.CanDisableThinking {
+		canDisable = yesNo(mi.CanDisableThinking)
+	}
+	onlyReason := "—"
+	if mi.OnlyReasoning {
+		onlyReason = "是"
+	}
+	tags := "—"
+	if len(mi.Tags) > 0 {
+		tags = strings.Join(mi.Tags, ",")
+	}
+	isDef := "—"
+	if mi.IsDefault {
+		isDef = "是"
+	}
+	desc := mi.DescriptionZh
+	if desc == "" {
+		desc = mi.DescriptionEn
+	}
+	agents := orDash(strings.Join(mi.Agents, ","))
+	return modelRateRow{
+		ID:            mi.ID,
+		Name:          mi.Name,
+		Rate:          rate,
+		RateV:         mi.CreditsRate,
+		Effort:        effort,
+		Supported:     supported,
+		CanDisable:    canDisable,
+		OnlyReason:    onlyReason,
+		ContextWindow: mi.ContextWindow,
+		MaxTokens:     mi.MaxTokens,
+		Images:        yesNo(mi.SupportsImages),
+		ToolCall:      yesNo(mi.SupportsToolCall),
+		Reason:        yesNo(mi.SupportsReasoning),
+		Agents:        agents,
+		Disabled:      mi.Disabled,
+		Vendor:        orDash(mi.Vendor),
+		Tags:          tags,
+		IsDeflt:       isDef,
+		Desc:          desc,
+	}
+}
+
+// renderModelRows 按「显示全部上游模型」开关把对应视图灌进表格。
+// 只在「重新加载参数」或开关切换时调用；cliRows 为空（从未拉取）时表格清空。
+func (a *app) renderModelRows() {
+	showAll := a.ckShowAllModels != nil && a.ckShowAllModels.Checked()
+	rows := a.cliRows
+	if showAll {
+		rows = a.allRows
+	}
+	a.modelRates.Replace(rows)
+	if a.lblModelHint != nil {
+		if showAll {
+			a.lblModelHint.SetText(fmt.Sprintf("共 %d 个（上游全量目录，其中可对话 %d 个）", len(rows), len(a.cliRows)))
+		} else {
+			a.lblModelHint.SetText(fmt.Sprintf("共 %d 个模型（可对话）", len(rows)))
+		}
+	}
+	if a.lblModelDetail != nil && len(rows) > 0 {
+		a.lblModelDetail.SetText("选中一行查看该模型的完整参数。")
+	}
 }
 
 // yesNo 布尔转中文显示。
@@ -1263,6 +1299,12 @@ type app struct {
 	tvModelRates   *walk.TableView
 	lblModelHint   *walk.Label
 	lblModelDetail *walk.Label
+	// ckShowAllModels 勾选后表格显示上游全量目录（含非 cli 分组与禁用条目）。
+	// cliRows / allRows 缓存两份视图数据，切换视图不再打上游；
+	// 探测类下拉框固定用 cliRows（非 cli 模型不可对话，测了只会报错或消耗积分）。
+	ckShowAllModels *walk.CheckBox
+	cliRows         []modelRateRow
+	allRows         []modelRateRow
 
 	// 登录页
 	leURL     *walk.LineEdit

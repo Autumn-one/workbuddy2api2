@@ -226,7 +226,7 @@ func (a *app) syncMatrixModels() {
 	if a.cbMatrixModel == nil {
 		return
 	}
-	models := probeModelChoices(a.modelRates.items)
+	models := probeModelChoices(a.cliRows)
 	if equalStrs(models, a.lastMatrixModels) {
 		return
 	}
@@ -264,7 +264,7 @@ func (a *app) doMatrixProbe() {
 	// （初版从「测试」页控件取值是错的——账号页上看不见也改不了。）
 	def := a.selectedMatrixModel()
 	if def == "" {
-		if a.modelRates == nil || len(a.modelRates.items) == 0 {
+		if len(a.cliRows) == 0 {
 			a.lblAccts2.SetText("模型清单为空：请先到「模型」页点「重新加载参数」")
 		} else {
 			a.lblAccts2.SetText("请先在账号页选择要检测的模型")
@@ -323,7 +323,7 @@ func (a *app) doMatrixProbeSelected() {
 	}
 	def := a.selectedMatrixModel()
 	if def == "" {
-		if a.modelRates == nil || len(a.modelRates.items) == 0 {
+		if len(a.cliRows) == 0 {
 			a.lblAccts2.SetText("模型清单为空：请先到「模型」页点「重新加载参数」")
 		} else {
 			a.lblAccts2.SetText("请先在账号页选择要检测的模型")

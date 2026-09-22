@@ -127,9 +127,12 @@ var staticModels = []map[string]any{
 }
 
 // dynamicModelsCache 动态模型缓存。
+// ids = cli 可对话列表（/v1/models 默认输出）；all = 上游全量目录（?all=1 输出），
+// 二者同一次上游请求产出、同一 TTL。
 var dynamicModelsCache struct {
 	sync.RWMutex
 	ids      []upstream.ModelInfo
+	all      []upstream.ModelInfo
 	fetched  time.Time // 最近一次成功拉取时间
 	lastFail time.Time // 最近一次拉取失败时间（负缓存）
 }
@@ -140,7 +143,17 @@ const (
 )
 
 // models 返回模型列表：优先动态（缓存 1h），失败回退静态表。
+// ?all=1 时返回上游全量目录（含非 cli 分组与 disabled 条目），每条额外带
+// agents / disabled / callable 标记——仅展示用，callable=false 的模型
+// 走 chat 不会被上游接受为对话模型。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	if q := r.URL.Query().Get("all"); q == "1" || strings.EqualFold(q, "true") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"object": "list",
+			"data":   h.modelListAll(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
@@ -153,107 +166,145 @@ func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 // 消耗倍率）。这些是【增量字段】，不影响标准客户端解析；需要思考深度档位的
 // 客户端可据此决定传哪个 reasoning_effort。
 func (h *Handler) modelList() []map[string]any {
-	if infos := h.fetchDynamicModels(); len(infos) > 0 {
+	if infos, _ := h.fetchDynamicModels(); len(infos) > 0 {
 		out := make([]map[string]any, 0, len(infos))
 		for _, mi := range infos {
-			entry := map[string]any{
-				"id":                mi.ID,
-				"object":            "model",
-				"created":           1753600000,
-				"owned_by":          "workbuddy",
-				"context_length":    mi.ContextWindow,
-				"max_output_tokens": mi.MaxTokens,
-			}
-			if mi.ContextWindow == 0 {
-				entry["context_length"] = 131072 // 兜底
-			}
-			// 模型显示名与简介（上游 descriptionZh/En）。
-			if mi.Name != "" {
-				entry["name"] = mi.Name
-			}
-			if mi.DescriptionZh != "" {
-				entry["description"] = mi.DescriptionZh
-			} else if mi.DescriptionEn != "" {
-				entry["description"] = mi.DescriptionEn
-			}
-			// 思考深度：默认档 + 可选档 + 能否关闭。
-			// 上游对固定单档模型给 defaultEffort，对可调档模型给 supportedEfforts（互斥）。
-			reasoning := map[string]any{}
-			if mi.DefaultEffort != "" {
-				reasoning["default_effort"] = mi.DefaultEffort
-			}
-			if len(mi.Efforts) > 0 {
-				reasoning["supported_efforts"] = mi.Efforts
-			}
-			if mi.CanDisableThinking {
-				reasoning["can_disable_thinking"] = true
-			}
-			if mi.OnlyReasoning {
-				reasoning["only_reasoning"] = true
-			}
-			if len(reasoning) > 0 {
-				entry["reasoning"] = reasoning
-			}
-			// 能力标志。
-			caps := map[string]any{}
-			if mi.SupportsImages {
-				caps["images"] = true
-			}
-			if mi.SupportsToolCall {
-				caps["tool_calls"] = true
-			}
-			if mi.SupportsReasoning {
-				caps["reasoning"] = true
-			}
-			if len(caps) > 0 {
-				entry["capabilities"] = caps
-			}
-			// 消耗倍率（非额度）：积分池按此倍率折算各模型可用量。
-			if mi.CreditsRate > 0 {
-				entry["credits_multiplier"] = mi.CreditsRate
-			}
-			out = append(out, entry)
+			out = append(out, modelEntry(mi))
 		}
 		return out
 	}
 	return staticModels
 }
 
-// fetchDynamicModels 从池中任一健康账号拉模型列表（含 contextWindow/maxTokens），缓存 1h。
+// modelListAll /v1/models?all=1 的全量视图：上游目录里所有模型，
+// 在标准条目之上追加 agents（所属分组）、disabled、callable（能否走本网关对话）。
+// callable=false 的条目仅用于观测上游目录，客户端不应拿它们发 chat。
+func (h *Handler) modelListAll() []map[string]any {
+	_, all := h.fetchDynamicModels()
+	if len(all) == 0 {
+		return nil
+	}
+	inCLI := func(mi upstream.ModelInfo) bool {
+		for _, g := range mi.Agents {
+			if g == "cli" {
+				return true
+			}
+		}
+		return false
+	}
+	out := make([]map[string]any, 0, len(all))
+	for _, mi := range all {
+		entry := modelEntry(mi)
+		agents := mi.Agents
+		if agents == nil {
+			agents = []string{} // nil 切片会序列化成 null，空数组更符合"无分组"语义
+		}
+		entry["agents"] = agents
+		entry["disabled"] = mi.Disabled
+		entry["callable"] = inCLI(mi) && !mi.Disabled
+		out = append(out, entry)
+	}
+	return out
+}
+
+// modelEntry 单个模型的 OpenAI 兼容条目 + 本网关扩展字段（reasoning/capabilities/倍率）。
+func modelEntry(mi upstream.ModelInfo) map[string]any {
+	entry := map[string]any{
+		"id":                mi.ID,
+		"object":            "model",
+		"created":           1753600000,
+		"owned_by":          "workbuddy",
+		"context_length":    mi.ContextWindow,
+		"max_output_tokens": mi.MaxTokens,
+	}
+	if mi.ContextWindow == 0 {
+		entry["context_length"] = 131072 // 兜底
+	}
+	// 模型显示名与简介（上游 descriptionZh/En）。
+	if mi.Name != "" {
+		entry["name"] = mi.Name
+	}
+	if mi.DescriptionZh != "" {
+		entry["description"] = mi.DescriptionZh
+	} else if mi.DescriptionEn != "" {
+		entry["description"] = mi.DescriptionEn
+	}
+	// 思考深度：默认档 + 可选档 + 能否关闭。
+	// 上游对固定单档模型给 defaultEffort，对可调档模型给 supportedEfforts（互斥）。
+	reasoning := map[string]any{}
+	if mi.DefaultEffort != "" {
+		reasoning["default_effort"] = mi.DefaultEffort
+	}
+	if len(mi.Efforts) > 0 {
+		reasoning["supported_efforts"] = mi.Efforts
+	}
+	if mi.CanDisableThinking {
+		reasoning["can_disable_thinking"] = true
+	}
+	if mi.OnlyReasoning {
+		reasoning["only_reasoning"] = true
+	}
+	if len(reasoning) > 0 {
+		entry["reasoning"] = reasoning
+	}
+	// 能力标志。
+	caps := map[string]any{}
+	if mi.SupportsImages {
+		caps["images"] = true
+	}
+	if mi.SupportsToolCall {
+		caps["tool_calls"] = true
+	}
+	if mi.SupportsReasoning {
+		caps["reasoning"] = true
+	}
+	if len(caps) > 0 {
+		entry["capabilities"] = caps
+	}
+	// 消耗倍率（非额度）：积分池按此倍率折算各模型可用量。
+	if mi.CreditsRate > 0 {
+		entry["credits_multiplier"] = mi.CreditsRate
+	}
+	return entry
+}
+
+// fetchDynamicModels 从池中任一健康账号拉模型目录（含 contextWindow/maxTokens），缓存 1h。
+// 一次上游请求同时产出 cli 可对话列表与全量目录（后者供 ?all=1 展示）。
 // 拉取失败记录时间戳进入 5min 负缓存，冷却期内直接用静态表，避免反复打上游。
-func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
+func (h *Handler) fetchDynamicModels() (cli []upstream.ModelInfo, all []upstream.ModelInfo) {
 	dynamicModelsCache.RLock()
 	if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
-		out := dynamicModelsCache.ids
+		out, allOut := dynamicModelsCache.ids, dynamicModelsCache.all
 		dynamicModelsCache.RUnlock()
-		return out
+		return out, allOut
 	}
 	// 失败负缓存：冷却期内不再请求上游。
 	if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
 		dynamicModelsCache.RUnlock()
-		return nil
+		return nil, nil
 	}
 	dynamicModelsCache.RUnlock()
 
 	acct := h.cfg.Pool.Pick()
 	if acct == nil {
-		return nil
+		return nil, nil
 	}
-	infos, err := h.cfg.Upstream.FetchModels(acct)
+	infos, allInfos, err := h.cfg.Upstream.FetchCatalog(acct)
 	if err != nil || len(infos) == 0 {
 		// 拉取失败惩罚该账号，避免下次 Pick 又选中同一个反复失败；lastFail 保持全局负缓存。
 		h.cfg.Pool.NoteError(acct.UID)
 		dynamicModelsCache.Lock()
 		dynamicModelsCache.lastFail = time.Now()
 		dynamicModelsCache.Unlock()
-		return nil
+		return nil, nil
 	}
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.ids = infos
+	dynamicModelsCache.all = allInfos
 	dynamicModelsCache.fetched = time.Now()
 	dynamicModelsCache.lastFail = time.Time{} // 成功则清空负缓存
 	dynamicModelsCache.Unlock()
-	return infos
+	return infos, allInfos
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
