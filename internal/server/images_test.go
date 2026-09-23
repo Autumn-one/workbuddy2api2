@@ -65,6 +65,71 @@ func TestImageGenerationsOK(t *testing.T) {
 	}
 }
 
+// TestImageGenerationsLogsRow 图像请求必须走与 chat 相同的表格日志链路——
+// 曾因未接 chatStat 导致生图请求在运行日志/请求日志里完全不可见（回归测试）。
+func TestImageGenerationsLogsRow(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	out := captureStdout(t, func() {
+		resp, err := http.Post(srv.URL+"/v1/images/generations", "application/json",
+			strings.NewReader(`{"prompt":"a cat"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status=%d", resp.StatusCode)
+		}
+	})
+	for _, want := range []string{"| #", defaultImageGenModel, "| image |", "| 200 |", "acct=u1", "total="} {
+		if !strings.Contains(out, want) {
+			t.Errorf("row missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// TestImageEditsLogsRow edits 端点落 mode=imgedit 的表格行；校验失败也落行（status=400）。
+func TestImageEditsLogsRow(t *testing.T) {
+	withChatLog(t)
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/e.png"}]}}`
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	pngB64 := "iVBORw0KGgoAAAANSUhEUg=="
+	out := captureStdout(t, func() {
+		resp, err := http.Post(srv.URL+"/v1/images/edits", "application/json",
+			strings.NewReader(`{"prompt":"make it blue","image":"`+pngB64+`"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 200 {
+			t.Fatalf("status=%d", resp.StatusCode)
+		}
+		resp2, err := http.Post(srv.URL+"/v1/images/edits", "application/json",
+			strings.NewReader(`{"prompt":"p"}`)) // 缺 image → 400
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp2.Body.Close()
+	})
+	if !strings.Contains(out, "| imgedit |") {
+		t.Errorf("missing imgedit row:\n%s", out)
+	}
+	if !strings.Contains(out, "| 400 |") {
+		t.Errorf("validation failure should still log a row:\n%s", out)
+	}
+}
+
 // TestImageGenerationsRotatesOn429 429 queue-full → 换号重试成功。
 func TestImageGenerationsRotatesOn429(t *testing.T) {
 	var calls atomic.Int32

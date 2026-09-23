@@ -60,12 +60,27 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}
+
+	// 请求级统计：与 chat 同一条表格日志链路（任何出口都会落一行）。
+	// 图像请求没有 token usage，tok/ctx/cache/think 列恒为 "-"，
+	// 但请求数仍计入用量统计（Requests++、Missing++——用量页能看到
+	// "这个图像模型被调了几次"，token 列如实为 0）。
+	st := newChatStat(time.Now(), body, false)
+	st.mode = "image"
+	if edit {
+		st.mode = "imgedit"
+	}
+	st.usageSink = h.cfg.UsageStore
+	defer st.done()
+
 	var in imageGenRequest
 	if err := json.Unmarshal(body, &in); err != nil {
+		st.status = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid JSON: "+err.Error())
 		return
 	}
 	if strings.TrimSpace(in.Prompt) == "" {
+		st.status = http.StatusBadRequest
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "prompt is required")
 		return
 	}
@@ -78,6 +93,8 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 			in.Model = defaultImageEditModel
 		}
 	}
+	// 日志展示实际生效的模型（含默认补全），而非客户端原文字段。
+	st.model = in.Model
 	req := upstream.ImageRequest{
 		Model:         in.Model,
 		Prompt:        in.Prompt,
@@ -93,12 +110,14 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 	if edit {
 		rawImgs, err := parseImageField(in.Image)
 		if err != nil || len(rawImgs) == 0 {
+			st.status = http.StatusBadRequest
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "image is required (data URL / http(s) URL / base64)")
 			return
 		}
 		// 归一化为 data URL 列表；远程图在入轮转前抓取一次即可（与账号无关，直连即可）。
 		req.Images, err = h.cfg.Upstream.NormalizeImageInputs(nil, rawImgs)
 		if err != nil {
+			st.status = http.StatusBadRequest
 			writeOpenAIError(w, http.StatusBadRequest, "invalid_image", err.Error())
 			return
 		}
@@ -122,8 +141,10 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		acct := h.cfg.Pool.PickExcluding(tried, in.Model)
 		if acct == nil {
+			st.status = http.StatusServiceUnavailable
 			break
 		}
+		st.acct = acct
 		tried[acct.UID] = true
 		if !h.cfg.Pool.Acquire(acct.UID) {
 			continue
@@ -148,20 +169,29 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 		}
 
 		var items []upstream.ImageItem
+		var proxy string
 		var callErr error
 		if edit {
-			items, callErr = h.cfg.Upstream.EditImage(acct, req)
+			items, proxy, callErr = h.cfg.Upstream.EditImage(acct, req)
 		} else {
-			items, callErr = h.cfg.Upstream.GenerateImage(acct, req)
+			items, proxy, callErr = h.cfg.Upstream.GenerateImage(acct, req)
 		}
+		st.params.Proxy = proxy
 		if callErr != nil {
 			var ue *upstream.Error
 			if errors.As(callErr, &ue) {
+				st.status = ue.Status
+				if st.status < 400 {
+					// 信封错误（200 + code!=0）：HTTP 层是 200 但本次调用确已失败，
+					// 状态列如实按网关语义记 502，不伪装成成功。
+					st.status = http.StatusBadGateway
+				}
 				lastErr = ue
 				h.applyErrorPolicy(acct, in.Model, ue.Kind, ue.Status, ue.Msg)
 				log.Printf("image acct=%s model=%s edit=%v: %s", logAccountName(acct), in.Model, edit, ue)
 			} else {
 				// 传输层错误：换号不罚（与 chat 同策）。
+				st.status = http.StatusServiceUnavailable
 				lastErr = callErr
 				log.Printf("image acct=%s model=%s edit=%v: transport error: %v", logAccountName(acct), in.Model, edit, callErr)
 			}
@@ -171,6 +201,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 		if len(items) == 0 {
 			// 200 但无有效结果：上游返回了空 data——透传错误而非换号重试（与账号无关）。
 			releaseHeld()
+			st.status = http.StatusBadGateway
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_empty", "upstream returned no image")
 			return
 		}
@@ -180,6 +211,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 		if strings.EqualFold(in.ResponseFormat, "b64_json") {
 			h.cfg.Upstream.InlineImageURLs(acct, items)
 		}
+		st.status = http.StatusOK
 		writeJSON(w, http.StatusOK, map[string]any{
 			"created": time.Now().Unix(),
 			"data":    items,
@@ -194,6 +226,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 		if status < 400 {
 			status = http.StatusBadGateway
 		}
+		st.status = status
 		writeOpenAIError(w, status, ue.Kind.String(), ue.Msg)
 		return
 	}
@@ -201,6 +234,7 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
+	st.status = http.StatusServiceUnavailable
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
 

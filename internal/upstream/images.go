@@ -62,17 +62,20 @@ type imageData struct {
 }
 
 // GenerateImage 文生图：POST /v2/images/generations。
-func (c *Client) GenerateImage(a *auth.Auth, in ImageRequest) ([]ImageItem, error) {
+// 返回值含【实际使用】的出口代理（空串 = 直连），供请求日志展示。
+func (c *Client) GenerateImage(a *auth.Auth, in ImageRequest) ([]ImageItem, string, error) {
 	return c.postImage(a, "/v2/images/generations", in, false)
 }
 
 // EditImage 图生图编辑：POST /v2/images/edits。in.Images 必须已是 data URL。
-func (c *Client) EditImage(a *auth.Auth, in ImageRequest) ([]ImageItem, error) {
+// 返回值含【实际使用】的出口代理（空串 = 直连），供请求日志展示。
+func (c *Client) EditImage(a *auth.Auth, in ImageRequest) ([]ImageItem, string, error) {
 	return c.postImage(a, "/v2/images/edits", in, true)
 }
 
 // postImage 发图像请求并解析信封。错误路径沿用 doJSONFor 的 *Error（已含 Classify 分类）。
-func (c *Client) postImage(a *auth.Auth, path string, in ImageRequest, edit bool) ([]ImageItem, error) {
+// 返回的 proxy 是本次请求实际使用的出口代理（含不可达回落后的真实值）。
+func (c *Client) postImage(a *auth.Auth, path string, in ImageRequest, edit bool) ([]ImageItem, string, error) {
 	n := in.N
 	if n <= 0 {
 		n = 1
@@ -110,22 +113,22 @@ func (c *Client) postImage(a *auth.Auth, path string, in ImageRequest, edit bool
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+path, bytes.NewReader(raw))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	ChatHeaders(req, a)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Model-ID", in.Model)
-	data, err := c.doJSONFor(a, req)
+	data, proxy, err := c.doJSONForWithProxy(a, req)
 	if err != nil {
-		return nil, err
+		return nil, proxy, err
 	}
 	var d imageData
 	if err := json.Unmarshal(data, &d); err != nil {
-		return nil, fmt.Errorf("image parse: %w (body: %s)", err, truncate(string(data), 120))
+		return nil, proxy, fmt.Errorf("image parse: %w (body: %s)", err, truncate(string(data), 120))
 	}
 	items := d.Data[:0]
 	for _, it := range d.Data {
@@ -133,7 +136,7 @@ func (c *Client) postImage(a *auth.Auth, path string, in ImageRequest, edit bool
 			items = append(items, it)
 		}
 	}
-	return items, nil
+	return items, proxy, nil
 }
 
 // maxImageFetchBytes 拉取远程输入图/结果图的大小上限（防超大响应撑爆内存）。

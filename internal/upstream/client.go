@@ -583,28 +583,37 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 
 // doJSONFor 与 doJSON 相同，但按账号选择出口代理（a 为 nil 表示直连）。
 func (c *Client) doJSONFor(a *auth.Auth, req *http.Request) (json.RawMessage, error) {
-	resp, err := c.clientFor(a, false).Do(req)
+	data, _, err := c.doJSONForWithProxy(a, req)
+	return data, err
+}
+
+// doJSONForWithProxy 与 doJSONFor 相同，额外返回【实际使用】的出口代理
+// （空串 = 直连或代理不可达回落），供请求日志如实展示——与 chat 的
+// params.Proxy 同口径："报告的就是用的那个"。
+func (c *Client) doJSONForWithProxy(a *auth.Auth, req *http.Request) (json.RawMessage, string, error) {
+	cl, proxy := c.clientForWithProxy(a, false)
+	resp, err := cl.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, proxy, err
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+		return nil, proxy, &Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
 	}
 	var env apiEnvelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
+		return nil, proxy, fmt.Errorf("parse failed: %w (body: %s)", err, truncate(string(raw), 120))
 	}
 	if env.Code != 0 {
 		kind := Classify(resp.StatusCode, env.Msg)
 		if kind == ErrNone {
 			kind = ErrClient
 		}
-		return nil, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
+		return nil, proxy, &Error{Kind: kind, Status: resp.StatusCode, Msg: fmt.Sprintf("code=%d msg=%s", env.Code, truncate(env.Msg, 160))}
 	}
-	return env.Data, nil
+	return env.Data, proxy, nil
 }
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），

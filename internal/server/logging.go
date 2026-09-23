@@ -45,7 +45,7 @@ func chatOut() io.Writer {
 type chatStat struct {
 	start  time.Time
 	model  string
-	mode   string     // "stream" | "sync"
+	mode   string     // "stream" | "sync" | "image" | "imgedit"
 	acct   *auth.Auth // 完整账号（展示时取昵称前 7 字符，无昵称回落 UID 前 8 位）
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"

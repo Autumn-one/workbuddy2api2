@@ -47,7 +47,7 @@ func TestGenerateImageHunyuanBody(t *testing.T) {
 	rt := &captureRT{status: 200, respBody: `{"code":0,"data":{"data":[{"url":"https://img.example/a.png","revised_prompt":"rp"}]}}`}
 	c := imageClient(rt)
 	revise := true
-	items, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok", EnterpriseID: "ent"}, ImageRequest{
+	items, _, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok", EnterpriseID: "ent"}, ImageRequest{
 		Model: "hunyuan-image-alpha", Prompt: "a cat", Size: "1024x1024", N: 2,
 		Footnote: "fn", Revise: &revise,
 	})
@@ -88,7 +88,7 @@ func TestGenerateImageHunyuanBody(t *testing.T) {
 func TestGenerateImageNonHunyuanBody(t *testing.T) {
 	rt := &captureRT{status: 200, respBody: `{"code":0,"data":{"data":[{"b64_json":"QUJD"}]}}`}
 	c := imageClient(rt)
-	items, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{
+	items, _, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{
 		Model: "gpt-image-1", Prompt: "p", Size: "1024x1024", N: 1,
 		Quality: "high", Style: "vivid", Background: "transparent",
 	})
@@ -109,7 +109,7 @@ func TestGenerateImageNonHunyuanBody(t *testing.T) {
 func TestEditImageBody(t *testing.T) {
 	rt := &captureRT{status: 200, respBody: `{"code":0,"data":{"data":[{"url":"https://img.example/e.png"}]}}`}
 	c := imageClient(rt)
-	_, err := c.EditImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{
+	_, _, err := c.EditImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{
 		Model: "hunyuan-image-v2.0-general-edit", Prompt: "make it blue", Size: "1024x1024",
 		Images: []string{"data:image/png;base64,QUJD"}, InputFidelity: "high",
 	})
@@ -131,7 +131,7 @@ func TestEditImageBody(t *testing.T) {
 func TestImageAPIError(t *testing.T) {
 	rt := &captureRT{status: 429, respBody: `{"code":14003,"msg":"Hunyuan image queue is full for model [hunyuan-image-alpha]"}`}
 	c := imageClient(rt)
-	_, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{Model: "hunyuan-image-alpha", Prompt: "p", Size: "1024x1024"})
+	_, _, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok"}, ImageRequest{Model: "hunyuan-image-alpha", Prompt: "p", Size: "1024x1024"})
 	ue, ok := err.(*Error)
 	if !ok {
 		t.Fatalf("expected *Error, got %T: %v", err, err)
