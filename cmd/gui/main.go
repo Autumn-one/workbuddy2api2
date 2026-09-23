@@ -1691,11 +1691,18 @@ func (a *app) refreshAccounts() {
 	// 此时签名多半未变，updateItems 只重绘可见单元格、不会恢复行数，
 	// 不干预会永远空白。每个 tick 核对一次，不一致强制整表重建并留日志，
 	// 下次再出现"看不到账号"可直接在 gui.log 里查到证据。
+	//
+	// 注意必须发消息给真正的 SysListView32（tvNativeLV）：tv.Handle() 是
+	// walk 的容器窗口，对它发 LVM_* 只会经 DefWindowProc 返回 0——
+	// 那会让本检查每 tick 误判行数不符，反而制造"一直重建"的闪烁。
+	// 找不到 LV（控件尚在装配）时跳过本次核对，不误报。
 	if a.tvAccounts != nil {
-		lvRows := int(win.SendMessage(a.tvAccounts.Handle(), lvmGetItemCount, 0, 0))
-		if lvRows != len(items) {
-			log.Printf("账号表自愈：界面行数 %d ≠ 数据行数 %d，强制重建", lvRows, len(items))
-			a.lastSig = ""
+		if lv := tvNativeLV(a.tvAccounts); lv != 0 {
+			lvRows := int(win.SendMessage(lv, lvmGetItemCount, 0, 0))
+			if lvRows != len(items) {
+				log.Printf("账号表自愈：界面行数 %d ≠ 数据行数 %d，强制重建", lvRows, len(items))
+				a.lastSig = ""
+			}
 		}
 	}
 	if !a.acctSigChanged(a.tblSignature(items)) {
