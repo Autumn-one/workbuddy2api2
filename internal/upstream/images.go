@@ -5,7 +5,8 @@
 //   - POST {chatBase}/v2/images/edits       —— 图生图编辑
 //
 // 请求体按模型族分两套装配：
-//   - hunyuan-*：{model, prompt, size, n, footnote?, revise:{value}}（返回 url）
+//   - hunyuan-*：{model, prompt, size, n, footnote?, revise:{value}, ...extra}
+//     （footnote 即右下角水印文案，≤16 字符，对齐 TokenHub 混元生图契约；返回 url）
 //   - 其他模型：{model, prompt, size, n, response_format:"b64_json",
 //     quality?, style?, background?}
 //
@@ -36,8 +37,15 @@ type ImageRequest struct {
 	N      int    // <=0 按 1 处理
 
 	// hunyuan 族专属
-	Footnote string // 图片脚注文案（可选）
-	Revise   *bool  // 提示词自动润色开关；nil = 不传
+	// Footnote 右下角水印文案（上游契约 footnote，≤16 字符）。
+	// 指针三态：nil = 不发该字段（上游用默认水印）；"" = 显式空串（试探关闭水印，
+	// 上游是否接受空串为关未确认）；非空 = 自定义水印文案。
+	Footnote *string
+	Revise   *bool // 提示词自动润色开关；nil = 不传
+	// Extra 实验性上游字段透传（仅 hunyuan 族生效）：浅拷贝进请求体，
+	// 用于不改代码试 logo_add/watermark 等候选水印开关。
+	// 已占用键（model/prompt/size/n/footnote/revise/image/input_fidelity）跳过。
+	Extra map[string]any
 
 	// 非 hunyuan 族专属
 	Quality    string
@@ -87,11 +95,16 @@ func (c *Client) postImage(a *auth.Auth, path string, in ImageRequest, edit bool
 		"n":      n,
 	}
 	if strings.HasPrefix(in.Model, "hunyuan-") {
-		if in.Footnote != "" {
-			body["footnote"] = in.Footnote
+		if in.Footnote != nil {
+			body["footnote"] = *in.Footnote
 		}
 		if in.Revise != nil {
 			body["revise"] = map[string]any{"value": *in.Revise}
+		}
+		for k, v := range in.Extra {
+			if _, occupied := body[k]; !occupied {
+				body[k] = v
+			}
 		}
 	} else {
 		body["response_format"] = "b64_json"

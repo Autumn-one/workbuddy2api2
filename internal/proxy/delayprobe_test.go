@@ -115,7 +115,7 @@ func TestProbeDelaysConcurrentAllCovered(t *testing.T) {
 }
 
 // TestApplyDelaysAutoRebindsDeadNode 核心（用户要求）：绑在失败节点上的账号
-// 应被自动换到延迟最低的健康节点。
+// 应被自动换到【可达且负载最少】的节点——**不比较延迟**（只要可达，不计较快慢）。
 func TestApplyDelaysAutoRebindsDeadNode(t *testing.T) {
 	r := NewRegistry([]Listener{
 		{Name: "dead", Node: "死节点", Port: 40001, Region: RegionHK},
@@ -133,15 +133,16 @@ func TestApplyDelaysAutoRebindsDeadNode(t *testing.T) {
 
 	r.ApplyDelays(map[string]int{"死节点": 0, "快节点": 30, "慢节点": 200})
 
-	// 死节点上的账号被换走；目标是延迟最低的健康节点（快节点 30ms）
-	if got := r.NodeFor("u-dead"); got != "快节点" {
-		t.Errorf("u-dead 应被换到 快节点, got %q", got)
+	// 死节点上的账号被换走；目标是【负载最少】的可达节点（慢节点空着），
+	// 而不是 30ms 的快节点——延迟不参与选路（用户要求）。
+	if got := r.NodeFor("u-dead"); got != "慢节点" {
+		t.Errorf("u-dead 应被换到负载最少的 慢节点（不看延迟）, got %q", got)
 	}
 	// 健康节点上的账号不动（稳定优先）
 	if got := r.NodeFor("u-fast"); got != "快节点" {
 		t.Errorf("u-fast 不应被换, got %q", got)
 	}
-	if len(events) != 1 || events[0].UID != "u-dead" || events[0].ToNode != "快节点" {
+	if len(events) != 1 || events[0].UID != "u-dead" || events[0].ToNode != "慢节点" {
 		t.Errorf("换绑事件不符: %+v", events)
 	}
 }

@@ -104,6 +104,54 @@ func TestUsageTotalTextMissingHint(t *testing.T) {
 	}
 }
 
+// TestUsageDayOptionsMapping 日期下拉框的索引必须与聚合日期一一对应。
+//
+// 回归点（实测）：下拉框显示 2026-10-01，界面标签却给出 2026-09-30 的 78.63M——
+// 因为 a.usageDays 不含「全部日期」而下拉框含，索引换算少减 1，整列日期全部前移一天。
+func TestUsageDayOptionsMapping(t *testing.T) {
+	st := guiUsageTestStore(t)
+	opts := usageDayOptions(st.Rows())
+	want := []string{"全部日期", "2026-09-12", "2026-09-11"}
+	if len(opts) != len(want) {
+		t.Fatalf("下拉项=%v want %v", opts, want)
+	}
+	for i := range want {
+		if opts[i] != want[i] {
+			t.Fatalf("下拉项[%d]=%q want %q（最新在前）", i, opts[i], want[i])
+		}
+	}
+
+	// 0 号「全部日期」= 不筛日期
+	if got := usageDayAt(opts, 0); got != "" {
+		t.Errorf("「全部日期」应返回空串（不筛日期）, got %q", got)
+	}
+	// 不变式：下拉框显示哪一项，就聚合哪一天
+	for i := 1; i < len(opts); i++ {
+		if got := usageDayAt(opts, i); got != opts[i] {
+			t.Errorf("索引 %d 显示 %q 却聚合 %q", i, opts[i], got)
+		}
+	}
+	// 最新一天（下拉框第 2 项）
+	if got := usageDayAt(opts, 1); got != "2026-09-12" {
+		t.Errorf("选最新日应聚合 2026-09-12, got %q", got)
+	}
+	// 最早一天必须可达：老实现把它落进越界分支，退回「全部日期」
+	if got := usageDayAt(opts, len(opts)-1); got != "2026-09-11" {
+		t.Errorf("选最早日应聚合 2026-09-11, got %q", got)
+	}
+	// 越界安全
+	if got := usageDayAt(opts, len(opts)); got != "" {
+		t.Errorf("越界应返回空串, got %q", got)
+	}
+
+	// 端到端：映射结果喂给汇总文案，数字必须是那一天的
+	// （2026-09-12：输入 200+300+400=900，输出 20+30+40=90，总 token 990）
+	txt := usageTotalText(st, usageDayAt(opts, 1), usageViewDetail)
+	if !strings.Contains(txt, "2026-09-12") || !strings.Contains(txt, "总 token 990") {
+		t.Errorf("选最新日应显示当天汇总, got: %s", txt)
+	}
+}
+
 // TestUsageRowsFromModels 模型级汇总：按模型聚合，请求/token 正确。
 func TestUsageRowsFromModels(t *testing.T) {
 	st := guiUsageTestStore(t)

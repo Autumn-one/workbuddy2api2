@@ -127,6 +127,59 @@ func TestCoverAllNodes(t *testing.T) {
 	}
 }
 
+// TestParseUserListenersCommentLines 段内注释行不是段边界。
+//
+// 回归点（实测 2026-10-01，代理开启失败的根因之一）：本机 Clash 配置的 listeners
+// 段里带着兄弟项目注入的标记注释 `# >>> trae2api auto listeners >>>`，
+// 旧实现把这一行当成"下一个顶层段"→ 段解析提前结束 → 其后 33 条可用端口
+// 一条都没被识别 → 误判"用户没配 listeners" → 去改写 Clash（在服务模式下必被拒），
+// 开启代理因此失败。
+func TestParseUserListenersCommentLines(t *testing.T) {
+	cfg := strings.Join([]string{
+		"listeners:",
+		"- name: npm-task",
+		"  type: http",
+		"  listen: 127.0.0.1",
+		"  port: 17898",
+		"# >>> trae2api auto listeners >>>",
+		"- name: acct-01-HK",
+		"  type: mixed",
+		"  listen: 127.0.0.1",
+		"  port: 34567",
+		`  proxy: "🇭🇰 香港Y01"`,
+		"  udp: false",
+		"- name: acct-02-HK",
+		"  type: mixed",
+		"  listen: 127.0.0.1",
+		"  port: 34568",
+		`  proxy: "🇭🇰 香港Y02 | IEPL"`,
+		"  udp: false",
+		"# 用户随手写的注释",
+		"- name: acct-03-HK",
+		"  port: 34569",
+		`  proxy: "🇭🇰 香港Y03"`,
+		"rules:",
+		"- MATCH,DIRECT",
+	}, "\n")
+	got := ParseUserListeners(cfg)
+	want := []struct {
+		port int
+		node string
+	}{
+		{34567, "🇭🇰 香港Y01"},
+		{34568, "🇭🇰 香港Y02 | IEPL"},
+		{34569, "🇭🇰 香港Y03"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("应解析出 %d 条（注释行不得终止段）, got %d: %+v", len(want), len(got), got)
+	}
+	for i, w := range want {
+		if got[i].Port != w.port || got[i].Node != w.node {
+			t.Errorf("第 %d 条 = %d/%q, want %d/%q", i, got[i].Port, got[i].Node, w.port, w.node)
+		}
+	}
+}
+
 // TestParseUserListenersRealConfigShape 用本机真实配置的形状验证
 // （含混合缩进、CRLF、emoji 节点名、竖线与空格）。
 func TestParseUserListenersRealConfigShape(t *testing.T) {

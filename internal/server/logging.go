@@ -128,7 +128,8 @@ type chatStatsReader struct {
 	// 优先取标准字段，缺失时回落自有字段；只采信上游上报值，不做任何估算。
 	hasThink bool
 	thinkTok int
-	// hasCached/cachedTok 命中缓存的输入 token（cached_tokens / cache_read_input_tokens）。
+	// hasCached/cachedTok 命中缓存的输入 token（取值位置见 pickCached：
+	// 嵌套 prompt_tokens_details → DeepSeek 自有 → 顶层同名字段）。
 	// 单独统计的意义：ctx 很大时若大部分命中缓存，实际计费输入远小于 ctx——
 	// 这是"token 花在哪"里最容易被误读的一项，必须能看到。
 	hasCached bool
@@ -189,7 +190,13 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			Details *struct {
 				ReasoningTokens *int `json:"reasoning_tokens"`
 			} `json:"completion_tokens_details"`
-			// 命中缓存的输入 token：上游给两个同源字段，优先标准字段。
+			// 命中缓存的输入 token：上游把同一个量放在多个位置，取值优先级见 pickCached。
+			// 注意 prompt_tokens_details 与 completion_tokens_details 是两个不同的对象，
+			// 缓存读在【输入】侧。
+			PromptDetails *struct {
+				CachedTokens *int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+			CacheHitTokens  *int `json:"prompt_cache_hit_tokens"`
 			CachedTokens    *int `json:"cached_tokens"`
 			CacheReadTokens *int `json:"cache_read_input_tokens"`
 		} `json:"usage"`
@@ -211,14 +218,15 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasThink = true
 		s.thinkTok = *chunk.Usage.ThinkingTokens
 	}
-	// 缓存命中的输入：cached_tokens 优先，回落 cache_read_input_tokens（同源字段）。
-	if chunk.Usage.CachedTokens != nil {
-		s.hasCached = true
-		s.cachedTok = *chunk.Usage.CachedTokens
-	} else if chunk.Usage.CacheReadTokens != nil {
-		s.hasCached = true
-		s.cachedTok = *chunk.Usage.CacheReadTokens
+	// 缓存命中的输入：位置优先级与下游（pi-ai 的 parseChunkUsage）一致——
+	// OpenAI 标准嵌套位置 → DeepSeek 自有字段 → 顶层同名字段。
+	// 顶层那两个实测会被填 0（真值在别处），故由 pickCached 取第一个非零值。
+	var nestedCached *int
+	if d := chunk.Usage.PromptDetails; d != nil {
+		nestedCached = d.CachedTokens
 	}
+	s.cachedTok, s.hasCached = pickCached(nestedCached,
+		chunk.Usage.CacheHitTokens, chunk.Usage.CachedTokens, chunk.Usage.CacheReadTokens)
 }
 
 // CachedTokens 返回命中缓存的输入 token 数；缺失返回 -1。
@@ -268,20 +276,67 @@ func promptTokens(resp map[string]any) int {
 	return usageInt(resp, "prompt_tokens")
 }
 
+// pickCached 从各已知位置挑出"命中缓存的输入 token"。
+//
+// 背景（实测）：上游把同一个量放在不同位置——OpenAI 标准嵌套的
+// prompt_tokens_details.cached_tokens、DeepSeek 自有的 prompt_cache_hit_tokens、
+// 顶层的 cached_tokens / cache_read_input_tokens；而顶层那两个会被填成 0。
+// 旧实现只读顶层，于是日志 cache= 列恒为 0（2026-10-01 的 2802 行请求全为 0），
+// 而同一批请求在下游（pi-ai 按 嵌套 → DeepSeek 自有 → 顶层 的顺序取值）读到 1.17B。
+//
+// 规则：按调用方给的优先级取第一个非零值；全部存在但都是 0 → (0, true)
+// （冷上下文确实可能全未命中，0 是合法值）；一个都不存在 → (0, false) 缺失。
+func pickCached(values ...*int) (int, bool) {
+	present := false
+	for _, v := range values {
+		if v == nil {
+			continue
+		}
+		present = true
+		if *v != 0 {
+			return *v, true
+		}
+	}
+	return 0, present
+}
+
+// usageIntAt 按路径读响应里的整数字段，例如
+// ["usage", "prompt_tokens_details", "cached_tokens"]；
+// 路径上缺失或类型不符返回 nil——与"存在且为 0"区分开。
+func usageIntAt(resp map[string]any, path ...string) *int {
+	var cur any = resp
+	for _, key := range path {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return nil
+		}
+		v, ok := m[key]
+		if !ok {
+			return nil
+		}
+		cur = v
+	}
+	f, ok := cur.(float64)
+	if !ok {
+		return nil
+	}
+	n := int(f)
+	return &n
+}
+
 // cachedTokens 从 Aggregate 返回的响应中提取命中缓存的输入 token；缺失返回 -1。
-// 优先 cached_tokens，回落 cache_read_input_tokens（同源字段）。
+// 位置优先级与流式路径一致（见 pickCached）。
 func cachedTokens(resp map[string]any) int {
-	u, ok := resp["usage"].(map[string]any)
+	n, ok := pickCached(
+		usageIntAt(resp, "usage", "prompt_tokens_details", "cached_tokens"),
+		usageIntAt(resp, "usage", "prompt_cache_hit_tokens"),
+		usageIntAt(resp, "usage", "cached_tokens"),
+		usageIntAt(resp, "usage", "cache_read_input_tokens"),
+	)
 	if !ok {
 		return -1
 	}
-	if v, ok := u["cached_tokens"].(float64); ok {
-		return int(v)
-	}
-	if v, ok := u["cache_read_input_tokens"].(float64); ok {
-		return int(v)
-	}
-	return -1
+	return n
 }
 
 // thinkingTokens 从 Aggregate 返回的响应中提取思考（推理）token 数；缺失返回 -1。
@@ -305,15 +360,10 @@ func thinkingTokens(resp map[string]any) int {
 
 // usageInt 取 resp.usage.<key> 的整数值；缺失/类型不符返回 -1。
 func usageInt(resp map[string]any, key string) int {
-	u, ok := resp["usage"].(map[string]any)
-	if !ok {
-		return -1
+	if v := usageIntAt(resp, "usage", key); v != nil {
+		return *v
 	}
-	v, ok := u[key].(float64)
-	if !ok {
-		return -1
-	}
-	return int(v)
+	return -1
 }
 
 // logAccountName 生成日志/表格里的账号标识：昵称前 7 字符优先，无昵称回落 UID 前 8 位。

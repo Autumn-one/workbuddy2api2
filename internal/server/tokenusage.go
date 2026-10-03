@@ -36,7 +36,7 @@ type TokenDelta struct {
 	In     int // prompt_tokens（输入/上下文）
 	Out    int // completion_tokens（输出，按上游口径已含思考）
 	Think  int // reasoning_tokens / completion_thinking_tokens
-	Cached int // cached_tokens / cache_read_input_tokens（命中缓存的输入）
+	Cached int // 命中缓存的输入（取值位置见 logging.go 的 pickCached）
 }
 
 // TokenUsageRow 一行统计（明细或汇总）。

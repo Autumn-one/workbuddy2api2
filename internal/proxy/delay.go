@@ -89,16 +89,17 @@ func DelayHealthy(delays map[string]int, node string) bool {
 // 健康判定：延迟 > 0 → 健康；否则（0 = 失败/超时）→ 不健康。
 // 本函数是唯一有权判定"节点不可用"的入口（不再被 TCP 端口探测覆盖）。
 //
-// 自动换绑（用户要求）：绑在失败节点上的账号立即换到【延迟最低的健康节点】，
-// 换绑后通过回调通知（GUI 落盘 + 日志）。全部节点失败时不换（防抖动把账号
-// 从一个死节点换到另一个死节点）；账号本来就绑在健康节点上不动（稳定优先）。
+// 自动换绑（用户要求）：绑在失败节点上的账号立即换到【可达且负载最少】的节点
+// （**不比较延迟**——用户明确要求"只要可达，不计较快慢"），换绑后通过回调通知
+// （GUI 落盘 + 日志）。全部节点失败时不换（防抖动把账号从一个死节点换到另一个死节点）；
+// 账号本来就绑在健康节点上不动（稳定优先）。
 //
 // 注意：本函数只做"按本轮结果对齐健康状态"，不解决"节点恢复了要不要换回来"——
 // 那由下一轮探测自动完成（健康节点被重新标记健康，但已换走的账号【不换回】，
 // 出口 IP 稳定优先于"回到老节点"）。
 func (r *Registry) ApplyDelays(delays map[string]int) {
 	r.mu.Lock()
-	// 缓存延迟供"按延迟选节点"与界面展示
+	// 缓存延迟**仅供界面展示**（不参与任何自动选节点/换绑决策）
 	if r.delays == nil {
 		r.delays = map[string]int{}
 	}
@@ -117,7 +118,7 @@ func (r *Registry) ApplyDelays(delays map[string]int) {
 			}
 		}
 	}
-	// 自动换绑：把绑在失败节点上的账号挪到延迟最低的健康节点。
+	// 自动换绑：把绑在失败节点上的账号挪到可达的节点（按负载最少挑，不看延迟）。
 	// 全部失败时不换——没有可用目标，换也是白换（且会引发连锁重分配）。
 	var events []RebindEvent
 	if healthyCount > 0 {
@@ -192,99 +193,6 @@ func (r *Registry) NodeOptions() []NodeOption {
 	return out
 }
 
-// PickMode 自动选节点的排序策略。
-type PickMode int
-
-const (
-	// PickByRegion 地区优先（HK→TW→JP→其他），同地区内按端口序。
-	// 适用于"看重出口地区可信度"的场景（默认）。
-	PickByRegion PickMode = iota
-	// PickByDelay 延迟优先（哪个快用哪个），延迟相同再比地区。
-	// 适用于"看重速度"的场景。
-	PickByDelay
-)
-
-// PickBestNode 按地区优先挑最优节点（默认策略）。
-func (r *Registry) PickBestNode() (Listener, bool) {
-	return r.PickBestNodeBy(PickByRegion)
-}
-
-// PickBestNodeBy 按指定策略挑最优节点。健康是硬门槛（不可用的绝不选）；
-// 全部不可用时回落第一个并返回 ok=true —— 让调用方仍有候选可试，
-// 而不是直接失败（与选号器的"全冷却兜底"同思路）。
-func (r *Registry) PickBestNodeBy(mode PickMode) (Listener, bool) {
-	r.mu.RLock()
-	delays := r.delays
-	r.mu.RUnlock()
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	if len(r.listeners) == 0 {
-		return Listener{}, false
-	}
-	healthy := make([]Listener, 0, len(r.listeners))
-	for _, l := range r.listeners {
-		if _, bad := r.unhealthy[l.Port]; !bad {
-			healthy = append(healthy, l)
-		}
-	}
-	if len(healthy) == 0 {
-		return r.listeners[0], true // 全不可用：回落
-	}
-	if mode == PickByDelay {
-		best := healthy[0]
-		for _, l := range healthy[1:] {
-			bd, ld := delays[best.Node], delays[l.Node]
-			// 延迟 0 表示未探测/不可用；已健康的节点延迟应 >0，
-			// 但仍做防御：0 不参与比较（视为无穷大）。
-			if bd == 0 {
-				best = l
-				continue
-			}
-			if ld == 0 {
-				continue
-			}
-			if ld < bd {
-				best = l
-			}
-		}
-		return best, true
-	}
-	// 地区优先：先取最高优先地区，再在该地区内挑延迟最低的。
-	//
-	// 修正（实测缺陷）：原实现只取"排序后第一个健康节点"，等价于"地区+端口序"，
-	// 会在香港有 35ms 节点时选中同地区 60ms 的节点 —— 同地区内当然该挑最快的。
-	bestRegion := healthy[0].Region
-	for _, l := range healthy {
-		if l.Region < bestRegion {
-			bestRegion = l.Region
-		}
-	}
-	best, bestDelay := Listener{}, 1<<30
-	for _, l := range healthy {
-		if l.Region != bestRegion {
-			continue
-		}
-		d := delays[l.Node]
-		if d <= 0 {
-			continue // 未探测到延迟：不作为最优候选
-		}
-		if d < bestDelay {
-			best, bestDelay = l, d
-		}
-	}
-	if best.Port != 0 {
-		return best, true
-	}
-	// 该地区全部缺延迟数据：回落到排序后的第一个健康节点
-	for _, l := range healthy {
-		if l.Region == bestRegion {
-			return l, true
-		}
-	}
-	return healthy[0], true
-}
-
 // SetNodeForAccount 手动把账号绑定到指定节点。
 // 返回 false 表示节点不存在（此时不改动现有绑定，避免静默改错）。
 func (r *Registry) SetNodeForAccount(uid, node string) bool {
@@ -307,22 +215,25 @@ func (r *Registry) SetNodeForAccount(uid, node string) bool {
 	return true
 }
 
-// ClearNodeForAccount 解除账号的手动指定，交还自动分配：
-// 按当前策略重新挑一个节点（优先地区、可用为准），并返回新绑定。
+// ClearNodeForAccount 解除账号的手动指定，交还自动分配。
+//
+// 交还后按【可达 → 负载最少】重新分配（与首次分配同规则，**不看延迟**）。
+// 旧实现是"地区优先挑第一个健康节点"，会让所有交还的账号再次挤到同一个节点上
+// ——集中正是这个功能要避免的（实测 28/30 个账号挤在一个节点）。
 //
 // 用途：用户手动指定后想"交还自动管理"时使用。
 func (r *Registry) ClearNodeForAccount(uid string) (Listener, bool) {
 	if uid == "" {
 		return Listener{}, false
 	}
-	l, ok := r.PickBestNode()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	best, ok := r.pickLeastLoadedLocked(r.loadLocked(), 0)
 	if !ok {
-		return Listener{}, false
+		return Listener{}, false // 没有任何可达节点：不改动现有绑定
 	}
-	if !r.SetNodeForAccount(uid, l.Node) {
-		return Listener{}, false
-	}
-	return l, true
+	r.byUID[uid] = best
+	return r.listeners[best], true
 }
 
 // AccountOfNode 返回绑定了指定节点的账号数（界面显示"该节点服务几个账号"）。

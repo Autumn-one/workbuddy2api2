@@ -56,6 +56,14 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// ImageFootnote 生图（hunyuan 族）右下角水印控制：
+		// 上游 footnote 即水印文案字段（≤16 字符）。三态：
+		//   缺键 → 不发 footnote（上游加默认水印，现状）；
+		//   false → 生图默认发 footnote:""（试探上游以空串关水印，未确认生效）；
+		//   true  → 生图默认发 image_footnote_text（空 text 与 false 等效）。
+		// 客户端请求显式传 footnote 时优先于本默认。
+		ImageFootnote     *bool  `json:"image_footnote"`
+		ImageFootnoteText string `json:"image_footnote_text"`
 	} `json:"features"`
 
 	Upstash struct {
@@ -208,6 +216,14 @@ func applyEnv(c *Config) {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
 	}
+	if v := os.Getenv("WB2A_IMAGE_FOOTNOTE"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Features.ImageFootnote = &b
+		}
+	}
+	if v := os.Getenv("WB2A_IMAGE_FOOTNOTE_TEXT"); v != "" {
+		c.Features.ImageFootnoteText = v
+	}
 }
 
 func (c *Config) normalize() error {
@@ -308,4 +324,19 @@ func (c *Config) ProxyAuto() bool {
 		return *c.Proxy.Auto
 	}
 	return true
+}
+
+// ImageFootnoteDefault 返回生图默认 footnote 注入值。
+// nil = 不注入（features.image_footnote 缺键）；非 nil 为待发送的水印文案：
+// false → ""（显式空串，试探关水印）；true → image_footnote_text。
+func (c *Config) ImageFootnoteDefault() *string {
+	if c == nil || c.Features.ImageFootnote == nil {
+		return nil
+	}
+	if !*c.Features.ImageFootnote {
+		s := ""
+		return &s
+	}
+	s := c.Features.ImageFootnoteText
+	return &s
 }

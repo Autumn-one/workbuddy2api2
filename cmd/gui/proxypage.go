@@ -258,7 +258,7 @@ func (a *app) doSelectNodeForAccount() {
 	log.Printf("代理：手动指定 %s 的节点 %s → %s", a.displayName(row.UID), orDash(before), node)
 }
 
-// doAutoAssignSelected 把选中账号交还自动分配（按地区优先+可用挑节点）。
+// doAutoAssignSelected 把选中账号交还自动分配（按"可达 + 负载最少"挑节点，不看延迟）。
 func (a *app) doAutoAssignSelected() {
 	if a.proxyReg == nil {
 		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
@@ -284,6 +284,31 @@ func (a *app) doAutoAssignSelected() {
 	a.lblProxyHint.SetText(fmt.Sprintf("%s：%s → %s（已交还自动分配）",
 		a.displayName(row.UID), orDash(before), l.Node))
 	log.Printf("代理：%s 交还自动分配 %s → %s", a.displayName(row.UID), orDash(before), l.Node)
+}
+
+// doRespreadProxy 把挤在同一个出口节点上的账号重新分散（显式动作）。
+//
+// 为什么是显式动作而不是每次启动自动做：出口 IP 变动本身是上游眼里的异常特征
+// （用户要求"同一账号稳定走同一节点"），所以只在用户点它时才动手。
+// 实测场景（2026-10-01）：28/30 个账号挤在同一个节点——那是旧换绑算法
+// （按延迟最低挑目标）造成的，算法已修（改按负载最少），本按钮用来收拾既成事实。
+func (a *app) doRespreadProxy() {
+	if a.proxyReg == nil {
+		a.lblProxyHint.SetText("代理未启用：请先点「开启代理」")
+		return
+	}
+	moved := a.proxyReg.Respread()
+	if moved > 0 {
+		a.proxyReg.SaveBindings(a.proxyBindingsPath)
+	}
+	a.refreshProxyBindings()
+	busy, total := a.proxyReg.Concentration()
+	if moved == 0 {
+		a.lblProxyHint.SetText(fmt.Sprintf("出口没有过度集中（最忙节点 %d/%d 个账号），无需分散", busy, total))
+		return
+	}
+	a.lblProxyHint.SetText(fmt.Sprintf("已重新分散 %d 个账号；最忙节点现在 %d/%d 个账号", moved, busy, total))
+	log.Printf("代理：重新分散出口，移动 %d 个账号（最忙节点 %d/%d）", moved, busy, total)
 }
 
 // syncNodePickOptions 刷新"可选节点"下拉框（含健康状态与延迟）。
@@ -499,6 +524,19 @@ func (a *app) enableProxyNow() (string, error) {
 		if reg.Healthy(l.Port) {
 			ok++
 		}
+	}
+
+	// 出口过度集中：自动分散 + 如实提示。
+	//
+	// 实测 2026-10-02：绑定是持久化的，重启会【原样继承】历史集中状态（28/30 挤在一个
+	// 节点），用户看到的就是"重启完还是只连一个节点"——所以这里直接动手摊开
+	// （≥3 才算扎堆；只共用两个可能是用户手动指定，不动）。
+	if moved, maxShare, total := reg.AutoRespread(3); moved > 0 {
+		applyNote += fmt.Sprintf("；出口过度集中（最忙节点 %d/%d 个账号），已自动重新分散 %d 个账号", maxShare, total, moved)
+		log.Printf("代理：出口过度集中（%d/%d 个账号在同一个节点），已自动重新分散 %d 个账号", maxShare, total, moved)
+	} else if maxShare >= 3 {
+		applyNote += fmt.Sprintf("；注意 %d/%d 个账号共用同一个出口节点（没有空闲节点可摊开），可点「重新分散出口」重试", maxShare, total)
+		log.Printf("代理：出口集中度偏高（%d/%d 个账号在同一个节点），但暂无空闲节点可摊开", maxShare, total)
 	}
 
 	// 注入到 upstream（运行期生效，旧请求不受影响）

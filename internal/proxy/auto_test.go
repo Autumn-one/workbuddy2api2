@@ -1,6 +1,9 @@
 package proxy
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -156,5 +159,89 @@ func TestGenerateReloadPayload(t *testing.T) {
 	p := ReloadPayload("C:/x/clash-verge.yaml")
 	if p["path"] != "C:/x/clash-verge.yaml" {
 		t.Errorf("payload 应含 path: %v", p)
+	}
+}
+
+// TestReloadPayloadContent 内容重载的 payload：只带 payload，不带 path
+// （带 path 会触发内核的 SAFE_PATHS 检查，正是服务模式下被 400 拒的原因）。
+func TestReloadPayloadContent(t *testing.T) {
+	p := ReloadPayloadContent("mode: rule\n")
+	if p["payload"] != "mode: rule\n" {
+		t.Errorf("应含 payload 字段: %v", p)
+	}
+	if _, ok := p["path"]; ok {
+		t.Errorf("内容重载不应带 path: %v", p)
+	}
+}
+
+// TestApplyListenersReloadFallbackPayload 按路径重载被拒时必须回退到"按内容重载"。
+//
+// 回归点（实测 2026-10-01）：Clash Verge 服务模式的内核只允许重载自身 runtime 目录里的
+// 路径（AppData 里的 clash-verge.yaml 被 400 "path is not subpath ... SAFE_PATHS" 拒绝），
+// 旧实现直接判定失败并回滚 → 「开启代理」永远失败。
+func TestApplyListenersReloadFallbackPayload(t *testing.T) {
+	var pathAttempts, payloadAttempts int
+	var gotPayload string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if p, _ := body["payload"].(string); p != "" {
+			payloadAttempts++
+			gotPayload = p
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		pathAttempts++
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"path is not subpath of home directory or SAFE_PATHS"}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "clash-verge.yaml")
+	orig := "mixed-port: 10808\nproxies:\n- name: n1\n  type: socks5\nrules:\n- MATCH,DIRECT\n"
+	if err := os.WriteFile(cfg, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ApplyListeners(srv.URL, "", dir, []Listener{{Name: "acct-01-HK", Port: 34567, Node: "香港Y01"}})
+	if err != nil {
+		t.Fatalf("应回退到内容重载并成功, got err=%v", err)
+	}
+	if got != cfg {
+		t.Errorf("返回路径=%s want %s", got, cfg)
+	}
+	if pathAttempts != 1 || payloadAttempts != 1 {
+		t.Errorf("应各尝试一次（path=%d payload=%d）", pathAttempts, payloadAttempts)
+	}
+	raw, _ := os.ReadFile(cfg)
+	if !strings.Contains(string(raw), autoBlockBegin) {
+		t.Errorf("内容重载成功后注入块应保留在配置里:\n%s", raw)
+	}
+	if !strings.Contains(gotPayload, autoBlockBegin) || !strings.Contains(gotPayload, "port: 34567") {
+		t.Errorf("重载内容应含注入后的完整配置（%d 字节）", len(gotPayload))
+	}
+}
+
+// TestApplyListenersReloadBothFailRollsBack 路径与内容都被拒 → 回滚配置并报错
+// （磁盘不得留下与运行态不一致的半成品）。
+func TestApplyListenersReloadBothFailRollsBack(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"message":"nope"}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "clash-verge.yaml")
+	orig := "mixed-port: 10808\nproxies:\n"
+	if err := os.WriteFile(cfg, []byte(orig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ApplyListeners(srv.URL, "", dir, []Listener{{Name: "a", Port: 34567, Node: "香港Y01"}}); err == nil {
+		t.Fatal("两种重载都失败时应报错")
+	}
+	raw, _ := os.ReadFile(cfg)
+	if string(raw) != orig {
+		t.Errorf("失败应回滚原配置, got:\n%s", raw)
 	}
 }

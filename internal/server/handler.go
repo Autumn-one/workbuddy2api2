@@ -34,6 +34,9 @@ type Config struct {
 	// UsageStore token 用量统计（账号×模型×日期）；nil = 不统计。
 	// 仅观测，不参与任何决策。
 	UsageStore *TokenUsageStore
+	// ImageFootnoteDefault 生图默认 footnote（右下角水印文案）；nil = 不注入，
+	// 客户端显式传的 footnote（含空串）优先于本默认值。
+	ImageFootnoteDefault *string
 }
 
 // Handler 主路由。

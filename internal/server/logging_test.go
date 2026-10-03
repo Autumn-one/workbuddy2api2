@@ -511,3 +511,127 @@ func TestChatLogsSyncRowIncludesPromptAndThinkingTokens(t *testing.T) {
 		}
 	}
 }
+
+// TestPickCached 缓存读取 token 的取值规则：按优先级取第一个非零值。
+//
+// 回归点（实测）：上游把真值放在嵌套 prompt_tokens_details.cached_tokens，
+// 顶层同名字段被填 0；旧实现只读顶层，于是 2026-10-01 的 2802 行请求日志
+// cache= 全为 0，而同一批请求在下游（pi-ai 同样的取值顺序）读到 1.17B。
+func TestPickCached(t *testing.T) {
+	ptr := func(v int) *int { return &v }
+	cases := []struct {
+		name        string
+		values      []*int
+		want        int
+		wantPresent bool
+	}{
+		{"嵌套真值 + 顶层影子 0", []*int{ptr(313344), nil, ptr(0), ptr(0)}, 313344, true},
+		{"DeepSeek 自有字段", []*int{nil, ptr(1280), nil, nil}, 1280, true},
+		{"顶层同名字段（保持旧口径）", []*int{nil, nil, ptr(800), ptr(800)}, 800, true},
+		{"全 0 是合法值而非缺失", []*int{ptr(0), nil, ptr(0), nil}, 0, true},
+		{"一个都不存在 = 缺失", []*int{nil, nil, nil, nil}, 0, false},
+		{"高优先级的 0 不遮蔽低优先级真值", []*int{ptr(0), ptr(42)}, 42, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, present := pickCached(c.values...)
+			if got != c.want || present != c.wantPresent {
+				t.Errorf("pickCached()=(%d,%v) want (%d,%v)", got, present, c.want, c.wantPresent)
+			}
+		})
+	}
+}
+
+// TestChatStatsReaderCachedTokens 流式末帧的缓存读取 token：
+// 真值可能只在嵌套位置或 DeepSeek 自有字段，不能只认顶层。
+func TestChatStatsReaderCachedTokens(t *testing.T) {
+	cases := []struct {
+		name string
+		sse  string
+		want int
+	}{
+		{
+			name: "OpenAI 标准嵌套位置（顶层是 0 影子字段）",
+			sse: "data: {\"usage\":{\"prompt_tokens\":313986,\"completion_tokens\":263," +
+				"\"cached_tokens\":0,\"prompt_tokens_details\":{\"cached_tokens\":313344}}}\n\ndata: [DONE]\n\n",
+			want: 313344,
+		},
+		{
+			name: "DeepSeek 自有字段 prompt_cache_hit_tokens",
+			sse:  "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_cache_hit_tokens\":64}}\n\ndata: [DONE]\n\n",
+			want: 64,
+		},
+		{
+			name: "顶层 cache_read_input_tokens（无嵌套时）",
+			sse:  "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cache_read_input_tokens\":32}}\n\ndata: [DONE]\n\n",
+			want: 32,
+		},
+		{
+			name: "全 0 保留 0，不误报缺失",
+			sse:  "data: {\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"cached_tokens\":0}}\n\ndata: [DONE]\n\n",
+			want: 0,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := newChatStatsReaderSince(strings.NewReader(c.sse), time.Now())
+			_, _ = io.Copy(io.Discard, r)
+			if got := r.CachedTokens(); got != c.want {
+				t.Errorf("CachedTokens()=%d want %d", got, c.want)
+			}
+		})
+	}
+	// 完全无缓存字段 → -1（缺失），与"存在且为 0"区分
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	if got := r.CachedTokens(); got != -1 {
+		t.Errorf("无缓存字段时 CachedTokens()=%d want -1", got)
+	}
+}
+
+// TestCachedTokensExtraction 非流式（Aggregate）路径的口径必须与流式一致。
+func TestCachedTokensExtraction(t *testing.T) {
+	cases := []struct {
+		name string
+		resp map[string]any
+		want int
+	}{
+		{
+			name: "嵌套真值 + 顶层影子 0",
+			resp: map[string]any{"usage": map[string]any{
+				"prompt_tokens": 313986.0, "completion_tokens": 263.0,
+				"cached_tokens":         0.0,
+				"prompt_tokens_details": map[string]any{"cached_tokens": 313344.0},
+			}},
+			want: 313344,
+		},
+		{
+			name: "DeepSeek 自有字段",
+			resp: map[string]any{"usage": map[string]any{"prompt_cache_hit_tokens": 64.0}},
+			want: 64,
+		},
+		{
+			name: "顶层 cache_read_input_tokens",
+			resp: map[string]any{"usage": map[string]any{"cache_read_input_tokens": 32.0}},
+			want: 32,
+		},
+		{
+			name: "存在但为 0 → 0（不是缺失）",
+			resp: map[string]any{"usage": map[string]any{"cached_tokens": 0.0}},
+			want: 0,
+		},
+		{
+			name: "无缓存字段 → -1",
+			resp: map[string]any{"usage": map[string]any{"prompt_tokens": 10.0}},
+			want: -1,
+		},
+		{name: "无 usage → -1", resp: map[string]any{}, want: -1},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := cachedTokens(c.resp); got != c.want {
+				t.Errorf("cachedTokens()=%d want %d", got, c.want)
+			}
+		})
+	}
+}

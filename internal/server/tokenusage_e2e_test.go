@@ -93,3 +93,56 @@ func TestUsageRecordedOnFailure(t *testing.T) {
 		t.Errorf("Missing=%d want 1（缺 usage 计数）", r.Missing)
 	}
 }
+
+// usage 里缓存真值只在嵌套位置、顶层同名字段是 0 影子字段——实测上游形态（见 pickCached）。
+const sseWithNestedCache = "data: {\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n" +
+	"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]," +
+	"\"usage\":{\"prompt_tokens\":313986,\"completion_tokens\":263,\"cached_tokens\":0," +
+	"\"prompt_tokens_details\":{\"cached_tokens\":313344}}}\n\ndata: [DONE]\n\n"
+
+// TestUsageRecordedNestedCacheEndToEnd 嵌套位置的缓存真值必须一路进到请求日志与用量统计。
+//
+// 回归：旧实现只读顶层 cached_tokens，读到影子 0 → 请求日志 cache= 列与
+// 用量页「缓存输入」恒为 0，缓存复用率这一项完全失明。
+// 流式与非流式两条出口都要覆盖——两者解析路径不同（SSE 末帧 struct / Aggregate map）。
+func TestUsageRecordedNestedCacheEndToEnd(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		mode string
+	}{
+		{"流式（SSE 末帧）", `{"model":"deepseek-v4.1-flash","stream":true,"messages":[]}`, "| stream |"},
+		{"非流式（Aggregate）", `{"model":"deepseek-v4.1-flash","messages":[]}`, "| sync |"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			withChatLog(t)
+			up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseWithNestedCache, true })
+			store := NewTokenUsageStore("")
+			defer store.Close()
+			h := NewHandler(Config{
+				Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+				Upstream:   up,
+				UsageStore: store,
+			})
+			out := captureStdout(t, func() {
+				rec := httptestPost(h, c.body)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("code=%d", rec.Code)
+				}
+			})
+			for _, want := range []string{c.mode, "cache=313344", "ctx=313986", "tok=263"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("请求行缺少 %q:\n%s", want, out)
+				}
+			}
+			rows := store.Rows()
+			if len(rows) != 1 {
+				t.Fatalf("应记录 1 行, got %d", len(rows))
+			}
+			if r := rows[0]; r.Cached != 313344 || r.In != 313986 || r.Out != 263 {
+				t.Errorf("用量记录错误: %+v", r)
+			}
+		})
+	}
+}

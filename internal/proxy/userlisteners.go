@@ -61,6 +61,13 @@ func ParseUserListeners(configText string) []UserListener {
 		if skipping {
 			continue
 		}
+		// 注释行不是段边界。实测（2026-10-01）：本机 listeners 段里带着兄弟项目
+		// 注入的标记注释 `# >>> trae2api auto listeners >>>`，旧实现把这一行当成
+		// "下一个顶层段"→ 段解析提前结束 → 其后 33 条可用端口一条都没识别到 →
+		// 误判"用户没配 listeners" → 去改写 Clash（服务模式下必被拒）→ 开启代理失败。
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
 		indented := strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t")
 		isItem := strings.HasPrefix(trimmed, "- ") || trimmed == "-"
 

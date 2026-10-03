@@ -110,7 +110,8 @@ type Registry struct {
 	removed   map[string]bool
 	unhealthy map[int]time.Time // 端口 → 标记不健康的时间
 	// delays 最近一次延迟探测结果（节点名 → 毫秒；0/缺失 = 不可用）。
-	// 仅用于"按延迟自动选节点"与界面展示，不参与健康判定（健康看 unhealthy）。
+	// **仅供界面展示**：不参与自动选节点/换绑（用户要求：只要可达，不计较快慢），
+	// 健康判定看 unhealthy（由延迟探测>0 与否喂入，见 ApplyDelays）。
 	delays map[string]int
 	// onAutoRebind 节点失败自动换绑后的回调（GUI 落盘 proxy-bindings.json + 日志）。
 	onAutoRebind RebindFunc
@@ -227,23 +228,45 @@ func (r *Registry) assignLocked(uid string) (Listener, bool) {
 	if idx, ok := r.byUID[uid]; ok && idx < len(r.listeners) {
 		return r.listeners[idx], true
 	}
-	// 选负载最少的健康节点；同负载取地区靠前（listeners 已按优先级排序）。
+	// 选负载最少的健康节点（同负载取延迟最低），见 pickLeastLoadedLocked。
 	load := r.loadLocked()
-	best, bestLoad := -1, 1<<30
-	for i, l := range r.listeners {
-		if _, bad := r.unhealthy[l.Port]; bad {
-			continue
-		}
-		if load[l.Port] < bestLoad {
-			best, bestLoad = i, load[l.Port]
-		}
-	}
-	if best < 0 {
+	best, ok := r.pickLeastLoadedLocked(load, 0)
+	if !ok {
 		// 全部不健康：回落第一个（宁可走一个可能不通的出口，也不放弃代理）
 		best = 0
 	}
 	r.byUID[uid] = best
 	return r.listeners[best], true
+}
+
+// pickLeastLoadedLocked 选一个**可达**的 listener：负载最少 → 同负载按下标靠前
+// （listeners 已按地区优先级/原名稳定排序，因此等价于"地区靠前"，结果可复现）。
+//
+// **完全不看延迟**（用户要求 2026-10-02：只要可达，不计较快慢）。延迟只用于界面展示，
+// 不参与任何自动选节点/换绑决策。
+//
+// excludePort > 0 时跳过该端口（换绑/重新分散时"不选自己"）。
+// 没有任何健康候选时返回 ok=false，由调用方决定回落策略。
+//
+// 为什么是"负载优先"（2026-10-02 修正）：换绑曾按【延迟最低】挑目标，一次批量节点
+// 失效（实测 09-21 16:24、09-27 00:42）会把几十个账号同时换到同一个最快节点上；
+// 而绑定又是"稳定优先、永不回迁"，于是集中状态被永久固化——出口 IP 反而比失效前
+// 更集中（实测 28/30 个账号挤在一个节点），正好违背"一账号一出口 IP"这个功能存在的理由。
+// 负载优先则天然把账号摊开。
+func (r *Registry) pickLeastLoadedLocked(load map[int]int, excludePort int) (int, bool) {
+	best, bestLoad := -1, 1<<30
+	for i, l := range r.listeners {
+		if l.Port == excludePort {
+			continue
+		}
+		if _, bad := r.unhealthy[l.Port]; bad {
+			continue
+		}
+		if ld := load[l.Port]; ld < bestLoad {
+			best, bestLoad = i, ld
+		}
+	}
+	return best, best >= 0
 }
 
 // loadLocked 统计每个端口当前服务的账号数。调用方需已持锁。
@@ -259,9 +282,9 @@ func (r *Registry) loadLocked() map[int]int {
 
 // Rebind 强制账号换一个节点（当前节点不通时用）。返回新的绑定。
 //
-// 换绑目标按【延迟最低 + 负载最少】挑：既然要主动换，就换到当前最快的健康节点
-// （此前只按负载，可能换到一个低负载但慢/地区差的节点）。
-// 延迟缺失的节点（未探测）不参与"最快"竞争，防止换到一个还没验证过的节点。
+// 换绑目标与首次分配同一规则：**可达 → 负载最少 → 按下标（地区）靠前**，
+// **不比较延迟**（用户要求：只要可达就行）。曾经按"延迟最低"优先，会在批量失效时
+// 把所有账号挤到同一个最快节点上——那是出口 IP 集中化的直接成因（2026-10-02 修正）。
 func (r *Registry) Rebind(uid string) (Listener, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -275,35 +298,102 @@ func (r *Registry) rebindLocked(uid string) (Listener, bool) {
 	}
 	cur, hadCur := r.byUID[uid]
 	load := r.loadLocked()
-	curPort := -1
+	curPort := 0 // 0 = 不排除任何端口（真实端口都 > 0）
 	if hadCur && cur < len(r.listeners) {
 		curPort = r.listeners[cur].Port
 		load[curPort]-- // 排除自己，避免"自己占着位置"影响选择
 	}
-	best, bestLoad := -1, 1<<30
-	bestDelay := 1 << 30
-	for i, l := range r.listeners {
-		if l.Port == curPort {
-			continue // 换就是要换掉当前这个
-		}
-		if _, bad := r.unhealthy[l.Port]; bad {
-			continue
-		}
-		// 延迟优先，负载兜底：换绑的意图是"换到能用的最快的节点"。
-		// 延迟 0（未探测/失败）不参与最快竞争，但它仍是健康节点，作负载候选。
-		d := r.delays[l.Node]
-		if d <= 0 {
-			d = 1 << 29 // 未探测节点排在有实测延迟的后面、但仍在候选内
-		}
-		if d < bestDelay || (d == bestDelay && load[l.Port] < bestLoad) {
-			best, bestDelay, bestLoad = i, d, load[l.Port]
-		}
-	}
-	if best < 0 {
+	best, ok := r.pickLeastLoadedLocked(load, curPort)
+	if !ok {
 		return Listener{}, false // 没有别的健康节点可换
 	}
 	r.byUID[uid] = best
 	return r.listeners[best], true
+}
+
+// Respread 把"多个账号挤在同一个出口节点"的情况重新分散开。
+//
+// 为什么需要（实测 2026-10-01）：换绑曾按"延迟最低"挑目标，一次批量节点失效就把
+// 28/30 个账号同时换到同一个最快节点上；而绑定又是"稳定优先、永不回迁"，于是集中
+// 状态被永久保留——用户发现"代理怎么都用的一个"。
+//
+// 规则：每个节点保留一个账号（按 UID 排序的第一个），其余账号按"负载最少"重新分配；
+// 本来就分散的账号不动；所有节点同样拥挤时不硬挪（换过去也不会更分散）。
+// 返回被移动的账号数。
+//
+// 这是**显式动作**（界面按钮触发）：出口 IP 变动本身是上游眼里的异常特征，
+// 不该在每次启动时悄悄改。算法侧的修复保证它不会再次集中。
+func (r *Registry) Respread() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.listeners) == 0 {
+		return 0
+	}
+	uids := make([]string, 0, len(r.byUID))
+	for uid := range r.byUID {
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids) // 固定顺序：同一状态多次调用结果一致（可离线断言）
+	load := r.loadLocked()
+	moved := 0
+	for _, uid := range uids {
+		idx, ok := r.byUID[uid]
+		if !ok || idx < 0 || idx >= len(r.listeners) {
+			continue
+		}
+		port := r.listeners[idx].Port
+		if load[port] <= 1 {
+			continue // 这个出口只有它自己，保持不动（稳定优先）
+		}
+		best, ok := r.pickLeastLoadedLocked(load, port)
+		if !ok {
+			break // 没有其它健康出口可用，继续也没意义
+		}
+		if load[r.listeners[best].Port] >= load[port] {
+			continue // 换过去不会更分散
+		}
+		load[port]--
+		load[r.listeners[best].Port]++
+		r.byUID[uid] = best
+		moved++
+	}
+	return moved
+}
+
+// AutoRespread 启动/开启代理时的"自动分散"：出口过度集中（最忙节点服务 ≥ minShare
+// 个账号）时自动摊开；其余情况一律不动。
+//
+// 为什么要自动（实测 2026-10-02）：绑定是持久化的，历史遗留的集中状态（28/30 个账号
+// 挤在同一个节点）会在每次重启后被【原样继承】——用户重启后看到的还是"只连一个节点"，
+// 必须自己点按钮才会摊开。既然集中本身就是这个功能要消灭的状态，就该自动收拾。
+//
+// 为什么要有阈值：用户可能手动把两个账号指到同一节点（那是有意的），
+// 只有明显扎堆（默认 ≥3 个）才值得动手——阈值内的共用不动。
+//
+// 返回被移动的账号数，以及动手前的集中度（maxShare/total）。
+func (r *Registry) AutoRespread(minShare int) (moved, maxShare, total int) {
+	if minShare < 2 {
+		minShare = 2
+	}
+	maxShare, total = r.Concentration()
+	if total == 0 || maxShare < minShare {
+		return 0, maxShare, total
+	}
+	return r.Respread(), maxShare, total
+}
+
+// Concentration 报告当前出口集中度：最忙节点上的账号数与绑定总数。
+// 供界面在"过度集中"时明确提示（实测曾 28/30 挤在同一个节点，用户只能靠肉眼发现）。
+func (r *Registry) Concentration() (maxShare, total int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, n := range r.loadLocked() {
+		if n > maxShare {
+			maxShare = n
+		}
+		total += n
+	}
+	return maxShare, total
 }
 
 // Unassign 解除账号绑定（账号删除时调用，释放节点占用）。

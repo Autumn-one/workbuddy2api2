@@ -142,6 +142,21 @@ func ReloadPayload(configPath string) map[string]any {
 	return map[string]any{"path": configPath}
 }
 
+// ReloadPayloadContent 构造"按配置内容重载"的 payload（不经过文件路径检查）。
+//
+// 为什么需要：Clash Verge 的【服务模式】（clash_verge_service 拉起 verge-mihomo）下，
+// 内核只接受它自己 runtime 目录里的路径——
+//
+//	400 {"message":"path is not subpath of home directory or SAFE_PATHS: <AppData>\clash-verge.yaml
+//	     allowed paths: [C:\ProgramData\clash-verge-service\users\<hash>\runtime]"}
+//
+// 而那个 runtime 目录对普通进程是拒绝访问的（实测 Get-ChildItem/Test-Path 均被拒），
+// 所以按路径重载在服务模式下永远失败。内容重载不带 path，是这种形态下唯一还能让
+// listeners 立即生效的办法。
+func ReloadPayloadContent(configText string) map[string]any {
+	return map[string]any{"payload": configText}
+}
+
 // ApplyListeners 一站式自动化：注入 listeners → 写回配置 → 重载生效。
 //
 // 返回写入的配置路径。任一步失败都返回错误（不留下半成品：写回前先备份到内存，
@@ -171,11 +186,20 @@ func ApplyListeners(apiBase, secret, dataDir string, ls []Listener) (string, err
 		_ = os.Remove(tmp)
 		return "", fmt.Errorf("替换配置失败: %w", err)
 	}
-	// 重载；失败则回滚配置内容（避免磁盘与运行态不一致）
+	// 重载：先按路径（非服务模式的常规形式）；被拒则改用配置内容重试
+	// （Clash Verge 服务模式下内核只认自己的 runtime 目录，按路径必被拒——见
+	// ReloadPayloadContent 注释）。两条都不通才回滚，避免磁盘与运行态不一致。
 	code, body := RawConfigsPut(apiBase, secret, ReloadPayload(cfgPath))
 	if code != 200 && code != 204 {
+		pcode, pbody := RawConfigsPut(apiBase, secret, ReloadPayloadContent(injected))
+		if pcode == 200 || pcode == 204 {
+			return cfgPath, nil
+		}
 		_ = os.WriteFile(cfgPath, orig, 0o600)
-		return "", fmt.Errorf("Clash 重载失败（%d %s），已回滚配置", code, body)
+		return "", fmt.Errorf("Clash 重载失败（按路径 %d %s；按内容 %d %s），已回滚配置。"+
+			"若 Clash Verge 开了「服务模式」，其内核只接受自身 runtime 目录内的路径，"+
+			"可把 listeners 配到 Verge 的 Merge 覆写文件里（订阅更新也不会丢）",
+			code, body, pcode, pbody)
 	}
 	return cfgPath, nil
 }

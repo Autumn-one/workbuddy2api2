@@ -27,18 +27,22 @@ const (
 
 // imageGenRequest 客户端请求体：OpenAI images 标准字段 + 上游扩展字段透传。
 type imageGenRequest struct {
-	Prompt         string          `json:"prompt"`
-	Model          string          `json:"model"`
-	N              int             `json:"n"`
-	Size           string          `json:"size"`
-	Quality        string          `json:"quality"`
-	Style          string          `json:"style"`
-	Background     string          `json:"background"`
-	ResponseFormat string          `json:"response_format"`
-	User           string          `json:"user"`
+	Prompt         string `json:"prompt"`
+	Model          string `json:"model"`
+	N              int    `json:"n"`
+	Size           string `json:"size"`
+	Quality        string `json:"quality"`
+	Style          string `json:"style"`
+	Background     string `json:"background"`
+	ResponseFormat string `json:"response_format"`
+	User           string `json:"user"`
 	// 上游扩展（hunyuan 族）
-	Footnote string `json:"footnote"`
-	Revise   *bool  `json:"revise"`
+	// Footnote 指针三态：缺键 = 不发（上游默认水印）；"" = 显式空串（试探关水印）；
+	// 非空 = 自定义水印文案（≤16 字符，右下角）。
+	Footnote *string `json:"footnote"`
+	Revise   *bool   `json:"revise"`
+	// Extra 实验性上游字段透传（仅 hunyuan 族；用于试 logo_add 等候选水印开关）。
+	Extra map[string]any `json:"extra"`
 	// edits 专用：image 可为字符串或字符串数组
 	// （data URL / http(s) URL / 裸 base64；不支持本地路径——防任意文件读取）
 	Image         json.RawMessage `json:"image"`
@@ -95,13 +99,20 @@ func (h *Handler) serveImage(w http.ResponseWriter, r *http.Request, edit bool) 
 	}
 	// 日志展示实际生效的模型（含默认补全），而非客户端原文字段。
 	st.model = in.Model
+	// 客户端未传 footnote 时注入网关默认（features.image_footnote 配置）；
+	// 客户端显式传（含 ""）则以客户端为准。
+	footnote := in.Footnote
+	if footnote == nil && h.cfg.ImageFootnoteDefault != nil {
+		footnote = h.cfg.ImageFootnoteDefault
+	}
 	req := upstream.ImageRequest{
 		Model:         in.Model,
 		Prompt:        in.Prompt,
 		Size:          in.Size,
 		N:             in.N,
-		Footnote:      in.Footnote,
+		Footnote:      footnote,
 		Revise:        in.Revise,
+		Extra:         in.Extra,
 		Quality:       in.Quality,
 		Style:         in.Style,
 		Background:    in.Background,

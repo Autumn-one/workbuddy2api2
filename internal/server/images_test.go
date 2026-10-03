@@ -65,6 +65,92 @@ func TestImageGenerationsOK(t *testing.T) {
 	}
 }
 
+// TestImageFootnoteDefault 生图 footnote 默认注入：
+// 配置了 ImageFootnoteDefault 时客户端未传 footnote → 注入默认值（含空串）；
+// 客户端显式传 footnote 时优先于默认。
+func TestImageFootnoteDefault(t *testing.T) {
+	var gotBody []byte
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`
+	})
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(r.Body)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`)),
+		}, nil
+	})
+	def := ""
+	h := NewHandler(Config{
+		Pool:                 testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:             up,
+		ImageFootnoteDefault: &def,
+	})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	post := func(body string) map[string]any {
+		resp, err := http.Post(srv.URL+"/v1/images/generations", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status=%d body=%s", resp.StatusCode, b)
+		}
+		var reqBody map[string]any
+		if err := json.Unmarshal(gotBody, &reqBody); err != nil {
+			t.Fatal(err)
+		}
+		return reqBody
+	}
+
+	// 客户端未传 → 注入默认空串（footnote:"" 必须出现在请求体里）
+	if b := post(`{"prompt":"a cat"}`); b["footnote"] != "" {
+		t.Fatalf("default footnote not injected: %v", b)
+	}
+	// 客户端显式传 → 客户端优先
+	if b := post(`{"prompt":"a cat","footnote":"my-mark"}`); b["footnote"] != "my-mark" {
+		t.Fatalf("client footnote must win: %v", b)
+	}
+}
+
+// TestImageFootnoteUnset 未配置默认时客户端不传 footnote → 请求体不带该键。
+func TestImageFootnoteUnset(t *testing.T) {
+	var gotBody []byte
+	up := newFakeUpstreamByPath(func(authz, path string) (int, string) {
+		return 200, `{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`
+	})
+	up.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		gotBody, _ = io.ReadAll(r.Body)
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`)),
+		}, nil
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}), Upstream: up})
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/images/generations", "application/json",
+		strings.NewReader(`{"prompt":"a cat"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	var reqBody map[string]any
+	_ = json.Unmarshal(gotBody, &reqBody)
+	if _, has := reqBody["footnote"]; has {
+		t.Fatalf("footnote must be absent without client value and default: %v", reqBody)
+	}
+}
+
 // TestImageGenerationsLogsRow 图像请求必须走与 chat 相同的表格日志链路——
 // 曾因未接 chatStat 导致生图请求在运行日志/请求日志里完全不可见（回归测试）。
 func TestImageGenerationsLogsRow(t *testing.T) {
@@ -177,9 +263,9 @@ func TestImageGenerationsValidation(t *testing.T) {
 	for _, tc := range []struct{ path, body string }{
 		{"/v1/images/generations", `{}`},
 		{"/v1/images/generations", `{"prompt":"  "}`},
-		{"/v1/images/edits", `{"prompt":"p"}`},                          // 缺 image
-		{"/v1/images/edits", `{"prompt":"p","image":"C:\\x.png"}`},       // 本地路径
-		{"/v1/images/edits", `{"prompt":"p","image":"!!!garbage!!!"}`},   // 非 base64
+		{"/v1/images/edits", `{"prompt":"p"}`},                         // 缺 image
+		{"/v1/images/edits", `{"prompt":"p","image":"C:\\x.png"}`},     // 本地路径
+		{"/v1/images/edits", `{"prompt":"p","image":"!!!garbage!!!"}`}, // 非 base64
 	} {
 		resp, err := http.Post(srv.URL+tc.path, "application/json", strings.NewReader(tc.body))
 		if err != nil {

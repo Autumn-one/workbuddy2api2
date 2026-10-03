@@ -229,6 +229,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `upstream.header_timeout_seconds` | 回落 `timeout_seconds` | 聊天首字节前（响应头）上限 |
 | `upstream.idle_timeout_seconds` | `300` | 聊天流中空闲上限（活跃续命，静默断流） |
 | `features.sanitize_blacklist_fingerprints` | `true` | 出站请求体黑名单指纹脱敏 |
+| `features.image_footnote` | 缺省不发 | 生图（hunyuan 族）右下角水印控制：`false` = 生图默认发 `footnote:""`（试探关水印）；`true` = 发送 `image_footnote_text` 文案 |
+| `features.image_footnote_text` | `""` | 与 `image_footnote:true` 搭配的水印文案（上游限制 ≤16 字符）；空串等效 `false` |
 | `upstash.url` / `token` | 空 | 空 = 纯内存模式（Noop 降级，功能照常） |
 | `pool.max_in_flight` | `3` | 单账号最大在途请求数（`0` = 不限） |
 | `pool.breaker_threshold` | `3` | 连续失败触发熔断阈值 |
@@ -360,6 +362,13 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 你没配（或配的端口已失效） | 自动写入 listeners 并让 Clash 热重载，无需重启 Clash |
 | 账号→节点对应关系 | 记住并默认沿用（出口 IP 必须稳定）；只有节点真的不在了才重分配那个账号 |
 | Clash 没运行 / 连不上 | 不启用代理，全部直连 —— 不影响网关服务本身 |
+| 账号怎么挑节点 | **只按「可达 + 负载最少」挑，不比较延迟**（要求：只要可达，不计较快慢）；同一个节点尽量只服务一个账号 |
+
+> **出口集中会被明确提示**：程序启动时检查集中度，超过阈值就写进日志与「代理」页提示
+> （实测曾出现 28/30 个账号挤在同一个节点——换绑算法按"延迟最低"挑目标的后果，已修）。
+> 「代理」页的**「重新分散出口」**按钮可以把挤在一起的账号摊开（每个节点留一个，
+> 其余挪到空节点）。它是**显式动作**——出口 IP 变动本身是异常特征，程序不会在启动时
+> 悄悄改。
 
 想关掉自动开启：配置写 `proxy.auto: false`，或点界面上的「关闭代理」
 （后者只在本次运行生效，重启后仍会按默认自动开启）。
@@ -418,7 +427,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
 | `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
-| `POST /v1/images/generations` | Bearer（`api_key` 非空时） | 文生图（OpenAI 兼容）；默认模型 `hunyuan-image-alpha`；返回 `{created, data:[{url}]}` |
+| `POST /v1/images/generations` | Bearer（`api_key` 非空时） | 文生图（OpenAI 兼容）；默认模型 `hunyuan-image-alpha`；返回 `{created, data:[{url}]}`。hunyuan 族扩展字段：`footnote`（右下角水印文案）、`revise`（prompt 改写开关）、`extra`（实验性上游字段透传） |
 | `POST /v1/images/edits` | Bearer（`api_key` 非空时） | 图生图编辑；`image` 支持 data URL / http(s) URL / 裸 base64（**不支持本地路径**）；默认模型 `hunyuan-image-v2.0-general-edit` |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（动态拉取，缓存 1h；失败回落静态表 + 5min 负缓存）**含扩展参数**：思考深度档位、能力标志、消耗倍率；`?all=1` 返回上游全量目录（含非 cli 分组，带 `agents`/`disabled`/`callable` 标记） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
@@ -474,6 +483,23 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 出站请求强制 `stream:true`；SSE 帧按 OpenAI 规范**白名单重建**（`reasoning_content` 保留、工具调用按 index 合并、未知字段剥离）
 - 保证恰好一个 `data: [DONE]`（上游漏发时兜底补写）；空流先写一帧 `error` 再补 `[DONE]`；`error` 帧原样透传
 
+### 生图水印（footnote）
+
+hunyuan 族生图的右下角水印对应上游 `footnote` 字段（≤16 字符，对齐腾讯 TokenHub
+混元生图契约）。网关的处理：
+
+- 客户端传 `footnote` → 原样透传；**显式 `""`** 会把空串发给上游
+  （上游是否以空串关闭水印**未经官方确认**，需实测）。
+- 客户端不传 → 看 `features.image_footnote` 配置（见字段速查）；缺省不发。
+- 若空串无效，可在请求体加 `extra` 试候选字段（如 `{"extra":{"logo_add":0}}`），
+  网关将其浅拷贝进 hunyuan 请求体（不会覆盖已占用键）。
+
+```bash
+curl -X POST http://127.0.0.1:7863/v1/images/generations \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"prompt":"a cat","footnote":""}'
+```
+
 ## 📊 Token 用量统计
 
 GUI「用量」页记录所有账号、所有模型的 token 用量，维度是**账号 × 模型 × 日期**
@@ -486,7 +512,7 @@ GUI「用量」页记录所有账号、所有模型的 token 用量，维度是*
 | 列 | 来源 |
 |---|---|
 | 请求数 | 该组合的请求次数（**含失败请求**） |
-| 缓存输入 | `usage.cached_tokens`（缺失回落 `cache_read_input_tokens`）——命中缓存的输入 token |
+| 缓存输入 | 命中缓存的输入 token；按 `usage.prompt_tokens_details.cached_tokens` → `prompt_cache_hit_tokens` → `cached_tokens` / `cache_read_input_tokens` 的顺序取**第一个非零值**（上游会把顶层同名字段填 0，只读顶层会恒为 0） |
 | 输入 | `usage.prompt_tokens`（上下文） |
 | 输出 | `usage.completion_tokens`（按上游口径**已含**思考） |
 | 其中思考 | `usage.completion_tokens_details.reasoning_tokens`（缺失回落 `completion_thinking_tokens`） |
@@ -500,6 +526,25 @@ GUI「用量」页记录所有账号、所有模型的 token 用量，维度是*
 > 2. **上下文大 ≠ 计费多**：`输入` 是上下文总量，`缓存输入` 是其中命中缓存的部分。
 >    两者接近时说明缓存复用率高、实际计费输入远小于上下文——这是判断"哪个账号/模型
 >    更划算"的关键，只看 `输入` 会严重高估成本。
+
+## 💳 积分消耗（按天，所有账号加总）
+
+GUI「积分消耗」页回答"**每天一共花掉多少积分**"——不是单个账号的流水，而是所有账号
+当天加总。数据来自积分变动历史（`data/credit-log.jsonl`，逐条明细在「日志」页），
+本页只是**按天聚合的派生视图**：不新增存储、不发任何上游请求，因此永远不会与实际
+历史不一致。
+
+| 列 | 来源与含义 |
+|---|---|
+| 消耗 | 当天所有账号**负向变动**之和（即花掉的积分） |
+| 增加 | 当天**正向变动**之和（签到 +100、加量包、刷新修正等，不区分来源） |
+| 净变化 | 增加 − 消耗 |
+| 变动次数 | 当天 delta ≠ 0 的记录条数 |
+| 涉及账号 | 当天有变动的不同账号数 |
+
+> **口径提醒**：积分下降是定时刷新**观测**到的，不是发生时立刻记录的，因此按
+> **观测时刻**归日——凌晨观察到的下降可能对应前一天的用量（最多滞后一个刷新间隔）。
+> 首次获取余额（delta = 0）不计入消耗/增加，也不计入变动次数。
 
 ## 🔎 连通性探测（测试页 / 检测模型可用性）
 
@@ -539,7 +584,7 @@ GUI「用量」页记录所有账号、所有模型的 token 用量，维度是*
 | `effort=` | **实际发往上游**的思考深度档位（`reasoning_effort` / `reasoningEffort`）；未指定为 `-` |
 | `max=` | 客户端指定的输出上限（`max_completion_tokens` 优先，其次 `max_tokens`）；未指定为 `-` |
 | `ctx=` | 输入（上下文）token 数，来自末帧 `usage.prompt_tokens`；缺失为 `-` |
-| `cache=` | 其中命中缓存的输入 token（`cached_tokens`，缺失回落 `cache_read_input_tokens`）；缺失为 `-`。与 `ctx=` 接近说明缓存复用率高、实际计费输入小 |
+| `cache=` | 其中命中缓存的输入 token（位置同「用量」页的缓存输入列：嵌套 `prompt_tokens_details` → DeepSeek 自有 `prompt_cache_hit_tokens` → 顶层，取第一个非零值）；缺失为 `-`。与 `ctx=` 接近说明缓存复用率高、实际计费输入小 |
 | `TTFB` | 流式首帧耗时（非流式为 `-`） |
 | `tok` | 输出 token 数，来自末帧 `usage.completion_tokens`；缺失为 `-` |
 | `think=` | **思考 token 数**，来自 `usage.completion_tokens_details.reasoning_tokens`（缺失回落 `completion_thinking_tokens`）。它是"档位是否真的生效"的直接证据：`effort=` 只说明请求了什么，`think=` 才说明思考了多少 |

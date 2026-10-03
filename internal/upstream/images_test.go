@@ -35,9 +35,9 @@ func (c *captureRT) RoundTrip(r *http.Request) (*http.Response, error) {
 
 func imageClient(rt http.RoundTripper) *Client {
 	return &Client{
-		HTTP:        &http.Client{Transport: rt},
-		ChatBaseCN:  "https://fake.example",
-		proxyPool:   newProxyPool(0),
+		HTTP:       &http.Client{Transport: rt},
+		ChatBaseCN: "https://fake.example",
+		proxyPool:  newProxyPool(0),
 	}
 }
 
@@ -47,9 +47,10 @@ func TestGenerateImageHunyuanBody(t *testing.T) {
 	rt := &captureRT{status: 200, respBody: `{"code":0,"data":{"data":[{"url":"https://img.example/a.png","revised_prompt":"rp"}]}}`}
 	c := imageClient(rt)
 	revise := true
+	footnote := "fn"
 	items, _, err := c.GenerateImage(&auth.Auth{UID: "u1", AccessToken: "tok", EnterpriseID: "ent"}, ImageRequest{
 		Model: "hunyuan-image-alpha", Prompt: "a cat", Size: "1024x1024", N: 2,
-		Footnote: "fn", Revise: &revise,
+		Footnote: &footnote, Revise: &revise,
 	})
 	if err != nil {
 		t.Fatalf("GenerateImage: %v", err)
@@ -81,6 +82,62 @@ func TestGenerateImageHunyuanBody(t *testing.T) {
 	}
 	if len(items) != 1 || items[0].URL != "https://img.example/a.png" || items[0].RevisedPrompt != "rp" {
 		t.Fatalf("items=%+v", items)
+	}
+}
+
+// TestGenerateImageFootnoteTriState footnote 三态：nil 不发该键（上游默认水印）；
+// 显式空串原样发送（试探关水印）；非空为自定义水印文案。
+func TestGenerateImageFootnoteTriState(t *testing.T) {
+	ok := `{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`
+	req := func() ImageRequest {
+		return ImageRequest{Model: "hunyuan-image-alpha", Prompt: "p", Size: "1024x1024"}
+	}
+
+	// nil → 不带 footnote 键
+	rt := &captureRT{status: 200, respBody: ok}
+	if _, _, err := imageClient(rt).GenerateImage(&auth.Auth{UID: "u", AccessToken: "t"}, req()); err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rt.body, &body)
+	if _, has := body["footnote"]; has {
+		t.Fatalf("nil footnote must not be sent: %v", body)
+	}
+
+	// 显式空串 → 发送 footnote:""
+	rt = &captureRT{status: 200, respBody: ok}
+	empty := ""
+	r := req()
+	r.Footnote = &empty
+	if _, _, err := imageClient(rt).GenerateImage(&auth.Auth{UID: "u", AccessToken: "t"}, r); err != nil {
+		t.Fatal(err)
+	}
+	body = nil
+	_ = json.Unmarshal(rt.body, &body)
+	if v, has := body["footnote"]; !has || v != "" {
+		t.Fatalf("explicit empty footnote must be sent as \"\": %v", body)
+	}
+}
+
+// TestGenerateImageHunyuanExtra extra 字段浅拷贝进 hunyuan 请求体，
+// 已占用键（model/prompt/size/n/footnote/revise/image/input_fidelity）不可被覆盖。
+func TestGenerateImageHunyuanExtra(t *testing.T) {
+	ok := `{"code":0,"data":{"data":[{"url":"https://img.example/a.png"}]}}`
+	rt := &captureRT{status: 200, respBody: ok}
+	c := imageClient(rt)
+	if _, _, err := c.GenerateImage(&auth.Auth{UID: "u", AccessToken: "t"}, ImageRequest{
+		Model: "hunyuan-image-alpha", Prompt: "p", Size: "1024x1024",
+		Extra: map[string]any{"logo_add": float64(0), "model": "evil-override", "size": "9999x9999"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(rt.body, &body)
+	if body["logo_add"] != float64(0) {
+		t.Fatalf("extra key not merged: %v", body)
+	}
+	if body["model"] != "hunyuan-image-alpha" || body["size"] != "1024x1024" {
+		t.Fatalf("extra must not override occupied keys: %v", body)
 	}
 }
 

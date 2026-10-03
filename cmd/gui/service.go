@@ -302,15 +302,16 @@ func (s *Service) Start(cfg *appconfig.Config) error {
 	})
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		UsageStore:   s.usageStore,
-		MaxRotate:    cfg.UpstreamRotate.MaxRotate,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  func() int { return 0 },
-		RedisMode:    mode,
-		SoftCooldown: cfg.SoftRateDur,
+		Pool:                 p,
+		Upstream:             up,
+		UsageStore:           s.usageStore,
+		MaxRotate:            cfg.UpstreamRotate.MaxRotate,
+		APIKey:               cfg.APIKey,
+		Session:              sessRouter,
+		StickyCount:          func() int { return 0 },
+		RedisMode:            mode,
+		SoftCooldown:         cfg.SoftRateDur,
+		ImageFootnoteDefault: cfg.ImageFootnoteDefault(),
 	})
 
 	ln, err := net.Listen("tcp", cfg.Listen)

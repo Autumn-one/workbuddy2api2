@@ -102,45 +102,35 @@ func TestApplyDelaysToRegistry(t *testing.T) {
 	}
 }
 
-// TestPickBestNode 自动挑最优节点：优先 HK/TW/JP 且延迟最低。
-func TestPickBestNode(t *testing.T) {
+// TestAutoAssignIgnoresDelay 自动分配只看"可达 + 负载最少"，**不看延迟**。
+//
+// 用户要求（2026-10-02）：只要可达就行，不计较快慢——延迟不得参与任何自动选路。
+// 回归点：曾按"延迟最低"挑节点，一次批量节点失效把 28/30 个账号挤到同一个最快
+// 节点上，出口 IP 反而比失效前更集中。
+func TestAutoAssignIgnoresDelay(t *testing.T) {
 	r := NewRegistry([]Listener{
-		{Name: "hk-slow", Port: 34567, Node: "香港Y01", Region: RegionHK},
-		{Name: "hk-fast", Port: 34568, Node: "香港Y02", Region: RegionHK},
-		{Name: "jp-fast", Port: 34569, Node: "日本Y01", Region: RegionJP},
-		{Name: "us-fastest", Port: 34570, Node: "美国Y01", Region: RegionOther},
+		{Name: "hk1", Port: 34567, Node: "香港Y01", Region: RegionHK},
+		{Name: "hk2", Port: 34568, Node: "香港Y02", Region: RegionHK},
+		{Name: "jp1", Port: 34569, Node: "日本Y01", Region: RegionJP},
 	})
-	delays := map[string]int{
-		"香港Y01": 800, "香港Y02": 120, "日本Y01": 90, "美国Y01": 20,
-	}
-	r.ApplyDelays(delays)
-	// 策略一：地区优先（默认）→ 先取最高优先地区（HK），再在其中挑延迟最低的。
-	// 香港Y02(120ms) 比香港Y01(800ms) 快，且美国虽 20ms 但地区优先级最低。
-	best, ok := r.PickBestNode()
-	if !ok {
-		t.Fatal("应能挑出节点")
-	}
-	if best.Node != "香港Y02" {
-		t.Errorf("地区优先应在香港里挑延迟最低的(香港Y02 120ms), got %q", best.Node)
-	}
-	// 策略二：延迟优先 → 美国Y01（20ms 最快）
-	fastest, ok := r.PickBestNodeBy(PickByDelay)
-	if !ok {
-		t.Fatal("应能挑出节点")
-	}
-	if fastest.Node != "美国Y01" {
-		t.Errorf("延迟优先应选美国Y01(20ms), got %q", fastest.Node)
-	}
-}
+	// 日本 20ms 最快、香港Y02 次之；但自动分配不认延迟。
+	r.ApplyDelays(map[string]int{"香港Y01": 800, "香港Y02": 120, "日本Y01": 20})
 
-// TestPickBestNodeFallbackAllDead 全部不可用时回落（不返回 ok=false 让调用方无措）。
-func TestPickBestNodeFallbackAllDead(t *testing.T) {
-	r := NewRegistry([]Listener{
-		{Name: "a", Port: 34567, Node: "香港Y01", Region: RegionHK},
-	})
-	r.ApplyDelays(map[string]int{"香港Y01": 0})
-	if _, ok := r.PickBestNode(); !ok {
-		t.Error("全部不可用时仍应返回一个候选（回落），而不是失败")
+	got := map[string]int{}
+	for _, uid := range []string{"u1", "u2", "u3"} {
+		l, ok := r.Assign(uid)
+		if !ok {
+			t.Fatal("应能分配")
+		}
+		got[l.Node]++
+	}
+	if len(got) != 3 {
+		t.Errorf("三个账号应摊到三个不同节点（负载最少优先，不是都去最快的日本Y01）: %v", got)
+	}
+	for node, n := range got {
+		if n != 1 {
+			t.Errorf("节点 %s 上有 %d 个账号（应各 1 个）: %v", node, n, got)
+		}
 	}
 }
 
@@ -193,6 +183,9 @@ func TestListNodeOptions(t *testing.T) {
 }
 
 // TestClearNodeForAccountReturnsToAuto 手动指定后可交还自动分配。
+//
+// 交还规则与首次分配一致：**可达 → 负载最少**（不看延迟）。
+// 此处香港空着、日本被自己占着 → 交还后应落到香港。
 func TestClearNodeForAccountReturnsToAuto(t *testing.T) {
 	r := NewRegistry([]Listener{
 		{Name: "hk", Port: 34567, Node: "香港Y01", Region: RegionHK},
@@ -204,13 +197,13 @@ func TestClearNodeForAccountReturnsToAuto(t *testing.T) {
 	if r.NodeFor("u1") != "日本Y01" {
 		t.Fatal("前置条件：应指定到日本")
 	}
-	// 交还自动 → 按地区优先应回到香港（地区优先于延迟）
+	// 交还自动 → 按负载最少（香港空着、日本被占）应落到香港
 	l, ok := r.ClearNodeForAccount("u1")
 	if !ok {
 		t.Fatal("交还自动应成功")
 	}
 	if l.Node != "香港Y01" {
-		t.Errorf("自动分配应选地区优先的香港Y01, got %q", l.Node)
+		t.Errorf("自动分配应选负载最少的香港Y01（不看延迟）, got %q", l.Node)
 	}
 	if r.NodeFor("u1") != "香港Y01" {
 		t.Errorf("绑定未更新: %q", r.NodeFor("u1"))
@@ -263,35 +256,5 @@ func TestDelayConstantsSane(t *testing.T) {
 	}
 }
 
-// TestPickBestNodeRegionThenFastest 关键回归（实测缺陷）：
-// 地区优先 ≠ 排序取第一个；必须在该地区内挑延迟最低的。
-//
-// 实测背景：香港有 35ms 节点时，原实现选中了同地区 60ms 的节点
-// （因为它只取"按端口排序后的第一个健康节点"）。
-func TestPickBestNodeRegionThenFastest(t *testing.T) {
-	r := NewRegistry([]Listener{
-		{Name: "hk60", Port: 34567, Node: "香港Y01", Region: RegionHK},
-		{Name: "hk35", Port: 34568, Node: "香港Y10", Region: RegionHK},
-		{Name: "jp20", Port: 34569, Node: "日本Y01", Region: RegionJP},
-	})
-	// 日本 20ms 最快，但地区优先级低于香港
-	r.ApplyDelays(map[string]int{"香港Y01": 60, "香港Y10": 35, "日本Y01": 20})
-	best, ok := r.PickBestNode()
-	if !ok {
-		t.Fatal("应能挑出节点")
-	}
-	if best.Node != "香港Y10" {
-		t.Errorf("应在香港内挑延迟最低的(香港Y10 35ms), got %q", best.Node)
-	}
-}
-
-// TestPickBestNodeMissingDelays 同地区节点都缺延迟数据时回落（不返回空）。
-func TestPickBestNodeMissingDelays(t *testing.T) {
-	r := NewRegistry([]Listener{
-		{Name: "hk", Port: 34567, Node: "香港Y01", Region: RegionHK},
-	})
-	r.ApplyDelays(map[string]int{}) // 无延迟数据 → 健康判定为不健康
-	if _, ok := r.PickBestNode(); !ok {
-		t.Error("全部无延迟数据时仍应返回候选（回落）")
-	}
-}
+// TestPickBestNode* 系列已删除：自动选路不再按延迟挑（用户要求"只要可达，不计较快慢"），
+// 相关回归由 TestAutoAssignIgnoresDelay 与 spread_test.go 覆盖。

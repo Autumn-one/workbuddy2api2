@@ -16,7 +16,9 @@
     "idle_timeout_seconds": 300
   },
   "features": {
-    "sanitize_blacklist_fingerprints": true
+    "sanitize_blacklist_fingerprints": true,
+    "image_footnote": false,
+    "image_footnote_text": ""
   },
   "upstash": {
     "url": "",

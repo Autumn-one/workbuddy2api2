@@ -211,6 +211,42 @@ func TestUpstreamEnvOverride(t *testing.T) {
 	}
 }
 
+func TestImageFootnoteDefault(t *testing.T) {
+	load := func(json string) *Config {
+		dir := t.TempDir()
+		fp := filepath.Join(dir, "c.json")
+		os.WriteFile(fp, []byte(json), 0o600)
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+
+	// 缺键 → 不注入
+	if d := Default().ImageFootnoteDefault(); d != nil {
+		t.Fatalf("unset must not inject, got %q", *d)
+	}
+	// false → 注入空串
+	if d := load(`{"features":{"image_footnote":false}}`).ImageFootnoteDefault(); d == nil || *d != "" {
+		t.Fatalf("false must inject empty string, got %v", d)
+	}
+	// true + text → 注入文案
+	if d := load(`{"features":{"image_footnote":true,"image_footnote_text":"my-mark"}}`).ImageFootnoteDefault(); d == nil || *d != "my-mark" {
+		t.Fatalf("true+text must inject text, got %v", d)
+	}
+	// env 覆盖：WB2A_IMAGE_FOOTNOTE=false → 空串
+	t.Setenv("WB2A_IMAGE_FOOTNOTE", "false")
+	if d := load(`{}`).ImageFootnoteDefault(); d == nil || *d != "" {
+		t.Fatalf("env false must inject empty string, got %v", d)
+	}
+	t.Setenv("WB2A_IMAGE_FOOTNOTE_TEXT", "env-mark")
+	t.Setenv("WB2A_IMAGE_FOOTNOTE", "true")
+	if d := load(`{}`).ImageFootnoteDefault(); d == nil || *d != "env-mark" {
+		t.Fatalf("env text must win, got %v", d)
+	}
+}
+
 func TestBadSessionTTL(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")

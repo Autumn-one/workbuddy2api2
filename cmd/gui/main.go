@@ -882,6 +882,11 @@ func (a *app) usageTabIndex() int {
 	return a.tabIndexByTitle("用量")
 }
 
+// creditSpendTabIndex 返回「积分消耗」页的页签序号（同样按标题查找）。
+func (a *app) creditSpendTabIndex() int {
+	return a.tabIndexByTitle("积分消耗")
+}
+
 // tabIndexByTitle 按页签标题查找序号；找不到回落 0。
 func (a *app) tabIndexByTitle(title string) int {
 	if a.tabs == nil {
@@ -1323,6 +1328,13 @@ type app struct {
 	// lastUsageSig 用量表上次刷新签名（防抖：签名不变不重建表格，防 1.5s 周期刷新闪烁）。
 	lastUsageSig string
 
+	// 积分消耗页（所有账号加总的每日积分消耗；纯派生视图——数据来自积分历史，不新增存储）
+	tvCreditSpend  *walk.TableView
+	lblCreditSpend *walk.Label
+	creditSpend    *creditSpendModel
+	// lastCreditSpendSig 同上（防抖签名）。
+	lastCreditSpendSig string
+
 	// 代理（账号级出口 IP）
 	proxyReg    *proxy.Registry
 	proxyCancel context.CancelFunc
@@ -1491,6 +1503,7 @@ func main() {
 		checkins:      &checkinModel{},
 		credits:       &creditModel{},
 		usage:         &usageModel{},
+		creditSpend:   &creditSpendModel{},
 		proxyBindings: &proxyBindingModel{},
 		modelRates:    &modelRateModel{},
 		oauth:         oauthflow.NewClient(),
@@ -1591,6 +1604,7 @@ func main() {
 	a.loadCheckinHistory()
 	a.loadCreditHistory()
 	a.refreshUsage()
+	a.refreshCreditSpend()
 	a.syncMatrixModels()
 	a.refreshProxyBindings()
 	a.refreshProxyToggle()
@@ -1634,6 +1648,11 @@ func (a *app) tickLoop() {
 			// 白白重建表格）。周期与 tick 一致即可，token 统计不是实时指标。
 			if a.tabs != nil && a.tabs.CurrentIndex() == a.usageTabIndex() {
 				a.refreshUsage()
+			}
+			// 积分消耗同上：只在「积分消耗」页可见时聚合（历史上万条时聚合不贵，
+			// 但没必要为看不见的页面每秒算一遍）。
+			if a.tabs != nil && a.tabs.CurrentIndex() == a.creditSpendTabIndex() {
+				a.refreshCreditSpend()
 			}
 		})
 	}

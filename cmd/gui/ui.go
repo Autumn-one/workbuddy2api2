@@ -463,6 +463,47 @@ func (a *app) buildUI() error {
 						},
 					},
 
+					// ══════════════ 积分消耗 ══════════════
+					{
+						Title:  "积分消耗",
+						Layout: dcl.VBox{Margins: dcl.Margins{Left: 14, Top: 14, Right: 14, Bottom: 14}, Spacing: 10},
+						Children: []dcl.Widget{
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "每天【所有账号加总】的积分消耗（数据来自积分变动历史，逐条明细在「日志」页）。" +
+								"\r\n· 消耗 = 当天所有账号的负向变动之和；增加 = 正向变动（签到、加量包等）。" +
+								"\r\n· 按【观测时刻】归日：积分靠定时刷新「看到」，凌晨观察到的下降可能对应前一天的用量（最多滞后一个刷新间隔）。"},
+							dcl.Composite{
+								Layout: dcl.HBox{Spacing: 8},
+								Children: []dcl.Widget{
+									dcl.PushButton{Text: "刷新", MinSize: dcl.Size{Width: 70}, OnClicked: a.refreshCreditSpend},
+									dcl.HSpacer{},
+								},
+							},
+							dcl.Label{
+								AssignTo:     &a.lblCreditSpend,
+								Text:         "—",
+								Font:         dcl.Font{Family: "Segoe UI", PointSize: 11, Bold: true},
+								MinSize:      dcl.Size{Width: 10},
+								EllipsisMode: dcl.EllipsisEnd,
+							},
+							dcl.TableView{
+								AssignTo:            &a.tvCreditSpend,
+								Model:               a.creditSpend,
+								AlternatingRowBG:    true,
+								LastColumnStretched: true, // 最后一列吃掉剩余宽度，拖宽窗口不留右侧空白
+								StretchFactor:       1,
+								Columns: []dcl.TableViewColumn{
+									{Title: "日期", Width: 100},
+									{Title: "消耗", Width: 110, Alignment: dcl.AlignFar},
+									{Title: "增加", Width: 110, Alignment: dcl.AlignFar},
+									{Title: "净变化", Width: 110, Alignment: dcl.AlignFar},
+									{Title: "变动次数", Width: 90, Alignment: dcl.AlignFar},
+									{Title: "涉及账号", Width: 90, Alignment: dcl.AlignFar},
+								},
+							},
+							dcl.Label{MinSize: dcl.Size{Width: 10}, EllipsisMode: dcl.EllipsisEnd, Text: "提示：只看某个账号的流水，在「日志」页按账号过滤；本页只回答「每天一共花了多少」。"},
+						},
+					},
+
 					// ══════════════ 代理 ══════════════
 					{
 						Title:  "代理",
@@ -496,6 +537,9 @@ func (a *app) buildUI() error {
 											dcl.PushButton{Text: "指定给选中账号", MinSize: dcl.Size{Width: 120}, OnClicked: a.doSelectNodeForAccount},
 											dcl.PushButton{Text: "换一个节点（自动）", MinSize: dcl.Size{Width: 130}, OnClicked: a.doSwitchAccountNode},
 											dcl.PushButton{Text: "交还自动分配", MinSize: dcl.Size{Width: 110}, OnClicked: a.doAutoAssignSelected},
+											// 收拾"多个账号挤在同一出口"的既成事实：
+											// 每个节点留一个账号，其余按可用节点摊开（显式动作，不自动改 IP）。
+											dcl.PushButton{Text: "重新分散出口", MinSize: dcl.Size{Width: 110}, OnClicked: a.doRespreadProxy},
 											dcl.HSpacer{},
 										},
 									},

@@ -90,25 +90,11 @@ func (a *app) usageView() int {
 	return a.cbUsageScope.CurrentIndex()
 }
 
-// selectedUsageDay 返回当前选中的日期（"YYYY-MM-DD"）；"全部日期"返回空串。
-func (a *app) selectedUsageDay() string {
-	if a.cbUsageDay == nil {
-		return ""
-	}
-	idx := a.cbUsageDay.CurrentIndex()
-	if idx <= 0 || idx >= len(a.usageDays) {
-		return ""
-	}
-	return a.usageDays[idx]
-}
-
-// syncUsageDays 用已有的日期列表刷新日期下拉框（最新在前），保留当前选择。
-func (a *app) syncUsageDays(st *server.TokenUsageStore) {
-	if a.cbUsageDay == nil {
-		return
-	}
+// usageDayOptions 构造日期下拉项：0 号固定为「全部日期」，其后为用量明细里出现过的
+// 日期（倒序，最新在前）。抽成纯函数是为了能离线断言「下拉项 ↔ 聚合日期」的对应关系。
+func usageDayOptions(rows []server.TokenUsageRow) []string {
 	seen := map[string]bool{}
-	for _, r := range st.Rows() {
+	for _, r := range rows {
 		if r.Day != "" {
 			seen[r.Day] = true
 		}
@@ -118,12 +104,42 @@ func (a *app) syncUsageDays(st *server.TokenUsageStore) {
 		days = append(days, d)
 	}
 	sort.Sort(sort.Reverse(sort.StringSlice(days))) // 最新在前
+	return append([]string{usageDayAll}, days...)
+}
 
-	if strings.Join(days, ",") == strings.Join(a.usageDays, ",") {
+// usageDayAt 把下拉框索引映射为聚合用的日期：0 号是「全部日期」→ 空串（不筛日期），
+// 越界同样返回空串。索引必须与 usageDayOptions 的项一一对应——**界面显示哪一项，
+// 就必须聚合哪一天**。
+//
+// 曾经的 bug：a.usageDays 只存了日期（不含「全部日期」）而下拉框含，索引少减 1，
+// 导致选「显示为今天」的那一项实际聚合前一天（10-01 的界面给出 09-30 的数字）。
+func usageDayAt(options []string, idx int) string {
+	if idx <= 0 || idx >= len(options) {
+		return ""
+	}
+	return options[idx]
+}
+
+// selectedUsageDay 返回当前选中的日期（"YYYY-MM-DD"）；"全部日期"返回空串。
+func (a *app) selectedUsageDay() string {
+	if a.cbUsageDay == nil {
+		return ""
+	}
+	return usageDayAt(a.usageDays, a.cbUsageDay.CurrentIndex())
+}
+
+// syncUsageDays 用已有的日期列表刷新日期下拉框（最新在前），保留当前选择。
+func (a *app) syncUsageDays(st *server.TokenUsageStore) {
+	if a.cbUsageDay == nil {
+		return
+	}
+	items := usageDayOptions(st.Rows())
+	if strings.Join(items, ",") == strings.Join(a.usageDays, ",") {
 		return // 选项未变，不重建（避免打断用户选择）
 	}
-	a.usageDays = days
-	items := append([]string{usageDayAll}, days...)
+	// a.usageDays 与下拉框的项保持平行（含 0 号「全部日期」），
+	// 这样 selectedUsageDay 的索引换算不会再错位。
+	a.usageDays = items
 	if err := a.cbUsageDay.SetModel(items); err != nil {
 		logf("用量页日期下拉框刷新失败: %v", err)
 		return
